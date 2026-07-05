@@ -233,8 +233,10 @@ def main():
 店舗ごとに`get_processed_dates`で取得済み日付を調べ、以下のロジックで対象日付を決める。
 
 ```python
+end_date = today - timedelta(days=COLLECT_UNTIL_DAYS_AGO)  # デフォルト2日前まで
+
 if processed:
-    # 前回取得済みの最終日の翌日から当日まで（実行間隔が空いてもギャップを残さない）
+    # 前回取得済みの最終日の翌日から収集対象の最終日まで（実行間隔が空いてもギャップを残さない）
     last_date = max(dt.strptime(d, '%Y-%m-%d') for d in processed)
     start_date = last_date + timedelta(days=1)
 else:
@@ -242,9 +244,10 @@ else:
     start_date = today - timedelta(days=INITIAL_BACKFILL_DAYS)  # デフォルト90日
 ```
 
-- 日次実行が想定通り毎日走っていれば「前日1日分」だけになり数分で終わる
+- `COLLECT_UNTIL_DAYS_AGO`（デフォルト2日前）: サイト側が当日・前日分をまだ更新していない可能性があるため、直近2日分は収集対象から外す。次回実行時に自動的にキャッチアップされる
+- 日次実行が想定通り毎日走っていれば「前々日1日分」だけになり数分で終わる
 - 実行が数日〜数週間空いても、最終取得日からのギャップを自動的に埋める（固定の「直近N日」方式だと長期間の抜けが永久に埋まらないため、この方式を採用）
-- 新規店舗（`stores.json`に追加した直後で取得済みデータが0件）は`INITIAL_BACKFILL_DAYS`分だけ初回バックフィルする
+- 新規店舗（`stores.json`に追加した直後で取得済みデータが0件）は`INITIAL_BACKFILL_DAYS`分だけ初回バックフィルする（この場合も収集終了日は`end_date`まで）
 
 ### アクセス間隔（動的sleep）
 
@@ -332,11 +335,11 @@ finally:
 | DB | ローカルSQLite（店舗ごとに`ホールデータ/{ホール名}.db`） | クラウドDB「Turso」（libSQL/SQLite互換、Tokyo）に1つの共有DBとして統合。`db.py`をsqlite3標準ライブラリからTursoクライアント(`libsql`)へ書き換え |
 | 店舗URL入力 | `メイン.py`で`input()`により対話入力 | リポジトリ内`stores.json`に店舗一覧（スラッグ）を記載し読み込む方式 |
 | 日付範囲入力 | `input()`で開始日・終了日を対話入力 | 店舗ごとに`get_processed_dates`の最終日+1〜当日を自動算出（新規店舗は90日分バックフィル） |
-| 実行環境 | ローカルPCで手動実行のみ | GitHub Actions（`.github/workflows/scrape.yml`、毎日21:00 JST）を追加。ローカルPCでの手動実行も引き続き可能 |
+| 実行環境 | ローカルPCで手動実行のみ | GitHub Actions（`.github/workflows/scrape.yml`）を試みたが、**ana-slo.com（Cloudflare）がGitHub Actionsのデータセンター系IPを最初のリクエストから403ブロックすることが判明**（2026-07-05実行テストで5店舗全て初回リクエストで403）。PCの住宅用IPでは約120リクエストまで通過していたのと対照的。そのため`schedule`（自動実行）は停止し、当面PC上での手動実行（`py -3.12 メイン.py`）に戻した。`workflow_dispatch`（手動トリガー）のみ残置（将来住宅用プロキシ等を検討する場合の検証用） |
 | 既存データ | ローカルSQLite5ファイル（計291,979件） | `merge_stores_for_turso.py`で1ファイルに統合→journal_mode=WAL変換→Turso Upload DBで移行済み |
 
 - Turso無料枠はストレージ5GB。店舗数・蓄積データ増加により将来逼迫する可能性があるため、運用しながら使用量を監視し、必要に応じて有料プラン（Developer: $4.99〜/月、9GBストレージ）への移行を検討する
-- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み
+- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み（現在は`workflow_dispatch`の手動検証用途のみで使用）
 - ローカル実行にはPython 3.12を使用（3.14では`libsql`のビルドに失敗するため。詳細は「db.py」節参照）
 - 詳細な移行方針は[`要件定義.md`](../要件定義.md)「3. 配信・公開」参照
 

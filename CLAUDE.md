@@ -9,10 +9,10 @@
 |---|---|---|---|
 | 1. データ収集 | [`fase1/`](fase1/) | 実装済み（Turso対応・GitHub Actions自動化まで完了） | `メイン.py` / `scraper.py` / `db.py` / `stores.json` |
 | 2. 設定推測・パターン分析 | [`fase2/`](fase2/) | 実装済み | 下表参照 |
-| 3. 配信・公開（iPhone Web閲覧） | `fase3/` | Stage A実装済み・Stage B未着手 | Stage A: fase1をGitHub Actionsでクラウド実行しTurso DBへ書き込み（完了）。Stage B: 機能A/Bもクラウドホスティングし iPhoneから直接アクセス（未着手） |
+| 3. 配信・公開（iPhone Web閲覧） | `fase3/` | Stage A一部実装（DB移行済み・自動実行は停止中）・Stage B未着手 | Stage A: TursoDB移行は完了。GitHub Actionsでの自動実行はCloudflareにデータセンターIPをブロックされるため停止し、当面PC手動実行に戻した。Stage B: 機能A/Bもクラウドホスティングし iPhoneから直接アクセス（未着手） |
 | 4. 日次自動実行 | `fase4/` | 未実装 | `fase4/run_daily.py` |
 
-> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜当日）に変更。GitHub Actions（`.github/workflows/scrape.yml`）で毎日21:00 JSTに自動実行。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
+> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜当日）に変更。**GitHub Actionsでの自動実行(`schedule`)は、ana-slo.com(Cloudflare)がデータセンター系IPを即403ブロックすることが判明したため停止中**（`workflow_dispatch`の手動トリガーのみ残す）。当面はPC上で`py -3.12 メイン.py`を手動実行し、Tursoへ書き込む運用。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
 
 ### fase2 ファイル構成
 

@@ -1,13 +1,15 @@
 name: Daily Scraping
 
+# 2026-07: ana-slo.com(Cloudflare)がGitHub Actionsのデータセンター系IPを
+# 即403ブロックすることが判明したため、自動実行(schedule)は停止中。
+# 手動実行(workflow_dispatch)のみ残す(将来プロキシ等を検討する場合の検証用)。
 on:
-  schedule:
-    - cron: '0 12 * * *'  # 毎日 21:00 JST (UTC+9) に実行
   workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 240  # これを超えたら強制的に失敗扱いにする(通常は2〜3時間程度で完了する想定)
     steps:
       - uses: actions/checkout@v4
 
