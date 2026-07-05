@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+.env
+
+# ローカルSQLite（Turso移行後は不要。移行前の生データはローカルに残す）
+ホールデータ/

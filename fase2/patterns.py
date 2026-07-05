@@ -1,0 +1,745 @@
+"""
+patterns.py — イベント検出・パターンスコア・αブレンド
+
+移動台検出 (detect_events / detect_all_events / is_new_series):
+    K=0前日比較で移動/撤去/増台イベントを検出
+幅型パターン (score_zentaiki / score_shintai / score_idoudai):
+    S_全台系 / S_新台増台 / S_移動台 — 1日分データで検出可能
+深さ型パターン (score_teppandai / score_rotation / score_sueki):
+    S_鉄板台(ACF→PDM→Lomb-Scargle / カレンダー検定) / S_ローテ / S_据え置き
+αブレンド (blend / walk_forward_alpha / learn_all_alphas):
+    長期/短期サブスコアのウォークフォワードα学習
+    対象: S_全台系・S_鉄板台・S_ローテ・S_据え置き
+
+依存: preprocess.py (check_missing_bias を深さ型検定内で呼ぶ)
+"""
+import pandas as pd
+import numpy as np
+from scipy import stats
+from scipy.optimize import minimize_scalar
+from scipy.signal import lombscargle
+
+SHORT_WINDOW = 14               # S_新台増台・S_移動台の短期トレンドウィンドウ幅N
+FDR_ALPHA = 0.05                # FDR補正の有意水準
+EFFECT_SIZE_THRESHOLD = 0.3     # rank-biserial相関等の効果量下限(calendar_test用)
+GINI_THRESHOLD = 0.1            # S_ローテ Gini係数下限(台数が多いと値が小さくなるため低め)
+ACF_MAX_LAG = 60                # ACFスクリーニングの最大lag(日)
+INVALID_RATE_THRESHOLD = 0.5    # Lomb-Scargle切り替え判定不能率閾値
+SHORT_WINDOW_DEFAULT = 30       # αブレンド短期版のウィンドウ幅M
+
+BLENDABLE_SCORES = ['S_全台系', 'S_鉄板台', 'S_ローテ', 'S_据え置き']
+
+
+# ── 移動台検出 ────────────────────────────────────────────────────
+
+def detect_events(df: pd.DataFrame, hole_name: str, machine_name: str) -> pd.DataFrame:
+    """
+    指定ホール×機種の前日比較で移動/撤去/増台イベントを検出する。
+    N = min(消失台数, 新規台数) を移動件数とし、残りを撤去/増台に分類。
+    同型入替(台番号変更なし)は検知不可のため対象外。
+
+    Returns:
+        DataFrame: 日付, ホール名, 機種名, 移動件数, 移動台番号, 撤去台番号, 増台台番号
+        - 移動台番号: 移動後の新台番号リスト (S_移動台の対象)
+        - 撤去台番号: 実際に撤去された台番号リスト
+        - 増台台番号: 純粋な増台台番号リスト (S_新台増台の対象)
+    """
+    mask = (df['ホール名'] == hole_name) & (df['機種名'] == machine_name)
+    sub = df.loc[mask, ['日付', '台番号']].dropna().drop_duplicates()
+
+    dates = sorted(sub['日付'].unique())
+    records = []
+
+    for i in range(1, len(dates)):
+        d_prev, d_curr = dates[i - 1], dates[i]
+
+        prev_set = set(sub.loc[sub['日付'] == d_prev, '台番号'].astype(int))
+        curr_set = set(sub.loc[sub['日付'] == d_curr, '台番号'].astype(int))
+
+        disappeared = sorted(prev_set - curr_set)
+        appeared = sorted(curr_set - prev_set)
+
+        if not disappeared and not appeared:
+            continue
+
+        n_moved = min(len(disappeared), len(appeared))
+
+        records.append({
+            '日付': d_curr,
+            'ホール名': hole_name,
+            '機種名': machine_name,
+            '移動件数': n_moved,
+            '移動台番号': appeared[:n_moved],
+            '撤去台番号': disappeared[n_moved:],
+            '増台台番号': appeared[n_moved:],
+        })
+
+    return pd.DataFrame(
+        records,
+        columns=['日付', 'ホール名', '機種名', '移動件数', '移動台番号', '撤去台番号', '増台台番号'],
+    )
+
+
+def detect_all_events(df: pd.DataFrame) -> pd.DataFrame:
+    """全ホール×全機種に対してイベント検出を実行してまとめて返す。"""
+    parts = []
+    for (hole, machine), _ in df.groupby(['ホール名', '機種名'], sort=False):
+        events = detect_events(df, hole, machine)
+        if not events.empty:
+            parts.append(events)
+
+    if not parts:
+        return pd.DataFrame(
+            columns=['日付', 'ホール名', '機種名', '移動件数', '移動台番号', '撤去台番号', '増台台番号']
+        )
+
+    return pd.concat(parts, ignore_index=True)
+
+
+def is_new_series(
+    df: pd.DataFrame,
+    hole_name: str,
+    machine_name: str,
+    台番号: int,
+    date: str,
+) -> bool:
+    """
+    指定の台が「移動後の新シリーズ」かどうかを返す。
+    台の同一性キーは (機種名, 台番号) — これが変わったら履歴リセット。
+    """
+    mask = (df['ホール名'] == hole_name) & (df['機種名'] == machine_name)
+    sub = df.loc[mask, ['日付', '台番号']].dropna().drop_duplicates()
+
+    dates = sorted(sub['日付'].unique())
+
+    if date not in dates:
+        return False
+
+    idx = dates.index(date)
+    if idx == 0:
+        return False
+
+    d_prev = dates[idx - 1]
+    prev_units = set(sub.loc[sub['日付'] == d_prev, '台番号'].astype(int))
+    return int(台番号) not in prev_units
+
+
+# ── 幅型パターン ──────────────────────────────────────────────────
+
+def score_zentaiki(df: pd.DataFrame, group_cols: list[str]) -> pd.Series:
+    """
+    S_全台系: 当日・指定グループ(機種/列/島)内の横断スコア集計。
+    Stage3スコアの「高さ × 揺らぎの少なさ」を 0〜1 で返す。
+    1日分のデータのみでも検出可能。
+    """
+    if 'is_invalid' in df.columns:
+        valid = df[~df['is_invalid'].fillna(True)]
+    else:
+        valid = df
+
+    avail_cols = [c for c in group_cols if c in df.columns]
+    if not avail_cols:
+        avail_cols = ['機種名'] if '機種名' in df.columns else []
+    group_key = ['日付', 'ホール名'] + avail_cols
+
+    stats = (
+        valid.groupby(group_key)['high_prob']
+        .agg(_mean='mean', _std='std', _count='count')
+        .reset_index()
+    )
+    stats['_std'] = stats['_std'].fillna(0.0)
+    # 高さ × 揺らぎの少なさ: std=0 → uniformity=1, std=0.5(最大) → uniformity=0
+    stats['_score'] = (
+        stats['_mean'] * (1.0 - (stats['_std'] / 0.5)).clip(0.0, 1.0)
+    ).clip(0.0, 1.0)
+    stats.loc[stats['_count'] < 2, '_score'] = np.nan
+
+    score_map = {
+        tuple(row[group_key]): row['_score']
+        for _, row in stats.iterrows()
+    }
+    keys = df[group_key].apply(tuple, axis=1)
+    return keys.map(score_map)
+
+
+def _compute_event_scores(
+    df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    unit_col: str,
+    window: int,
+) -> pd.Series:
+    """S_新台増台・S_移動台 共通の計算ロジック。"""
+    scores = pd.Series(np.nan, index=df.index)
+
+    if events_df.empty or unit_col not in events_df.columns:
+        return scores
+
+    if 'is_invalid' in df.columns:
+        valid_mask = ~df['is_invalid'].fillna(True)
+    else:
+        valid_mask = pd.Series(True, index=df.index)
+
+    # 基準値: 店舗×機種の全履歴平均 high_prob (is_invalid除外)
+    baseline_map = (
+        df[valid_mask]
+        .groupby(['ホール名', '機種名'])['high_prob']
+        .mean()
+        .to_dict()
+    )
+
+    for _, event in events_df.iterrows():
+        hole = event['ホール名']
+        machine = event['機種名']
+        start_date = event['日付']
+        units = event.get(unit_col, [])
+
+        if not isinstance(units, (list, np.ndarray)) or len(units) == 0:
+            continue
+
+        baseline = baseline_map.get((hole, machine), 0.5)
+        if pd.isna(baseline):
+            baseline = 0.5
+
+        for unit in units:
+            unit_int = int(unit)
+            unit_mask = (
+                (df['ホール名'] == hole)
+                & (df['機種名'] == machine)
+                & (df['台番号'] == unit_int)
+                & (df['日付'] >= start_date)
+                & valid_mask
+            )
+            unit_rows = df[unit_mask].sort_values('日付')
+
+            probs = unit_rows['high_prob'].values
+            for j, idx in enumerate(unit_rows.index):
+                w_start = max(0, j - window + 1)
+                trend = float(np.mean(probs[w_start:j + 1]))
+                raw = max(0.0, trend - baseline)
+                # 正規化: 差が 0.5 で score=1.0 に到達
+                scores[idx] = float(min(1.0, raw / 0.5))
+
+    return scores
+
+
+def score_shintai(
+    df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    window: int = SHORT_WINDOW,
+) -> pd.Series:
+    """
+    S_新台増台: 増台後の直近移動平均 - 基準値 → max(0, ...) → 0〜1。
+    配分が落ち着くと差が縮み自動フェードアウト。
+    """
+    return _compute_event_scores(df, events_df, '増台台番号', window)
+
+
+def score_idoudai(
+    df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    window: int = SHORT_WINDOW,
+) -> pd.Series:
+    """
+    S_移動台: 移動後の直近移動平均 - 同機種店舗全体平均 → max(0, ...) → 0〜1。
+    S_新台増台とは独立したサブスコア(重みを別々に調整できる)。
+    """
+    return _compute_event_scores(df, events_df, '移動台番号', window)
+
+
+def compute_breadth_scores(
+    df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    group_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """全幅型サブスコアを計算して列追加した DataFrame を返す。"""
+    if group_cols is None:
+        group_cols = ['機種名']
+
+    out = df.copy()
+    out['S_全台系'] = score_zentaiki(out, group_cols)
+    out['S_新台増台'] = score_shintai(out, events_df)
+    out['S_移動台'] = score_idoudai(out, events_df)
+    return out
+
+
+# ── 深さ型パターン ────────────────────────────────────────────────
+
+def acf_screen(series: pd.Series, max_lag: int = ACF_MAX_LAG) -> list[int]:
+    """
+    pairwise-complete ACF で有意なlagを返す。
+    欠損ペアは除外して計算する。
+    """
+    x = series.values.astype(float)
+    n = len(x)
+    significant: list[int] = []
+    for lag in range(1, min(max_lag + 1, n)):
+        x1 = x[:-lag]
+        x2 = x[lag:]
+        valid = ~(np.isnan(x1) | np.isnan(x2))
+        n_v = int(valid.sum())
+        if n_v < 10:
+            continue
+        v1, v2 = x1[valid], x2[valid]
+        if np.std(v1) == 0 or np.std(v2) == 0:
+            continue
+        try:
+            r, _ = stats.pearsonr(v1, v2)
+        except Exception:
+            continue
+        if abs(r) > 2.0 / np.sqrt(n_v):
+            significant.append(lag)
+    return significant
+
+
+def pdm_confirm(series: pd.Series, candidate_lags: list[int]) -> dict:
+    """
+    PDM(Phase Dispersion Minimization)で候補lagを確認する。
+    波形を仮定しない手法のため、矩形的なパターンにも対応。
+    theta = 平均ビン内分散 / 全体分散。theta < 0.7 を周期確認とみなす。
+    """
+    if not candidate_lags:
+        return {}
+    x = series.values.astype(float)
+    times = np.arange(len(x))
+    valid = ~np.isnan(x)
+    t_v = times[valid]
+    v_v = x[valid]
+    if len(v_v) < 10:
+        return {}
+    total_var = float(np.var(v_v, ddof=1))
+    if total_var == 0.0:
+        return {lag: {'theta': 1.0, 'confirmed': False} for lag in candidate_lags}
+    n_bins = 5
+    results: dict = {}
+    for lag in candidate_lags:
+        phases = (t_v % lag) / lag
+        bin_idx = (phases * n_bins).astype(int) % n_bins
+        bin_vars = [
+            float(np.var(v_v[bin_idx == b], ddof=1))
+            for b in range(n_bins)
+            if (bin_idx == b).sum() > 1
+        ]
+        theta = float(np.mean(bin_vars) / total_var) if bin_vars else 1.0
+        results[lag] = {'theta': theta, 'confirmed': theta < 0.7}
+    return results
+
+
+def lomb_scargle_screen(series: pd.Series, timestamps: pd.Series) -> list[float]:
+    """
+    判定不能率が INVALID_RATE_THRESHOLD 超の台に使用する。
+    等間隔サンプリング前提が崩れているため通常ACFの代替。
+    有意パワー(>0.4)を持つ周期(日数)のリストを返す。
+    """
+    valid = ~(series.isna() | timestamps.isna())
+    t = timestamps[valid].astype(float).values
+    y = series[valid].astype(float).values
+    if len(t) < 10:
+        return []
+    y = y - y.mean()
+    if float(np.std(y)) == 0.0:
+        return []
+    periods = np.arange(2, ACF_MAX_LAG + 1, dtype=float)
+    freqs = 2.0 * np.pi / periods
+    try:
+        pgram = lombscargle(t, y, freqs, normalize=True)
+    except Exception:
+        return []
+    return [float(periods[i]) for i in range(len(periods)) if pgram[i] > 0.4]
+
+
+def calendar_test(
+    series: pd.Series,
+    dates: pd.Series,
+    check_missing_bias_fn,
+) -> dict:
+    """
+    既知カレンダー17候補(曜日7 + 日付末尾10 + ゾロ目1)の検定。
+    一方向検定(並べ替え or Mann-Whitney U) + FDR補正 + 効果量ゲート。
+    check_missing_bias_fn: preprocess.check_missing_bias を渡す。
+
+    Returns:
+        {候補名: {'p_adj': float, 'effect_size': float, 'significant': bool}}
+    """
+    dt = pd.to_datetime(dates.values, errors='coerce')
+    mini_df = pd.DataFrame({'is_invalid': series.isna().values}, index=series.index)
+
+    day_names = ['月', '火', '水', '木', '金', '土', '日']
+    candidates: dict[str, np.ndarray] = {}
+    for i, name in enumerate(day_names):
+        candidates[f'曜日_{name}'] = (dt.dayofweek == i)
+    for d in range(10):
+        candidates[f'末尾_{d}'] = (dt.day % 10 == d)
+    candidates['ゾロ目'] = np.isin(dt.day, [11, 22])
+
+    names_list = list(candidates.keys())
+    p_values: list[float] = []
+    effect_sizes: list[float] = []
+    bias_skips: list[bool] = []
+
+    for name in names_list:
+        mask_arr = candidates[name]
+        mask_s = pd.Series(mask_arr, index=series.index)
+        bias = check_missing_bias_fn(mini_df, mask_s)
+        if bias['skip_test']:
+            p_values.append(1.0)
+            effect_sizes.append(0.0)
+            bias_skips.append(True)
+            continue
+        bias_skips.append(False)
+        valid_s = series.dropna()
+        valid_mask = mask_s.reindex(valid_s.index).fillna(False)
+        grp_c = valid_s[valid_mask]
+        grp_ctrl = valid_s[~valid_mask]
+        if len(grp_c) < 5 or len(grp_ctrl) < 5:
+            p_values.append(1.0)
+            effect_sizes.append(0.0)
+            continue
+        _, p = stats.mannwhitneyu(grp_c, grp_ctrl, alternative='greater')
+        n1, n2 = len(grp_c), len(grp_ctrl)
+        u_stat, _ = stats.mannwhitneyu(grp_c, grp_ctrl, alternative='two-sided')
+        # u_stat は grp_c 側のU統計量なので、grp_c > grp_ctrl (=p値の検定方向)ほど
+        # rbc が正になるようにする(符号を反転すると有意なパターンが常にeffect_sizeゲートで弾かれる)
+        rbc = float(2.0 * u_stat / (n1 * n2) - 1.0)
+        p_values.append(float(p))
+        effect_sizes.append(rbc)
+
+    significant_flags = benjamini_hochberg(p_values)
+    results: dict = {}
+    for i, name in enumerate(names_list):
+        results[name] = {
+            'p_adj': p_values[i],
+            'effect_size': effect_sizes[i],
+            'significant': (bool(significant_flags[i])
+                            and effect_sizes[i] >= EFFECT_SIZE_THRESHOLD
+                            and not bias_skips[i]),
+        }
+    return results
+
+
+def benjamini_hochberg(p_values: list[float], alpha: float = FDR_ALPHA) -> list[bool]:
+    """Benjamini-Hochberg FDR補正を適用し、各p値が有意かどうかを返す。"""
+    n = len(p_values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: p_values[i])
+    last_reject = -1
+    for rank_minus1, orig_i in enumerate(order):
+        if p_values[orig_i] <= (rank_minus1 + 1) / n * alpha:
+            last_reject = rank_minus1
+    reject = [False] * n
+    for rank_minus1 in range(last_reject + 1):
+        reject[order[rank_minus1]] = True
+    return reject
+
+
+def score_teppandai(
+    df: pd.DataFrame,
+    machine_name: str,
+    unit_col: str = '台番号',
+) -> pd.Series:
+    """
+    S_鉄板台: 2経路を統合した鉄板台スコア(0〜1)。
+    メイン経路: ACF → PDM → Lomb-Scargle(判定不能率高い台)
+    別経路: カレンダー17候補の検定
+    両経路が一致 → 確信度UP / 未知周期のみ → 別枠記録
+    履歴14日未満の台は NaN(検出不可扱い)。
+    """
+    from preprocess import check_missing_bias  # 循環インポート回避のため局所import
+
+    scores = pd.Series(np.nan, index=df.index)
+    mask_machine = df['機種名'] == machine_name
+    sub = df[mask_machine]
+    if sub.empty:
+        return scores
+
+    for (hole, unit), grp in sub.groupby(['ホール名', unit_col], sort=False):
+        grp_sorted = grp.sort_values('日付')
+        hp = grp_sorted['high_prob'].copy()
+        if 'is_invalid' in grp_sorted.columns:
+            hp[grp_sorted['is_invalid'].fillna(True).values] = np.nan
+        hp = hp.reset_index(drop=True)
+
+        n_total = len(hp)
+        if n_total < 14:
+            continue
+        n_invalid = int(hp.isna().sum())
+        invalid_rate_val = n_invalid / n_total
+
+        # ── メイン経路 ──
+        main_significant = False
+        if invalid_rate_val > INVALID_RATE_THRESHOLD:
+            ts = pd.Series(np.arange(n_total, dtype=float))
+            main_significant = len(lomb_scargle_screen(hp, ts)) > 0
+        else:
+            sig_lags = acf_screen(hp)
+            if sig_lags:
+                pdm_result = pdm_confirm(hp, sig_lags)
+                main_significant = any(v['confirmed'] for v in pdm_result.values())
+
+        # ── カレンダー経路 ──
+        date_series = pd.Series(grp_sorted['日付'].values)
+        cal_results = calendar_test(hp, date_series, check_missing_bias)
+        calendar_significant = any(v['significant'] for v in cal_results.values())
+
+        # ── 2経路統合 ──
+        if main_significant and calendar_significant:
+            unit_score = 1.0
+        elif main_significant or calendar_significant:
+            unit_score = 0.6
+        else:
+            continue  # 検出不可 → NaN のまま
+
+        scores.loc[grp_sorted.index] = unit_score
+
+    return scores
+
+
+def score_rotation(
+    df: pd.DataFrame,
+    machine_name: str,
+    group_col: str = '台番号',
+) -> pd.Series:
+    """
+    S_ローテ: 窓内集中度(ジニ係数) + 並べ替え検定 + FDR補正 + 効果量ゲート。
+    判定: 分散が有意 かつ ジニ係数が中程度(0.15〜0.7) → ローテーション検出。
+    スコアはジニ係数(0〜1)をそのままホール×機種の全行に適用。
+    """
+    from preprocess import check_missing_bias  # 循環インポート回避のため局所import
+
+    scores = pd.Series(np.nan, index=df.index)
+    mask_machine = df['機種名'] == machine_name
+    sub = df[mask_machine]
+    if sub.empty:
+        return scores
+
+    for hole, hole_grp in sub.groupby('ホール名', sort=False):
+        if 'is_invalid' in hole_grp.columns:
+            valid = hole_grp[~hole_grp['is_invalid'].fillna(True)]
+        else:
+            valid = hole_grp
+        if len(valid) < 10:
+            continue
+
+        unit_means = valid.groupby(group_col)['high_prob'].mean()
+        n_units = len(unit_means)
+        if n_units < 3:
+            continue
+
+        vals = unit_means.values
+        sorted_vals = np.sort(vals)
+        n = len(sorted_vals)
+        total = sorted_vals.sum()
+        if total > 0:
+            # 標準Gini: G = (2*sum((i+1)*x_i))/(n*sum(x)) - (n+1)/n  (i=0..n-1, 昇順)
+            gini = float(
+                (2.0 * np.dot(np.arange(1, n + 1), sorted_vals)) / (n * total) - (n + 1) / n
+            )
+        else:
+            gini = 0.0
+        gini = float(np.clip(gini, 0.0, 1.0))
+
+        # 欠損偏りガード(全行候補として渡す)
+        mini_df = (valid[['is_invalid']].copy() if 'is_invalid' in valid.columns
+                   else pd.DataFrame({'is_invalid': pd.Series(False, index=valid.index)}))
+        bias = check_missing_bias(mini_df, pd.Series(True, index=valid.index))
+        if bias['skip_test']:
+            continue
+
+        # 並べ替え検定: ユニット間 high_prob 平均の分散が偶然より大きいか
+        obs_var = float(np.var(vals, ddof=1))
+        flat = valid['high_prob'].dropna().values
+        if len(flat) < n_units:
+            continue
+        unit_sizes = valid.groupby(group_col).size().values
+        rng = np.random.default_rng(42)
+        count_ge = sum(
+            float(np.var(
+                [float(np.mean(perm[s:s + sz]))
+                 for s, sz in zip(np.cumsum(np.concatenate([[0], unit_sizes[:-1]])), unit_sizes)],
+                ddof=1,
+            )) >= obs_var
+            for perm in (rng.permutation(flat) for _ in range(500))
+        )
+        p_val = count_ge / 500
+
+        # ローテ: 有意 かつ 中程度集中(GINI_THRESHOLD≤gini<0.7 = 1台独占でも均等でもない)
+        if (p_val < FDR_ALPHA
+                and gini >= GINI_THRESHOLD
+                and gini < 0.7):
+            scores.loc[hole_grp.index] = gini
+
+    return scores
+
+
+def score_sueki(df: pd.DataFrame) -> pd.Series:
+    """
+    S_据え置き: Stage3スコアのlag-1自己相関(0〜1)。
+    正の自己相関 = 前日と同傾向の高設定が続いている(据え置き)。
+    履歴10日未満の台は NaN(検出不可扱い)。
+    """
+    scores = pd.Series(np.nan, index=df.index)
+    for (hole, machine, unit), grp in df.groupby(['ホール名', '機種名', '台番号'], sort=False):
+        grp_sorted = grp.sort_values('日付')
+        hp = grp_sorted['high_prob'].copy()
+        if 'is_invalid' in grp_sorted.columns:
+            hp[grp_sorted['is_invalid'].fillna(True).values] = np.nan
+        x = hp.values.astype(float)
+        x1, x2 = x[:-1], x[1:]
+        valid = ~(np.isnan(x1) | np.isnan(x2))
+        if int(valid.sum()) < 10:
+            continue
+        v1, v2 = x1[valid], x2[valid]
+        if np.std(v1) == 0 or np.std(v2) == 0:
+            continue
+        try:
+            r, _ = stats.pearsonr(v1, v2)
+        except Exception:
+            continue
+        scores.loc[grp_sorted.index] = float(max(0.0, r))
+    return scores
+
+
+def compute_depth_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """全深さ型サブスコアを計算して列追加した DataFrame を返す。"""
+    out = df.copy()
+    teppan = pd.Series(np.nan, index=out.index)
+    rotation = pd.Series(np.nan, index=out.index)
+    for machine in out['機種名'].dropna().unique():
+        mask = out['機種名'] == machine
+        teppan[mask] = score_teppandai(out, machine).reindex(out.index[mask])
+        rotation[mask] = score_rotation(out, machine).reindex(out.index[mask])
+    out['S_鉄板台'] = teppan
+    out['S_ローテ'] = rotation
+    out['S_据え置き'] = score_sueki(out)
+    return out
+
+
+# ── αブレンド ─────────────────────────────────────────────────────
+
+def compute_short_term_score(
+    df: pd.DataFrame,
+    score_col: str,
+    window: int = SHORT_WINDOW_DEFAULT,
+) -> pd.Series:
+    """
+    指定サブスコアの短期版(直近M日のウィンドウ)を計算する。
+    サンプル不足時はNaN → blend() 内でα=0フォールバック。
+    """
+    result = pd.Series(np.nan, index=df.index)
+    all_dates = sorted(df['日付'].unique())
+    if len(all_dates) < window:
+        return result
+
+    cutoff = all_dates[-window]
+    short_df = df[df['日付'] >= cutoff]
+
+    if score_col == 'S_全台系':
+        short_scores = score_zentaiki(short_df, ['機種名'])
+    elif score_col == 'S_鉄板台':
+        teppan = pd.Series(np.nan, index=short_df.index)
+        for machine in short_df['機種名'].dropna().unique():
+            s = score_teppandai(short_df, machine)
+            teppan.update(s)
+        short_scores = teppan
+    elif score_col == 'S_ローテ':
+        rotation = pd.Series(np.nan, index=short_df.index)
+        for machine in short_df['機種名'].dropna().unique():
+            s = score_rotation(short_df, machine)
+            rotation.update(s)
+        short_scores = rotation
+    elif score_col == 'S_据え置き':
+        short_scores = score_sueki(short_df)
+    else:
+        return result
+
+    result.loc[short_scores.index] = short_scores.values
+    return result
+
+
+def walk_forward_alpha(
+    long_scores: pd.Series,
+    short_scores: pd.Series,
+    target: pd.Series,
+    min_train_size: int = 60,
+) -> float:
+    """
+    ウォークフォワード検証でαを学習する。
+    target: 差枚 or Stage3スコアの時系列。サンプル不足時は 0.0 を返す。
+    """
+    df_wf = pd.concat([long_scores, short_scores, target], axis=1)
+    df_wf.columns = ['long', 'short', 'target']
+    df_wf = df_wf.sort_index().dropna(subset=['long', 'target'])
+
+    n = len(df_wf)
+    if n < min_train_size + 1:
+        return 0.0
+
+    long_v = df_wf['long'].values.astype(float)
+    short_v = df_wf['short'].values.astype(float)
+    tgt_v = df_wf['target'].values.astype(float)
+
+    def eval_alpha(alpha: float) -> float:
+        total_se = 0.0
+        count = 0
+        for t in range(min_train_size, n):
+            s, l = short_v[t], long_v[t]
+            blended = (alpha * s + (1.0 - alpha) * l) if not np.isnan(s) else l
+            total_se += (blended - tgt_v[t]) ** 2
+            count += 1
+        return total_se / count if count > 0 else np.inf
+
+    res = minimize_scalar(eval_alpha, bounds=(0.0, 1.0), method='bounded')
+    return float(np.clip(res.x, 0.0, 1.0))
+
+
+def blend(
+    long_score: pd.Series,
+    short_score: pd.Series,
+    alpha: float,
+) -> pd.Series:
+    """
+    ブレンド済みサブスコア = α×short + (1-α)×long。
+    short_score が NaN(サンプル不足)の行はα=0として長期版を使用。
+    """
+    result = long_score.copy().astype(float)
+    has_both = short_score.notna() & long_score.notna()
+    result[has_both] = (
+        alpha * short_score[has_both] + (1.0 - alpha) * long_score[has_both]
+    )
+    return result
+
+
+def learn_all_alphas(
+    df: pd.DataFrame,
+    hole_name: str,
+    scores: list[str] = BLENDABLE_SCORES,
+) -> dict:
+    """
+    全対象スコア(BLENDABLE_SCORES)のαを店舗×スコア別に学習する。
+    Returns: {スコア名: α}
+    """
+    hole_df = df[df['ホール名'] == hole_name].copy()
+    alphas: dict = {}
+
+    for score_col in scores:
+        if score_col not in hole_df.columns or 'high_prob' not in hole_df.columns:
+            alphas[score_col] = 0.0
+            continue
+
+        short_series = compute_short_term_score(hole_df, score_col)
+        hole_df['_short'] = short_series
+
+        daily = hole_df.groupby('日付').agg(
+            long_score=(score_col, 'mean'),
+            short_score=('_short', 'mean'),
+        )
+        daily_target = hole_df.groupby('日付')['high_prob'].mean()
+
+        alphas[score_col] = walk_forward_alpha(
+            daily['long_score'],
+            daily['short_score'],
+            daily_target,
+        )
+
+    hole_df.drop(columns=['_short'], errors='ignore', inplace=True)
+    return alphas

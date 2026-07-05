@@ -1,0 +1,25 @@
+name: Daily Scraping
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # 毎日 21:00 JST (UTC+9) に実行
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r fase1/requirements.txt
+
+      - name: Run scraper
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python fase1/メイン.py
