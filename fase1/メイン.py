@@ -21,7 +21,6 @@ MIN_SLEEP     = 10   # 最低待機時間（秒）
 BATCH_SIZE    = 20   # この件数ごとに長めの休憩を挟む
 BATCH_BREAK   = 60 * 5  # バッチ休憩時間（秒）
 
-DAILY_LOOKBACK_DAYS   = 3    # 通常運用時: 当日含め直近何日分をチェックするか（実行漏れ対策）
 INITIAL_BACKFILL_DAYS = 90   # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか
 
 STORES_FILE = os.path.join(os.path.dirname(__file__), 'stores.json')
@@ -35,10 +34,21 @@ def load_stores() -> list[str]:
 
 def process_store(con, hole_name: str):
     processed = get_processed_dates(con, hole_name)
-    lookback_days = INITIAL_BACKFILL_DAYS if not processed else DAILY_LOOKBACK_DAYS
-
     today = dt.now()
-    day_list = [(today - timedelta(days=x)).strftime('%Y-%m-%d') for x in range(lookback_days, -1, -1)]
+
+    if processed:
+        # 前回取得済みの最終日の翌日から当日まで（実行間隔が空いてもギャップを残さない）
+        last_date = max(dt.strptime(d, '%Y-%m-%d') for d in processed)
+        start_date = last_date + timedelta(days=1)
+    else:
+        # 新規店舗: 初回のみ指定日数さかのぼる
+        start_date = today - timedelta(days=INITIAL_BACKFILL_DAYS)
+
+    day_list = []
+    d = start_date
+    while d.date() <= today.date():
+        day_list.append(d.strftime('%Y-%m-%d'))
+        d += timedelta(days=1)
     remaining = [day for day in day_list if day not in processed]
 
     if not remaining:

@@ -7,20 +7,25 @@ metadata:
 
 # データ収集スキル — 総合リファレンス
 
-> 要件定義「1. データ収集」・データ収集_構成図.md・各スキルファイルを統合したドキュメント（2026-06-28）
+> 要件定義「1. データ収集」・データ収集_構成図.md・各スキルファイルを統合したドキュメント（2026-06-28、2026-07 Stage A移行反映）
 
 ---
 
 ## システム概要
 
-`ana-slo.com` からパチスロホールの台データをスクレイピングし、SQLiteに保存する。
+`ana-slo.com` からパチスロホールの台データをスクレイピングし、クラウドDB「Turso」（libSQL/SQLite互換）に保存する。GitHub Actionsで毎日自動実行され、PC上での手動実行も引き続き可能。
 
 ```
 メイン.py（エントリーポイント）
+  ├── stores.json（対象店舗一覧）
   ├── scraper.py（HTTPリクエスト・HTML解析）
-  └── db.py（SQLite保存・スキーマ管理）
-        └── ホールデータ/{ホール名}.db
+  └── db.py（Turso保存・スキーマ管理）
+        └── Turso DB（libsql://xxxx.turso.io、Primary Location: Tokyo）
+              全店舗が同一DB内で`ホール名`列により区別される（共有DB方式）
 ```
+
+実行環境: GitHub Actions（`.github/workflows/scrape.yml`、毎日21:00 JST・`workflow_dispatch`で手動実行も可）またはローカルPC（`py -3.12 メイン.py`）。
+リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）
 
 ---
 
@@ -28,13 +33,13 @@ metadata:
 
 | フェーズ | 処理 | 担当 |
 |---|---|---|
-| ① 入力受付 | 日付・URL検証、slug抽出 | `メイン.py` + `scraper.extract_slug` |
-| ② DB初期化 | テーブル作成・スキーマmigration | `db.setup_db` |
-| ③ 重複スキップ | 取得済み日付をDBから取得して除外 | `db.get_processed_dates` |
+| ① 店舗一覧読み込み | `stores.json`から対象ホール（スラッグ）一覧を取得 | `メイン.py.load_stores` |
+| ② DB初期化 | テーブル作成（`IF NOT EXISTS`、Turso上に無ければ作成） | `db.setup_db` |
+| ③ 日付範囲の自動算出 | 店舗ごとに取得済み最終日を調べ、翌日〜当日を対象に（新規店舗は`INITIAL_BACKFILL_DAYS`＝90日分バックフィル） | `メイン.py.process_store` + `db.get_processed_dates` |
 | ④ URL構築 | `https://ana-slo.com/{日付}-{slug}-data/` | `scraper.build_url` |
 | ⑤ HTTP取得 | リトライ3回・指数バックオフ・SSL対応 | `scraper.fetch_page` |
 | ⑥ HTML解析 | section単位でカラム数自動検出・台データ抽出 | `scraper.get_info` |
-| ⑦ データ保存 | 正常データ → `slot_data`、欠損 → `missing_data` | `db.write_db` / `write_missing` / `write_null_record` |
+| ⑦ データ保存 | 正常データ → `slot_data`、欠損 → `missing_data`（Turso DBへ） | `db.write_db` / `write_missing` / `write_null_record` |
 | ⑧ レート制御 | 通常10〜40秒待機、20件ごとに5分休憩 | `メイン.py` |
 
 ---
@@ -102,13 +107,23 @@ metadata:
 
 ## db.py
 
-### DBファイルの場所
-`ホールデータ/{ホール名スラッグ}.db`（店舗ごとにファイル分離）
+### 接続先
+Turso（libSQL/SQLite互換）の共有DB1つに全店舗のデータが入る（`ホール名`列で区別、店舗ごとのファイル分離は廃止）。
+
+```python
+def get_connection():
+    return libsql.connect(
+        database=os.environ['TURSO_DATABASE_URL'],
+        auth_token=os.environ['TURSO_AUTH_TOKEN'],
+    )
+```
+
+`メイン.py`で1回だけ接続を作り、全店舗のループで使い回す（`con`を各関数に引数で渡す設計。旧`db_path`引数は廃止）。
 
 ### テーブル構造: `slot_data`
 
 ```sql
-CREATE TABLE slot_data (
+CREATE TABLE IF NOT EXISTS slot_data (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     日付     TEXT NOT NULL,
     ホール名 TEXT NOT NULL,
@@ -130,7 +145,7 @@ CREATE TABLE slot_data (
 ### テーブル構造: `missing_data`
 
 ```sql
-CREATE TABLE missing_data (
+CREATE TABLE IF NOT EXISTS missing_data (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     日付     TEXT NOT NULL,
     ホール名 TEXT NOT NULL,
@@ -144,13 +159,17 @@ CREATE TABLE missing_data (
 
 | 関数 | 役割 |
 |---|---|
-| `setup_db(db_path)` | 起動時に1回だけ呼ぶ。旧スキーマ検出時は自動migration |
-| `_migrate_to_new_schema(con, cur)` | `slot_data` → `slot_data_old` にリネーム後、新テーブル作成・データ移行。旧データは `slot_data_old` に残す（手動確認・復元用） |
-| `get_processed_dates(db_path, hole_name)` | 取得済み日付セットを返す。`main()` でループ前に呼び、取得済み日付をスキップしてHTTPリクエストを節約 |
+| `get_connection()` | Turso DBへの接続を返す。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`環境変数が必須 |
+| `setup_db(con)` | 起動時に1回だけ呼ぶ。`CREATE TABLE IF NOT EXISTS`のみ（Tursoは新規DBのため旧スキーマmigrationロジックは不要・削除済み） |
+| `get_processed_dates(con, hole_name)` | 指定ホールの取得済み日付セットを返す。`メイン.py`で店舗ごとの日付範囲自動算出に使う |
 | `_parse_row(row, hole_name)` | `'/'` を含むセルを確率列、含まないセルを数値列として自動判別 |
-| `write_db(...)` | `data_column_list` / `data_row_list` を使って `data_list` をスライスし行に分割。`executemany` + `INSERT OR IGNORE` で一括インサート |
-| `write_missing(...)` | 欠損記録を `missing_data` テーブルに追加。`machine_name=None` はホール全体の欠損（ページにデータなし） |
-| `write_null_record(...)` | 機種名判明・データ取得失敗時、数値列NULLのプレースホルダーを `slot_data` に挿入。同日・同機種のNULLレコードが既にあれば挿入しない（重複防止チェック付き） |
+| `write_db(con, ...)` | `data_column_list` / `data_row_list` を使って `data_list` をスライスし行に分割。`executemany` + `INSERT OR IGNORE` で一括インサート |
+| `write_missing(con, ...)` | 欠損記録を `missing_data` テーブルに追加。`machine_name=None` はホール全体の欠損（ページにデータなし） |
+| `write_null_record(con, ...)` | 機種名判明・データ取得失敗時、数値列NULLのプレースホルダーを `slot_data` に挿入。同日・同機種のNULLレコードが既にあれば挿入しない（重複防止チェック付き） |
+
+### 移行時の注意点（Turso Upload DB）
+- TursoのUpload DB機能は`journal_mode=WAL`のSQLiteファイルしか受け付けない（`Protocol error: upload works only for DBs with journal_mode=WAL`）。アップロード前に`PRAGMA journal_mode=WAL;`を実行し、`PRAGMA wal_checkpoint(TRUNCATE);`で`-wal`/`-shm`ファイルを本体に統合してからアップロードする
+- ローカルPythonが3.14の場合、`libsql`パッケージのプリビルドwheelが無くソースビルド（Rust/maturin）に失敗することがある。Python 3.12を使うと解決する（`py -3.12 -m pip install -r requirements.txt`）
 
 ### `_parse_row` の確率列判別ロジック
 
@@ -185,13 +204,47 @@ scraper.get_info()
 ```
 
 ### 注意点
-- `con.close()` は `try/finally` で確実に実施
-- スキーマ変更時は `_CURRENT_SCHEMA_COLS` セットと `_CREATE_TABLE_SQL` を両方更新する
+- `con.close()` は `try/finally` で確実に実施（`メイン.py`の`main()`内）
+- スキーマ変更時は `_CREATE_TABLE_SQL` を更新する
 - ART/ART確率は現在全行NULL（ART非搭載機種のみのデータのため正常）。分析フェーズでNULL除外が必要
 
 ---
 
 ## メイン.py
+
+### 店舗ループとstores.json
+
+`input()`による対話入力は廃止。`stores.json`（`{"stores": ["スラッグ1", "スラッグ2", ...]}`）から対象ホール一覧を読み込み、1つのTurso接続(`con`)を使い回して店舗ごとに処理する。
+
+```python
+def main():
+    stores = load_stores()
+    con = get_connection()
+    try:
+        setup_db(con)
+        for hole_name in stores:
+            process_store(con, hole_name)
+    finally:
+        con.close()
+```
+
+### 日付範囲の自動算出（無人実行対応）
+
+店舗ごとに`get_processed_dates`で取得済み日付を調べ、以下のロジックで対象日付を決める。
+
+```python
+if processed:
+    # 前回取得済みの最終日の翌日から当日まで（実行間隔が空いてもギャップを残さない）
+    last_date = max(dt.strptime(d, '%Y-%m-%d') for d in processed)
+    start_date = last_date + timedelta(days=1)
+else:
+    # 新規店舗: 初回のみ指定日数さかのぼる
+    start_date = today - timedelta(days=INITIAL_BACKFILL_DAYS)  # デフォルト90日
+```
+
+- 日次実行が想定通り毎日走っていれば「前日1日分」だけになり数分で終わる
+- 実行が数日〜数週間空いても、最終取得日からのギャップを自動的に埋める（固定の「直近N日」方式だと長期間の抜けが永久に埋まらないため、この方式を採用）
+- 新規店舗（`stores.json`に追加した直後で取得済みデータが0件）は`INITIAL_BACKFILL_DAYS`分だけ初回バックフィルする
 
 ### アクセス間隔（動的sleep）
 
@@ -222,21 +275,16 @@ except AccessForbiddenError as e:
 
 残りの日付も処理しない（一時的なIP制限が原因のため無駄なリクエストを避ける）。
 
-### DB済み日付のスキップ
-
-- `get_processed_dates()` で取得済み日付セットを取得
-- ループ前に `remaining` リストを作成してスキップ
-
 ### 欠損処理
 
 ```python
 data_list, data_column_list, data_row_list, missing_machines = get_info(session, url, day)
 if data_list:
-    write_db(...)
+    write_db(con, data_list, data_column_list, data_row_list, hole_name, day)
 for machine_name, reason in missing_machines:
-    write_missing(db_path, hole_name, day, machine_name, reason)
+    write_missing(con, hole_name, day, machine_name, reason)
     if machine_name:                          # 機種名が特定できた場合のみ
-        write_null_record(db_path, hole_name, day, machine_name)
+        write_null_record(con, hole_name, day, machine_name)
 ```
 
 - `machine_name=None`（ページにデータなし）は `missing_data` のみ記録
@@ -275,19 +323,21 @@ finally:
 
 ---
 
-## 検討中の変更（未実装・Stage A移行計画）
+## Stage A移行（実装済み・2026-07）
 
-2026-07に要件定義「3. 配信・公開」（旧LINE通知）の議論の中で、fase1側の以下の変更を決定（実装は未着手）。
+要件定義「3. 配信・公開」（旧LINE通知）の議論を受け、fase1をクラウド化した。変更点は以下の通り。
 
-| 項目 | 現状 | 変更後 |
+| 項目 | 移行前 | 移行後 |
 |---|---|---|
-| DB | ローカルSQLite（`ホールデータ/{ホール名}.db`） | クラウドDB「Turso」（libSQL/SQLite互換）。`db.py`をsqlite3標準ライブラリからTursoクライアントへ書き換え |
-| 店舗URL入力 | `メイン.py`で`input()`により対話入力 | リポジトリ内`stores.json`に店舗一覧を記載し読み込む方式（店舗数・データ量は今後も増加予定のため、Git管理で追跡） |
-| 日付範囲入力 | `input()`で開始日・終了日を対話入力 | `get_processed_dates`を使い「前回取得済み日の翌日〜当日」を自動算出 |
-| 実行環境 | ローカルPCで手動実行 | GitHub Actionsの定期実行（`schedule: cron`）を追加。Selenium等のブラウザ操作が不要な素の`requests`実装のため無料枠内で運用可能 |
-| PC上の手動実行 | — | 廃止しない。同じコード・同じTurso DBに対して引き続き手動実行可能（クラウド化は「DBの置き場所」と「定期実行の主体」を追加するだけ） |
+| DB | ローカルSQLite（店舗ごとに`ホールデータ/{ホール名}.db`） | クラウドDB「Turso」（libSQL/SQLite互換、Tokyo）に1つの共有DBとして統合。`db.py`をsqlite3標準ライブラリからTursoクライアント(`libsql`)へ書き換え |
+| 店舗URL入力 | `メイン.py`で`input()`により対話入力 | リポジトリ内`stores.json`に店舗一覧（スラッグ）を記載し読み込む方式 |
+| 日付範囲入力 | `input()`で開始日・終了日を対話入力 | 店舗ごとに`get_processed_dates`の最終日+1〜当日を自動算出（新規店舗は90日分バックフィル） |
+| 実行環境 | ローカルPCで手動実行のみ | GitHub Actions（`.github/workflows/scrape.yml`、毎日21:00 JST）を追加。ローカルPCでの手動実行も引き続き可能 |
+| 既存データ | ローカルSQLite5ファイル（計291,979件） | `merge_stores_for_turso.py`で1ファイルに統合→journal_mode=WAL変換→Turso Upload DBで移行済み |
 
-- Turso無料枠はストレージ5GB。店舗数・蓄積データ増加により将来逼迫する可能性があるため、運用開始後は使用量を監視し、必要に応じて有料プラン（Developer: $4.99〜/月、9GBストレージ）への移行を検討する
+- Turso無料枠はストレージ5GB。店舗数・蓄積データ増加により将来逼迫する可能性があるため、運用しながら使用量を監視し、必要に応じて有料プラン（Developer: $4.99〜/月、9GBストレージ）への移行を検討する
+- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み
+- ローカル実行にはPython 3.12を使用（3.14では`libsql`のビルドに失敗するため。詳細は「db.py」節参照）
 - 詳細な移行方針は[`要件定義.md`](../要件定義.md)「3. 配信・公開」参照
 
 ---
@@ -296,3 +346,7 @@ finally:
 
 - 要件定義 → `要件定義.md`
 - 構成図 → `fase1/データ収集_構成図.md`
+- 依存パッケージ → `fase1/requirements.txt`（requests / beautifulsoup4 / libsql）
+- 対象店舗一覧 → `fase1/stores.json`
+- GitHub Actions定義 → `.github/workflows/scrape.yml`
+- 移行用ワンショットスクリプト → `fase1/merge_stores_for_turso.py`（既存ローカルSQLiteをTurso Upload DB用に統合。恒久パイプラインには含まれない）

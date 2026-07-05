@@ -7,12 +7,12 @@
 
 | 要件定義 | フォルダ | 状態 | 主要ファイル |
 |---|---|---|---|
-| 1. データ収集 | [`fase1/`](fase1/) | 実装済み | `メイン.py` / `scraper.py` / `db.py` |
+| 1. データ収集 | [`fase1/`](fase1/) | 実装済み（Turso対応・GitHub Actions自動化まで完了） | `メイン.py` / `scraper.py` / `db.py` / `stores.json` |
 | 2. 設定推測・パターン分析 | [`fase2/`](fase2/) | 実装済み | 下表参照 |
-| 3. 配信・公開（iPhone Web閲覧） | `fase3/` | 未実装 | 段階移行: DB移行(Turso)→Stage A(fase1をGitHub Actionsでクラウド実行、`stores.json`で店舗管理)→Stage B(機能A/BもクラウドホスティングしiPhoneから直接アクセス) |
+| 3. 配信・公開（iPhone Web閲覧） | `fase3/` | Stage A実装済み・Stage B未着手 | Stage A: fase1をGitHub Actionsでクラウド実行しTurso DBへ書き込み（完了）。Stage B: 機能A/Bもクラウドホスティングし iPhoneから直接アクセス（未着手） |
 | 4. 日次自動実行 | `fase4/` | 未実装 | `fase4/run_daily.py` |
 
-> ※ Stage A実装時、fase1は`db.py`(sqlite3→Turso/libsqlクライアント)と`メイン.py`(input()廃止→`stores.json`+自動日付算出)を変更予定。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)の「検討中の変更」参照
+> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜当日）に変更。GitHub Actions（`.github/workflows/scrape.yml`）で毎日21:00 JSTに自動実行。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
 
 ### fase2 ファイル構成
 
@@ -42,5 +42,6 @@
 
 ## データ保存先
 
-- SQLite DB: `ホールデータ/{ホール名スラッグ}.db`
+- クラウドDB: Turso（libSQL/SQLite互換、Primary Location: Tokyo/nrt）。`fase1/db.py`が`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`環境変数で接続（GitHub Secretsに登録済み）
+- ローカルSQLite: `ホールデータ/{ホール名スラッグ}.db`（Turso移行前の生データ。`.gitignore`でGit管理対象外。Turso移行時に`fase1/merge_stores_for_turso.py`で1ファイルに統合しUpload DB機能で移行済み）
 - 対象サイト: `ana-slo.com`
