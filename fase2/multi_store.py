@@ -137,11 +137,19 @@ def _save_channel_weights(weights: dict) -> None:
     preprocess.load_channel_weights(読み手)が期待する w1/w2/w3/orth_a/orth_b に合わせる。
     ※ 旧実装はb0〜b3キーで保存しており、読み手にマージされても無視される
       (=学習結果が使われない)バグがあった。
+    Stage5の学習対象外のキー(prior_high_ratio=事前確率π。手動設定値)は
+    既存ファイルの値を保全してから上書き保存する(学習実行のたびに消えるのを防ぐ)。
     """
     allowed = {'w1', 'w2', 'w3', 'orth_a', 'orth_b'}
     assert set(weights.keys()) <= allowed, f'不正なキー: {weights.keys()}'
+    preserved_keys = {'prior_high_ratio'}
+    merged = dict(weights)
+    if pp.CHANNEL_WEIGHTS_PATH.exists():
+        existing = json.loads(pp.CHANNEL_WEIGHTS_PATH.read_text(encoding='utf-8'))
+        for key in preserved_keys & set(existing.keys()):
+            merged[key] = existing[key]
     pp.CHANNEL_WEIGHTS_PATH.write_text(
-        json.dumps(weights, ensure_ascii=False, indent=2), encoding='utf-8'
+        json.dumps(merged, ensure_ascii=False, indent=2), encoding='utf-8'
     )
 
 

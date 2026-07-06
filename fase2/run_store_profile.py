@@ -122,6 +122,67 @@ def _run_teppan_predictions(
     sc.write_prediction_log(analysis_db, rows)
 
 
+def _run_transition_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> int:
+    """
+    [Stage7-3] 遷移モデル(据え置き/上げ/下げ)による全台翌日予測をprediction_logへ追記する。
+
+    S_鉄板台の翌日予測(検出済みの台のみ)と異なり、使用データ最終日に判定可能だった
+    全台が対象(検出条件の有無に依存しない全台カバレッジの翌日予測)。
+    予測値 = 当日high_prob×P(高→高) + (1-当日high_prob)×P(低→高)。
+    遷移行列は長期(全履歴)・短期(直近SHORT_WINDOW_DEFAULT日)の両方で推定しαブレンドする。
+    リーク禁止: 使用するのは使用データ最終日以前のhigh_probのみ(実測差枚は渡さない)。
+    入力は上限キャリブレーション補正後のhigh_prob(呼び出し位置で保証)。
+    """
+    matrix_long = pt.estimate_transition_matrix(scored, hole_name)
+
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates or matrix_long is None:
+        return 0  # ペア数不足(新規店舗など)は予測不可として記録しない
+    max_date = all_dates[-1]
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+
+    if len(all_dates) >= pt.SHORT_WINDOW_DEFAULT:
+        cutoff = all_dates[-pt.SHORT_WINDOW_DEFAULT]
+        matrix_short = pt.estimate_transition_matrix(scored[scored['日付'] >= cutoff], hole_name)
+    else:
+        matrix_short = None
+
+    last_day = scored[(scored['日付'] == max_date) & (scored['ホール名'] == hole_name)]
+    if 'is_invalid' in last_day.columns:
+        last_day = last_day[~last_day['is_invalid'].fillna(True)]
+    last_day = last_day.dropna(subset=['high_prob'])
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    detail_common = {'長期遷移': matrix_long, '短期遷移': matrix_short}
+    rows = []
+    for _, r in last_day.iterrows():
+        p_today = float(r['high_prob'])
+        result = pt.predict_transition_with_blend(p_today, matrix_long, matrix_short)
+        if result['ブレンド値'] is None:
+            continue
+        rows.append({
+            '実行日時': now,
+            '使用データ最終日': str(max_date),
+            '対象日': next_date.strftime('%Y-%m-%d'),
+            'ホール名': hole_name,
+            '機種名': r['機種名'],
+            '台番号': int(r['台番号']),
+            '予測種別': '遷移予測',
+            '長期スコア': result['長期スコア'],
+            '短期スコア': result['短期スコア'],
+            'ブレンド値': result['ブレンド値'],
+            '使用alpha': result['使用alpha'],
+            '詳細': {**detail_common, '当日high_prob': p_today},
+        })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
 def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str | None = None) -> None:
     """指定店舗のslot_dataから stage3_scores / store_profile を再計算して書き込む。"""
     replica_db = replica_db or str(ds.REPLICA_DB_PATH)
@@ -167,6 +228,10 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     # 上限キャリブレーション補正後の値を保存するため、補正が終わったここで書き込む
     sc.write_stage3_scores(analysis_db, hole_name, scored)
 
+    # [Stage7-3] 遷移モデルによる全台翌日予測。上限キャリブレーション補正後の
+    # high_probを入力にするため、compute_uplimitの後に呼ぶ
+    n_transition = _run_transition_predictions(scored, hole_name, analysis_db)
+
     weights = pp.load_weights(str(pp.WEIGHTS_PATH)) if pp.WEIGHTS_PATH.exists() else {}
     reliabilities = {
         col: sc.compute_reliability(scored, col)
@@ -186,7 +251,8 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     print(
         f'  [完了] {hole_name}: stage3_scores / store_profile を更新しました'
         f'({len(synthesized):,}行、上限キャリブレーション発動'
-        f'{uplimit_result["発動日数"]}/{uplimit_result["対象日数"]}日)。'
+        f'{uplimit_result["発動日数"]}/{uplimit_result["対象日数"]}日、'
+        f'遷移予測{n_transition}台)。'
     )
 
 

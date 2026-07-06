@@ -46,6 +46,14 @@ KAITEN_ZSCORE_MIN_DAYS = 5      # 台内zスコアに必要な最低履歴日数
 _DEFAULT_CHANNEL_WEIGHTS = {'w1': 1.0, 'w2': 0.5, 'w3': 0.0}
 _DEFAULT_ORTH_PARAMS = {'orth_a': 0.0, 'orth_b': 0.0}
 
+# 事前確率π: 「証拠ゼロの台日が高設定である確率」(店舗の高設定投入率の事前推定)。
+# Stage3のLogOddsに切片 β₀ = ln(π/(1-π)) として入る。旧実装はβ₀なし(=暗黙にπ=0.5)で、
+# 全証拠がゼロの行がhigh_prob=0.5となり、店舗集計E[高設定台数]/Nが0.5近辺の狭帯域に
+# 集中する原因だった(上限キャリブレーションの過剰発動の根本原因、2026-07判明)。
+# 0.15は業界感覚(高設定投入は多くて1〜2割)に基づく暫定値。stage3_channel_weights.jsonの
+# prior_high_ratioで上書き可能。将来は店舗別に学習する(上限モデルStep2/Kalman参照)。
+DEFAULT_PRIOR_HIGH_RATIO = 0.15
+
 logger = logging.getLogger(__name__)
 
 _specs_cache: dict | None = None
@@ -71,11 +79,16 @@ def load_bin_curves() -> dict:
 def load_channel_weights() -> dict:
     """
     multi_store.py(Stage5)が学習したStage3チャンネル重み(w1/w2/w3)と
-    直交化パラメータ(orth_a/orth_b)を読み込む。
-    未学習の場合は既定値(w1=1.0, w2=0.5, w3=0.0=回転数チャンネル無効)を返す。
+    直交化パラメータ(orth_a/orth_b)、事前確率(prior_high_ratio)を読み込む。
+    未学習の場合は既定値(w1=1.0, w2=0.5, w3=0.0=回転数チャンネル無効,
+    prior_high_ratio=DEFAULT_PRIOR_HIGH_RATIO)を返す。
     w3はmulti_store.validate_kaiten_channel(LOSO交差検証)に合格した場合のみ正になる。
     """
-    defaults = {**_DEFAULT_CHANNEL_WEIGHTS, **_DEFAULT_ORTH_PARAMS}
+    defaults = {
+        **_DEFAULT_CHANNEL_WEIGHTS,
+        **_DEFAULT_ORTH_PARAMS,
+        'prior_high_ratio': DEFAULT_PRIOR_HIGH_RATIO,
+    }
     if CHANNEL_WEIGHTS_PATH.exists():
         loaded = json.loads(CHANNEL_WEIGHTS_PATH.read_text(encoding='utf-8'))
         return {**defaults, **loaded}
@@ -562,10 +575,14 @@ def compute_log_odds(
     w1: float | None = None,
     w2: float | None = None,
     w3: float | None = None,
+    prior_high_ratio: float | None = None,
 ) -> pd.DataFrame:
     """
     3チャンネルのlogLRを重み付き合算し、log_odds と high_prob 列を追加して返す。
     w1: RNGチャンネル / w2: 差枚チャンネル / w3: 回転数行動チャンネル(Stage5で学習)
+    prior_high_ratio: 事前確率π(高設定投入率の事前推定)。切片 β₀=ln(π/(1-π)) として
+    LogOddsに加算する。証拠ゼロの行の high_prob が0.5ではなくπに落ちるようになり、
+    店舗集計 E[高設定台数]/N が意味を持つ(2026-07導入。DEFAULT_PRIOR_HIGH_RATIO参照)。
 
     各引数を省略した場合は stage3_channel_weights.json (multi_store.py の
     Stage5が学習) から自動読み込みする。未学習時の既定値は w1=1.0, w2=0.5,
@@ -582,10 +599,16 @@ def compute_log_odds(
         w2 = defaults['w2']
     if w3 is None:
         w3 = defaults['w3']
+    if prior_high_ratio is None:
+        prior_high_ratio = defaults['prior_high_ratio']
+    if not (0.0 < prior_high_ratio < 1.0):
+        raise ValueError(f'prior_high_ratioは(0,1)の範囲が必要: {prior_high_ratio}')
+    beta0 = float(np.log(prior_high_ratio / (1.0 - prior_high_ratio)))
 
     df = df.copy()
     df['log_odds'] = (
-        w1 * df['logLR_rng'].fillna(0.0)
+        beta0
+        + w1 * df['logLR_rng'].fillna(0.0)
         + w2 * df['logLR_sashimai'].fillna(0.0)
         + w3 * df['logLR_kaiten'].fillna(0.0)
     )

@@ -28,7 +28,7 @@
 | [`fase2/evaluate_predictions.py`](fase2/evaluate_predictions.py) | 実装済み(機能B再設計Stage7-2) | `prediction_log`とレプリカの実測差枚を突き合わせ、Spearman相関・Precision@N・リフトを`prediction_accuracy`へ集計。`python evaluate_predictions.py`で実行(翌日以降の実データがレプリカに入ってから意味を持つ) |
 | [`fase2/multi_store.py`](fase2/multi_store.py) | 実装済み(2026-07再設計) | Stage1b+Stage5+Stage6: 機種別デシルカーブ(bin_curves)学習と**LOSO交差検証ゲート**(旧実装は循環学習だったため、直交化残差が翌観測日のRNG証拠を予測できた場合のみw3>0・γ_storeを保存。不合格時はw3=0=回転数チャンネル無効)・検証(Tier再現性/マクロ整合性)。`python multi_store.py`で全店舗一括実行 |
 | [`fase2/data_source.py`](fase2/data_source.py) | 実装済み | fase2共通のデータ読み込み層。入力=Tursoレプリカ(`ホールデータ/turso_replica.db`、読み取り専用)・分析成果物の保存先=分析DB(`ホールデータ/analysis.db`)のパスと接続を集約 |
-| [`fase2/run_store_profile.py`](fase2/run_store_profile.py) | 実装済み | 1店舗分のpreprocess→patterns→scoreパイプラインを通しで実行し、分析DBの`stage3_scores`(Stage3出力)と`store_profile`を更新するバッチ(`--hole <店舗名>`で特定店舗のみ)。fase4(日次自動実行)が実装されるまでの間、新規店舗取込時やデータ更新後に手動実行する運用補助スクリプト |
+| [`fase2/run_store_profile.py`](fase2/run_store_profile.py) | 実装済み | 1店舗分のpreprocess→patterns→scoreパイプラインを通しで実行し、分析DBの`stage3_scores`(Stage3出力)と`store_profile`を更新するバッチ(`--hole <店舗名>`で特定店舗のみ)。fase4(日次自動実行)が実装されるまでの間、新規店舗取込時やデータ更新後に手動実行する運用補助スクリプト。**注意**: `--hole`指定なしの全店舗一括実行を怠ると特定店舗だけ更新が滞り機能Bの予測日付が他店舗より遅れる事例が発生済み(詳細は[`fase2/データ分析_skill.md`](fase2/データ分析_skill.md)「既知の運用リスク」参照) |
 | [`fase2/scrape_machine_specs.py`](fase2/scrape_machine_specs.py) | 実装済み | chonborista.comから機種別設定差確率表を取得し`raw_specs_scraped.json`に保存 |
 | [`fase2/assign_tier.py`](fase2/assign_tier.py) | 実装済み | `raw_specs_scraped.json`を正規化・Tier判定して`machine_setting_specs.json`を再構築 |
 

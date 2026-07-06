@@ -196,9 +196,12 @@ def _compute_event_scores(
         if not isinstance(units, (list, np.ndarray)) or len(units) == 0:
             continue
 
-        baseline = baseline_map.get((hole, machine), 0.5)
-        if pd.isna(baseline):
-            baseline = 0.5
+        # 基準値が計算不能(=この店舗×機種に有効行がない)なら検出不可として除外する。
+        # 旧実装は0.5を代入していたが、Stage3のβ₀導入(事前確率π=0.15)後は0.5が
+        # 「中立」を意味しなくなったため、虚構の基準値は作らない方針に統一(2026-07)
+        baseline = baseline_map.get((hole, machine))
+        if baseline is None or pd.isna(baseline):
+            continue
 
         for unit in units:
             unit_int = int(unit)
@@ -764,6 +767,97 @@ def predict_next_day_with_blend(
 
     long_pred = predict_next_day(hp_long, lags, cal_conditions, next_date)
     short_pred = predict_next_day(hp_short, lags, cal_conditions, next_date)
+
+    if long_pred is None and short_pred is None:
+        return {'長期スコア': None, '短期スコア': None, 'ブレンド値': None, '使用alpha': None}
+    if long_pred is None:
+        return {'長期スコア': None, '短期スコア': short_pred, 'ブレンド値': short_pred, '使用alpha': 1.0}
+    if short_pred is None:
+        return {'長期スコア': long_pred, '短期スコア': None, 'ブレンド値': long_pred, '使用alpha': 0.0}
+
+    blended = alpha * short_pred + (1.0 - alpha) * long_pred
+    return {'長期スコア': long_pred, '短期スコア': short_pred, 'ブレンド値': blended, '使用alpha': alpha}
+
+
+# ── [Stage7-3] 遷移モデル(据え置き/上げ/下げ)による全台翌日予測 ──────────────
+
+TRANSITION_MIN_PAIRS = 50  # 遷移確率の推定に必要な最低の連続日ペア数(暫定値)
+
+
+def estimate_transition_matrix(df: pd.DataFrame, hole_name: str) -> dict | None:
+    """
+    店舗単位で設定の日次遷移確率を推定する(v1: 無条件版)。
+
+    ホールの設定運用は「据え置き」だけでなく「上げ」「下げ」を含むため、
+    翌日予測の事前分布は単純な減衰priorではなく2状態(高/低)マルコフ遷移として持つ:
+      p_stay = P(高_t | 高_{t-1})  … 据え置き率(1 - p_stay が下げ率)
+      p_up   = P(高_t | 低_{t-1})  … 上げ率
+
+    真の設定ラベルは観測できないため、連続した暦日ペア(同一ホール×機種×台番号、
+    両日とも判定可能)の事後確率high_probをソフトカウントとして使う:
+      p_stay = Σ p_{t-1}·p_t / Σ p_{t-1}
+      p_up   = Σ (1-p_{t-1})·p_t / Σ (1-p_{t-1})
+    事後確率のノイズにより真の遷移より平滑化(持続性の過小評価)側に偏る既知のバイアスが
+    あるが、v1の推定量として許容する(条件付き拡張・バイアス補正は今後の実装予定.md参照)。
+
+    暦日差が1日でないペア(休業・欠測・取得漏れ)はk日遷移が混ざるため除外する。
+    ペア数がTRANSITION_MIN_PAIRS未満の場合はNone(=予測不可。虚構の値を作らない)。
+    """
+    d = df[df['ホール名'] == hole_name]
+    if 'is_invalid' in d.columns:
+        d = d[~d['is_invalid'].fillna(True)]
+    d = d.dropna(subset=['high_prob'])
+    if d.empty:
+        return None
+
+    d = d.sort_values(['機種名', '台番号', '日付'])
+    g = d.groupby(['機種名', '台番号'], sort=False)
+    prev_p = g['high_prob'].shift(1)
+    day_gap = (pd.to_datetime(d['日付']) - pd.to_datetime(g['日付'].shift(1))).dt.days
+    mask = (day_gap == 1) & prev_p.notna()
+
+    p_prev = prev_p[mask].to_numpy()
+    p_curr = d.loc[mask, 'high_prob'].to_numpy()
+    n_pairs = len(p_prev)
+    if n_pairs < TRANSITION_MIN_PAIRS:
+        return None
+
+    denom_hi = float(p_prev.sum())
+    denom_lo = float((1.0 - p_prev).sum())
+    if denom_hi <= 0 or denom_lo <= 0:
+        return None
+
+    eps = 1e-6  # 0/1に張り付くと予測が定数化するため内側にクリップ
+    p_stay = float(np.clip((p_prev * p_curr).sum() / denom_hi, eps, 1.0 - eps))
+    p_up = float(np.clip(((1.0 - p_prev) * p_curr).sum() / denom_lo, eps, 1.0 - eps))
+    return {'p_stay': p_stay, 'p_up': p_up, 'n_pairs': n_pairs}
+
+
+def predict_transition_next_day(p_today: float, matrix: dict) -> float:
+    """
+    当日の事後確率と遷移行列から翌日の高設定事前確率を返す。
+    P(高_翌日) = p_today·P(高→高) + (1-p_today)·P(低→高)
+    """
+    return p_today * matrix['p_stay'] + (1.0 - p_today) * matrix['p_up']
+
+
+def predict_transition_with_blend(
+    p_today: float,
+    matrix_long: dict | None,
+    matrix_short: dict | None,
+    alpha: float = None,
+) -> dict:
+    """
+    長期版(全履歴で推定した遷移行列)・短期版(直近M日窓)の両予測を
+    predict_next_day_with_blendと同じ規約でブレンドする(短期不可=alpha実質0)。
+
+    Returns: {'長期スコア', '短期スコア', 'ブレンド値', '使用alpha'}(すべて計算不可ならNone)
+    """
+    if alpha is None:
+        alpha = FIXED_ALPHA
+
+    long_pred = predict_transition_next_day(p_today, matrix_long) if matrix_long else None
+    short_pred = predict_transition_next_day(p_today, matrix_short) if matrix_short else None
 
     if long_pred is None and short_pred is None:
         return {'長期スコア': None, '短期スコア': None, 'ブレンド値': None, '使用alpha': None}
