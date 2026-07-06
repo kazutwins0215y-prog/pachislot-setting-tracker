@@ -215,9 +215,9 @@ def _compute_event_scores(
             for j, idx in enumerate(unit_rows.index):
                 w_start = max(0, j - window + 1)
                 trend = float(np.mean(probs[w_start:j + 1]))
-                raw = max(0.0, trend - baseline)
-                # 正規化: 差が 0.5 で score=1.0 に到達
-                scores[idx] = float(min(1.0, raw / 0.5))
+                raw = trend - baseline
+                # 正規化: 差が±0.5でscore=±1.0に到達。基準以下に沈む(弱い)場合は負値
+                scores[idx] = float(np.clip(raw / 0.5, -1.0, 1.0))
 
     return scores
 
@@ -228,7 +228,8 @@ def score_shintai(
     window: int = SHORT_WINDOW,
 ) -> pd.Series:
     """
-    S_新台増台: 増台後の直近移動平均 - 基準値 → max(0, ...) → 0〜1。
+    S_新台増台: 増台後の直近移動平均 - 基準値 → clip(-1, 1)。
+    基準以上に強ければ正、基準以下に沈んでいれば負(弱い)。
     配分が落ち着くと差が縮み自動フェードアウト。
     """
     return _compute_event_scores(df, events_df, '増台台番号', window)
@@ -240,7 +241,8 @@ def score_idoudai(
     window: int = SHORT_WINDOW,
 ) -> pd.Series:
     """
-    S_移動台: 移動後の直近移動平均 - 同機種店舗全体平均 → max(0, ...) → 0〜1。
+    S_移動台: 移動後の直近移動平均 - 同機種店舗全体平均 → clip(-1, 1)。
+    基準以上に強ければ正、基準以下に沈んでいれば負(弱い)。
     S_新台増台とは独立したサブスコア(重みを別々に調整できる)。
     """
     return _compute_event_scores(df, events_df, '移動台番号', window)
@@ -447,33 +449,106 @@ def benjamini_hochberg(p_values: list[float], alpha: float = FDR_ALPHA) -> list[
 
 TEPPAN_PHASE_BINS = 5  # pdm_confirmと同じ位相ビン数
 
+# [2026-07 機能B再設計] 鉄板台の「非該当日」に与える負スコアの縮小率。暫定値であり、
+# 実データ運用後に的中率(prediction_accuracy)を見ながら調整する前提(Phase6)。
+NEGATIVE_SCALE = 0.5
 
-def _phase_day_scores(hp: pd.Series, lag: int, n_bins: int = TEPPAN_PHASE_BINS) -> np.ndarray:
+
+def _phase_bin_effects(hp: pd.Series, lag: int, n_bins: int = TEPPAN_PHASE_BINS) -> dict[int, float]:
     """
-    確認済み周期lagについて、位相ビンごとの平均high_probが全体平均を上回るビンに
-    属する日へ (ビン平均 − 全体平均) / 0.5 のスコア(0〜1)を付与して返す。
-    該当しない日は0.0。0.5の正規化はscore_zentaiki等と同じ規約。
+    確認済み周期lagについて、位相ビンごとの平均high_probが全体平均を上回るビン(該当ビン)の
+    効果量((ビン平均−全体平均)/0.5、0〜1)を返す。該当ビンが1つもなければ空dict
+    (=この周期では検出なし)。_phase_day_scores(過去向け)とpredict_next_day(翌日投影)の
+    両方から共有される検出ロジック本体(二重実装を避けるため分離)。
 
     ※ 位相は「観測順インデックス」基準(既存のACF/PDMと同じ近似)。
       営業日が飛ぶと暦日とはズレる点に注意。
     """
     x = hp.values.astype(float)
-    out = np.zeros(len(x))
+    n = len(x)
     valid = ~np.isnan(x)
     if int(valid.sum()) < 10:
-        return out
+        return {}
     overall = float(np.nanmean(x))
-    t = np.arange(len(x))
+    t = np.arange(n)
     phases = (t % lag) / lag
     bins = (phases * n_bins).astype(int) % n_bins
+
+    positive_bins: dict[int, float] = {}
     for b in range(n_bins):
         m = (bins == b) & valid
         if int(m.sum()) < 2:
             continue
         diff = float(np.mean(x[m])) - overall
         if diff > 0:
-            # 該当ビンに属する日全体(欠測日含む=そのビンの日は熱いという予測)
-            out[bins == b] = min(1.0, diff / 0.5)
+            positive_bins[b] = min(1.0, diff / 0.5)
+    return positive_bins
+
+
+def _phase_day_scores(hp: pd.Series, lag: int, n_bins: int = TEPPAN_PHASE_BINS) -> np.ndarray:
+    """
+    確認済み周期lagについて、位相ビンごとの平均high_probが全体平均を上回るビン(該当ビン)に
+    属する日へ (ビン平均 − 全体平均) / 0.5 のスコア(0〜1)を付与する。
+    この周期で検出(該当ビンが1つ以上)がある場合、非該当ビンの日には
+    -NEGATIVE_SCALE × 該当ビン効果量の平均 を付与する(弱さの表現)。
+    検出自体がない(該当ビンが1つもない)場合は全日0.0のまま。
+    0.5の正規化はscore_zentaiki等と同じ規約。
+    """
+    n = len(hp)
+    out = np.zeros(n)
+    positive_bins = _phase_bin_effects(hp, lag, n_bins)
+    if not positive_bins:
+        return out  # この周期では検出なし
+
+    t = np.arange(n)
+    phases = (t % lag) / lag
+    bins = (phases * n_bins).astype(int) % n_bins
+    hot_mask = np.isin(bins, list(positive_bins.keys()))
+    for b, effect in positive_bins.items():
+        out[bins == b] = effect
+    mean_effect = float(np.mean(list(positive_bins.values())))
+    out[~hot_mask] = -NEGATIVE_SCALE * mean_effect
+    return out
+
+
+def _project_phase_score(hp: pd.Series, lag: int, n_bins: int = TEPPAN_PHASE_BINS) -> float:
+    """
+    次の観測点(観測順インデックス = len(hp)、まだ観測していない日)の周期経路予測値を返す。
+    該当ビンなら正の効果量、非該当ビンは-NEGATIVE_SCALE×平均効果量、
+    この周期自体の検出がなければ0.0(情報なし)。predict_next_dayから呼ばれる。
+    """
+    positive_bins = _phase_bin_effects(hp, lag, n_bins)
+    if not positive_bins:
+        return 0.0
+    next_t = len(hp)
+    phase = (next_t % lag) / lag
+    bin_idx = int(phase * n_bins) % n_bins
+    if bin_idx in positive_bins:
+        return positive_bins[bin_idx]
+    return -NEGATIVE_SCALE * float(np.mean(list(positive_bins.values())))
+
+
+def _combine_signed(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    符号付き2経路(周期・カレンダー)のnoisy-or型統合。0は「その経路からの情報なし」を表す。
+    - 両方0: 0(情報なし)
+    - 片方のみ0: 非ゼロの側をそのまま採用
+    - 両方正: noisy-or 1-(1-a)(1-b)
+    - 両方負: 絶対値をnoisy-orして符号を負に戻す -(1-(1-|a|)(1-|b|))
+    - 符号が異なる: 単純平均(暫定簡易ルール。実データで調整)
+    """
+    out = np.zeros_like(a, dtype=float)
+    both_pos = (a > 0) & (b > 0)
+    both_neg = (a < 0) & (b < 0)
+    only_a = (a != 0) & (b == 0)
+    only_b = (a == 0) & (b != 0)
+    mixed = (a != 0) & (b != 0) & ~both_pos & ~both_neg
+
+    out[both_pos] = 1.0 - (1.0 - a[both_pos]) * (1.0 - b[both_pos])
+    out[both_neg] = -(1.0 - (1.0 - np.abs(a[both_neg])) * (1.0 - np.abs(b[both_neg])))
+    out[only_a] = a[only_a]
+    out[only_b] = b[only_b]
+    out[mixed] = (a[mixed] + b[mixed]) / 2.0
     return out
 
 
@@ -484,17 +559,21 @@ def score_teppandai(
     details_out: list | None = None,
 ) -> pd.Series:
     """
-    S_鉄板台: 2経路統合の鉄板台スコア(0〜1)。**該当日のみ**にスコアを付与する。
+    S_鉄板台: 2経路統合の鉄板台スコア(-1〜1)。**検出済みの台**のみにスコアを付与する。
 
     [2026-07 仕様変更] 旧実装は検出台の全日に定数(1.0/0.6)を付与しており、
     「特定条件の日に入る」という鉄板台の性質と逆に、非該当日の狙い目度を
     押し上げて該当日のコントラストを消していた。現仕様:
-    - カレンダー経路: 有意候補(例: 末尾7)に合致する日のみ、効果量(rank-biserial)をスコアに
-    - 周期経路(ACF→PDM / Lomb-Scargle): 確認済み周期の高位相ビンに属する日のみ、
-      (ビン平均−全体平均)/0.5 をスコアに
-    - 両経路は noisy-or (1-(1-a)(1-b)) で統合(両経路一致日ほど高スコア)
-    - 非該当日・未検出台は NaN(synthesizeで除外・再正規化。
-      「非該当日は低設定寄り」の負スコア化は機能B再設計の符号付き拡張時に検討)
+    - カレンダー経路: 有意候補(例: 末尾7)に合致する日は効果量(rank-biserial、正)、
+      検出済みの台の非該当日は -NEGATIVE_SCALE×平均効果量(負、弱さの表現)
+    - 周期経路(ACF→PDM / Lomb-Scargle): 確認済み周期の高位相ビンに属する日は
+      (ビン平均−全体平均)/0.5(正)、同じ周期の非該当ビンの日は
+      -NEGATIVE_SCALE×平均効果量(負)
+    - 両経路は符号付きnoisy-or(_combine_signed)で統合
+      (両経路が同じ日に正の効果を示すほど高スコア、負の効果を示すほど低スコア、
+      符号が割れる日は単純平均)
+    - 検出自体がない(どちらの経路も一度も有意でない)台は NaN(synthesizeで除外・再正規化。
+      「検出不可」と「弱い」を混同しない — Stage4-1と同じ方針)
 
     details_out: listを渡すと検出条件(経路/条件/効果量)を台単位で追記する
     (どの条件で有意だったかを機能B等で表示するためのメタデータ)。
@@ -521,7 +600,8 @@ def score_teppandai(
         n_invalid = int(hp.isna().sum())
         invalid_rate_val = n_invalid / n_total
 
-        # ── 周期経路: 確認済み周期ごとに該当日スコア(複数周期はmax) ──
+        # ── 周期経路: 確認済み周期ごとに該当日スコア(複数周期は符号付きnoisy-orで統合。
+        #    0=情報なしとして扱うためnp.maximumではなく_combine_signedを使う) ──
         main_scores = np.zeros(n_total)
         if invalid_rate_val > INVALID_RATE_THRESHOLD:
             ts = pd.Series(np.arange(n_total, dtype=float))
@@ -529,12 +609,13 @@ def score_teppandai(
                 lag = max(2, int(round(period)))
                 day_scores = _phase_day_scores(hp, lag)
                 if day_scores.max() > 0:
-                    main_scores = np.maximum(main_scores, day_scores)
+                    main_scores = _combine_signed(main_scores, day_scores)
                     if details_out is not None:
                         details_out.append({
                             'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
                             '経路': '周期(Lomb-Scargle)', '条件': f'周期{lag}日(観測順)',
                             '効果量': round(float(day_scores.max()), 3),
+                            '周期日数': lag,
                         })
         else:
             sig_lags = acf_screen(hp)
@@ -545,15 +626,17 @@ def score_teppandai(
                         continue
                     day_scores = _phase_day_scores(hp, lag)
                     if day_scores.max() > 0:
-                        main_scores = np.maximum(main_scores, day_scores)
+                        main_scores = _combine_signed(main_scores, day_scores)
                         if details_out is not None:
                             details_out.append({
                                 'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
                                 '経路': '周期(ACF+PDM)', '条件': f'周期{lag}日(観測順)',
                                 '効果量': round(float(1.0 - res['theta']), 3),
+                                '周期日数': lag,
                             })
 
-        # ── カレンダー経路: 有意候補に合致する日のみ効果量をスコアに ──
+        # ── カレンダー経路: 有意候補に合致する日は効果量(正)、
+        #    検出済みの台の非該当日は-NEGATIVE_SCALE×平均効果量(負) ──
         cal_scores = np.zeros(n_total)
         date_series = pd.Series(grp_sorted['日付'].values)
         cal_results = calendar_test(hp, date_series, check_missing_bias)
@@ -561,26 +644,136 @@ def score_teppandai(
         if significant_names:
             dt_idx = pd.to_datetime(date_series.values, errors='coerce')
             candidates = calendar_candidates(dt_idx)
+            matched_mask = np.zeros(n_total, dtype=bool)
+            effects: list[float] = []
             for name in significant_names:
                 effect = float(np.clip(cal_results[name]['effect_size'], 0.0, 1.0))
+                effects.append(effect)
                 day_mask = np.asarray(candidates[name], dtype=bool)
-                cal_scores = np.maximum(cal_scores, np.where(day_mask, effect, 0.0))
+                cal_scores = np.where(day_mask, np.maximum(cal_scores, effect), cal_scores)
+                matched_mask |= day_mask
                 if details_out is not None:
                     details_out.append({
                         'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
                         '経路': 'カレンダー', '条件': name,
                         '効果量': round(effect, 3),
                     })
+            mean_effect = float(np.mean(effects))
+            cal_scores = np.where(matched_mask, cal_scores, -NEGATIVE_SCALE * mean_effect)
 
-        # ── 2経路統合(noisy-or): 両経路が同じ日を指すほど高スコア ──
-        combined = 1.0 - (1.0 - main_scores) * (1.0 - cal_scores)
-        combined = np.where(combined > 0, combined, np.nan)
+        # ── 2経路統合: 符号付きnoisy-or(_combine_signed) ──
+        combined = _combine_signed(main_scores, cal_scores)
+        combined = np.where(combined != 0.0, combined, np.nan)
         if np.isnan(combined).all():
             continue  # 検出不可 → NaN のまま
 
         scores.loc[grp_sorted.index] = combined
 
     return scores
+
+
+def build_observed_history(
+    df: pd.DataFrame,
+    hole_name: str,
+    machine_name: str,
+    unit: int,
+    unit_col: str = '台番号',
+) -> pd.Series:
+    """
+    score_teppandaiと同じ切り出し(日付昇順・is_invalidはNaN化・観測順に0始まりindex化)で
+    指定台のhigh_prob履歴を返す。predict_next_day系の翌日投影で、検出時と同じ位相基準を
+    再現するために使う(二重実装を避けるため共通化)。
+    """
+    mask = (
+        (df['ホール名'] == hole_name)
+        & (df['機種名'] == machine_name)
+        & (df[unit_col] == unit)
+    )
+    grp_sorted = df[mask].sort_values('日付')
+    hp = grp_sorted['high_prob'].copy()
+    if 'is_invalid' in grp_sorted.columns:
+        hp[grp_sorted['is_invalid'].fillna(True).values] = np.nan
+    return hp.reset_index(drop=True)
+
+
+def predict_next_day(
+    hp: pd.Series,
+    lags: list[int],
+    cal_conditions: list[dict],
+    next_date,
+) -> float | None:
+    """
+    S_鉄板台の「次の観測日」(next_date、暦日)のスコアを、検出済み条件のみから予測する。
+    [リーク禁止] hpはこの予測計算に使うデータ最終日までの観測順history
+    (is_invalidはNaN化済み)のみを渡すこと。実測値(翌日の差枚等)は一切使わない。
+
+    lags: teppan_conditionsの周期経路で確認済みの周期(観測順lag)のリスト。
+        複数ある場合は各lagの投影値を_combine_signedで順に統合する
+        (score_teppandai本体が複数周期をnoisy-orで統合するのと同じ扱い)。
+    cal_conditions: teppan_conditionsのカレンダー経路の行(条件名・効果量)のリスト。
+        next_dateの曜日・日付末尾と照合し、一致すれば効果量(正)、
+        一致しなければ-NEGATIVE_SCALE×平均効果量(負)を採用する。
+
+    周期・カレンダーともに情報がない(条件が空、または該当ビン/候補が未検出)場合はNoneを返す。
+    """
+    lag_pred = 0.0
+    for lag in lags:
+        lag_pred = _combine_signed(
+            np.array([lag_pred]), np.array([_project_phase_score(hp, lag)])
+        )[0]
+
+    cal_pred = 0.0
+    if cal_conditions:
+        dt = pd.Timestamp(next_date)
+        candidates = calendar_candidates(pd.DatetimeIndex([dt]))
+        matched_effects = [
+            float(c['効果量']) for c in cal_conditions
+            if bool(candidates.get(c['条件'], np.array([False]))[0])
+        ]
+        if matched_effects:
+            cal_pred = max(matched_effects)
+        else:
+            mean_effect = float(np.mean([float(c['効果量']) for c in cal_conditions]))
+            cal_pred = -NEGATIVE_SCALE * mean_effect
+
+    if lag_pred == 0.0 and cal_pred == 0.0:
+        return None
+    return float(_combine_signed(np.array([lag_pred]), np.array([cal_pred]))[0])
+
+
+def predict_next_day_with_blend(
+    hp_long: pd.Series,
+    hp_short: pd.Series,
+    lags: list[int],
+    cal_conditions: list[dict],
+    next_date,
+    alpha: float = None,
+) -> dict:
+    """
+    長期版(全履歴hp_long)・短期版(直近M日窓hp_short、compute_short_term_scoreと同じ
+    切り出し)の両方でpredict_next_dayを計算し、FIXED_ALPHAでブレンドする
+    (blend()と同じ「short版がNaN=alpha実質0で長期版を使用」の規約に合わせる)。
+
+    長期/短期の生予測値をそのままprediction_logに残しておくことで、将来
+    walk_forward_alphaによるα再学習にこのログをそのまま再利用できる(今後の実装予定.md 1.1節)。
+
+    Returns: {'長期スコア', '短期スコア', 'ブレンド値', '使用alpha'}(すべて計算不可ならNone)
+    """
+    if alpha is None:
+        alpha = FIXED_ALPHA
+
+    long_pred = predict_next_day(hp_long, lags, cal_conditions, next_date)
+    short_pred = predict_next_day(hp_short, lags, cal_conditions, next_date)
+
+    if long_pred is None and short_pred is None:
+        return {'長期スコア': None, '短期スコア': None, 'ブレンド値': None, '使用alpha': None}
+    if long_pred is None:
+        return {'長期スコア': None, '短期スコア': short_pred, 'ブレンド値': short_pred, '使用alpha': 1.0}
+    if short_pred is None:
+        return {'長期スコア': long_pred, '短期スコア': None, 'ブレンド値': long_pred, '使用alpha': 0.0}
+
+    blended = alpha * short_pred + (1.0 - alpha) * long_pred
+    return {'長期スコア': long_pred, '短期スコア': short_pred, 'ブレンド値': blended, '使用alpha': alpha}
 
 
 def score_rotation(
@@ -799,6 +992,23 @@ def blend(
         alpha * short_score[has_both] + (1.0 - alpha) * long_score[has_both]
     )
     return result
+
+
+def blend_scalar(long_value: float, short_value: float | None, alpha: float) -> float:
+    """
+    blend()と同じ数式(α×short+(1-α)×long)を単一のスカラー値に適用する版。
+
+    blend()は台×日の行単位Series専用のため、店舗×日 高設定上限キャリブレーション
+    (候補C。score.compute_uplimit)のように「長期分位点1本・短期分位点1本」という
+    集計値どうしをブレンドする用途にはそのまま使えない。同じ数式を再利用するための
+    スカラー版として新設(候補C・Step1。詳細はデータ分析_skill.md参照)。
+
+    short_valueがNone(短期側サンプル不足)の場合はlong_valueをそのまま返す
+    (blend()の「short=NaNの行はα=0扱い」という規約と同じ)。
+    """
+    if short_value is None or (isinstance(short_value, float) and np.isnan(short_value)):
+        return float(long_value)
+    return float(alpha * short_value + (1.0 - alpha) * long_value)
 
 
 FIXED_ALPHA = 0.3  # 暫定固定値(短期3:長期7)。ウォークフォワードα学習は停止中(下記docstring参照)

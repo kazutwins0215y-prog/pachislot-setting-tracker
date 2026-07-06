@@ -63,7 +63,7 @@ _HOT_MACHINES_N = 3
 # ── ユーティリティ ────────────────────────────────────────────────
 
 
-def _load_weights() -> dict[str, float]:
+def load_weights() -> dict[str, float]:
     if _WEIGHTS_PATH.exists():
         with open(_WEIGHTS_PATH, encoding='utf-8') as f:
             return json.load(f)
@@ -91,7 +91,7 @@ def _load_profile_from_db(db_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _load_all_profiles() -> pd.DataFrame:
+def load_all_profiles() -> pd.DataFrame:
     """分析DB(analysis.db)の store_profile を全店舗分読み込んで返す。"""
     if ds.ANALYSIS_DB_PATH.exists():
         profiles = _load_profile_from_db(str(ds.ANALYSIS_DB_PATH))
@@ -103,10 +103,13 @@ def _load_all_profiles() -> pd.DataFrame:
     )
 
 
-def _synthesize_scores(profiles: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
+def synthesize_scores(profiles: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
     """
     store_profile DataFrameから店舗ごとの合成スコア・平均信頼度・最高サブスコアを返す。
     スコアが NaN のパターンは除外して再正規化する（score.py の synthesize と同方針）。
+    有効重み = weights.get(label,1.0) × 信頼度 とし、信頼度が低いサブスコアほど
+    合成への寄与を減衰させる(score.py の synthesize と同じ方針。片方だけ直すと
+    機能A/B・機能B内の一言メモとダッシュボードで数値が食い違うため両方に反映)。
 
     Returns:
         ホール名 / 合成スコア / 平均信頼度 / 最高サブスコア / db_path を持つ DataFrame
@@ -131,10 +134,11 @@ def _synthesize_scores(profiles: pd.DataFrame, weights: dict[str, float]) -> pd.
             if pd.isna(score):
                 continue
 
-            w = float(weights.get(label, 1.0))
+            rel_val = float(rel) if not pd.isna(rel) else 1.0
+            w = float(weights.get(label, 1.0)) * rel_val
             numerator += w * float(score)
             denominator += w
-            reliabilities.append(float(rel) if not pd.isna(rel) else 0.0)
+            reliabilities.append(rel_val if not pd.isna(rel) else 0.0)
 
             if float(score) > best_val:
                 best_val = float(score)
@@ -187,7 +191,7 @@ def _pivot_profiles(profiles: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _load_hot_machines(db_path: str, hole_name: str, n: int = _HOT_MACHINES_N) -> list[dict]:
+def load_hot_machines(db_path: str, hole_name: str, n: int = _HOT_MACHINES_N) -> list[dict]:
     """
     stage3_scores の最新日において高設定確率が高い台を上位 n 件返す。
     テーブルがなければ空リストを返す。
@@ -239,6 +243,116 @@ def _rel_bar(value: float, width: int = 8) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
+# ── Phase 5: 検知期間履歴・カレンダーヒートマップ用ユーティリティ ──────────
+
+# 検知期間判定のしきい値(暫定値。「スコア > 0」を検出中とみなす。実データで調整)
+_PERIOD_SCORE_THRESHOLD = 0.0
+_WEEKDAY_LABELS = ['月', '火', '水', '木', '金', '土', '日']
+
+
+def _load_pattern_history(db_path: str) -> pd.DataFrame:
+    """pattern_history テーブルを全店舗分読み込む。テーブルが無ければ空DFを返す。"""
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'pattern_history' not in tables:
+                return pd.DataFrame()
+            return pd.read_sql_query('SELECT * FROM pattern_history', con)
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _detect_pattern_periods(
+    hist_hole: pd.DataFrame, threshold: float = _PERIOD_SCORE_THRESHOLD
+) -> pd.DataFrame:
+    """
+    pattern_history(単一店舗分)から「スコア > threshold」が連続している区間を
+    検出期間として近似抽出する(統計検定の再実行はしない軽量な後処理)。
+    区間は実行日時の最小〜最大でまとめる。NaN・しきい値以下は区間を打ち切る。
+    """
+    empty = pd.DataFrame(columns=['パターン', '開始', '終了', '実行回数', '平均スコア', '平均信頼度'])
+    if hist_hole.empty:
+        return empty
+
+    rows = []
+    for pattern, grp in hist_hole.sort_values('実行日時').groupby('パターン'):
+        above = (grp['スコア'] > threshold).fillna(False).to_numpy()
+        if not above.any():
+            continue
+        run_id = (above != np.concatenate(([False], above[:-1]))).cumsum()
+        grp = grp.assign(_above=above, _run=run_id)
+        for _, seg in grp[grp['_above']].groupby('_run'):
+            rows.append({
+                'パターン': _PATTERN_LABELS.get(pattern, pattern),
+                '開始': seg['実行日時'].min(),
+                '終了': seg['実行日時'].max(),
+                '実行回数': len(seg),
+                '平均スコア': float(seg['スコア'].mean()),
+                '平均信頼度': (
+                    float(seg['信頼度'].mean()) if seg['信頼度'].notna().any() else np.nan
+                ),
+            })
+
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _load_daily_stage3_avg(db_path: str, hole_name: str) -> pd.Series:
+    """stage3_scoresからhigh_probの日次平均(is_invalid除外)を返す(日付→平均値)。"""
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return pd.Series(dtype=float)
+            df = pd.read_sql_query(
+                """
+                SELECT 日付, high_prob
+                FROM stage3_scores
+                WHERE ホール名 = ?
+                  AND (is_invalid IS NULL OR is_invalid != 1)
+                  AND high_prob IS NOT NULL
+                """,
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.Series(dtype=float)
+
+    if df.empty:
+        return pd.Series(dtype=float)
+    return df.groupby('日付')['high_prob'].mean()
+
+
+def _month_grid(score_by_day: dict[str, float], year: int, month: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    year年month月のカレンダー形式(週×曜日)グリッドを作る。
+    score_by_day: 'YYYY-MM-DD' → スコアの辞書。月内でデータが無い日はNaN。
+    Returns: (z: 週数×7 のスコア行列, text: 同形状の「日」表示用文字列行列)
+    """
+    import calendar
+
+    weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)
+    z = np.full((len(weeks), 7), np.nan)
+    text = np.full((len(weeks), 7), '', dtype=object)
+    for wi, week in enumerate(weeks):
+        for di, day in enumerate(week):
+            if day == 0:
+                continue
+            text[wi, di] = str(day)
+            date_str = f'{year:04d}-{month:02d}-{day:02d}'
+            if date_str in score_by_day:
+                z[wi, di] = score_by_day[date_str]
+    return z, text
+
+
 # ── 公開関数 ──────────────────────────────────────────────────────
 
 
@@ -253,6 +367,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
     """
     import streamlit as st
     import plotly.express as px
+    import plotly.graph_objects as go
 
     if profiles.empty:
         st.warning(
@@ -261,9 +376,14 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
         )
         return
 
-    weights = _load_weights()
-    synth_df = _synthesize_scores(profiles, weights)
+    weights = load_weights()
+    synth_df = synthesize_scores(profiles, weights)
     pivot_df = _pivot_profiles(profiles)
+
+    st.caption(
+        'サブスコアは符号付き([-1, 1]): プラス=そのパターンが強く出ている、'
+        'マイナス=弱い(該当日が少ない/非該当日が多い)ことを示します。'
+    )
 
     # ── サイドバー設定 ──
     st.sidebar.subheader('表示設定')
@@ -319,7 +439,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
                 bar_df, x='スコア', y='ホール名', orientation='h',
                 color=color_col,
                 color_continuous_scale='Blues',
-                range_x=[0, 1],
+                range_x=[-1, 1],
                 title=f'{sel_pattern} — 店舗別スコア比較',
             )
             fig.update_layout(height=max(280, len(bar_df) * 42 + 80))
@@ -341,10 +461,10 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
         if not heat_data.dropna(how='all').empty:
             fig_heat = px.imshow(
                 heat_data,
-                color_continuous_scale='YlOrRd',
+                color_continuous_scale='RdBu',
                 labels=dict(x='サブスコア', y='ホール名', color='スコア'),
                 title='店舗 × サブスコア ヒートマップ',
-                zmin=0, zmax=1,
+                zmin=-1, zmax=1,
                 aspect='auto',
             )
             fig_heat.update_layout(height=max(280, len(heat_data) * 38 + 100))
@@ -394,7 +514,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
                 valid,
                 x='スコア', y='表示名', orientation='h',
                 color='信頼度', color_continuous_scale='Blues',
-                range_x=[0, 1],
+                range_x=[-1, 1],
                 title=f'{sel_hole} サブスコア',
             )
             fig_bar.update_layout(
@@ -412,6 +532,101 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
             ' — データを蓄積してから再確認してください。'
         )
 
+    st.divider()
+
+    # ── 5. 検知期間履歴 ──
+    st.subheader(f'{sel_hole} — 検知期間履歴')
+    st.caption(
+        'pattern_history(run_store_profile.py実行ごとの記録)から'
+        '「スコアが0を上回っている」連続区間を検出期間として近似表示します'
+        '(統計検定の再実行はしません)。'
+    )
+
+    hist_all = _load_pattern_history(str(ds.ANALYSIS_DB_PATH))
+    hist_hole = (
+        hist_all[hist_all['ホール名'] == sel_hole].copy()
+        if not hist_all.empty else pd.DataFrame()
+    )
+
+    periods = _detect_pattern_periods(hist_hole)
+    if periods.empty:
+        st.info(
+            '検出期間履歴がまだありません。run_store_profile.pyを複数回実行すると蓄積されます'
+            '(fase4の日次自動実行が実装されるまでは手動実行の頻度に応じた粒度になります)。'
+        )
+    else:
+        disp_periods = periods.sort_values('終了', ascending=False).copy()
+        disp_periods['平均スコア'] = disp_periods['平均スコア'].map(lambda x: f'{x:.3f}')
+        disp_periods['平均信頼度'] = disp_periods['平均信頼度'].map(
+            lambda x: f'{x:.0%}' if pd.notna(x) else '─'
+        )
+        st.dataframe(disp_periods, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── 6. 当月カレンダーヒートマップ(2層) ──
+    st.subheader(f'{sel_hole} — カレンダーヒートマップ（店舗内の絶対評価）')
+    st.caption(
+        '他店との比較ではなく、この店舗の中で相対的に強い日/弱い日を示します。'
+        '1枚目は日次平均high_prob(stage3_scores)、2枚目以降はパターン別(pattern_history)の内訳です。'
+    )
+
+    daily_avg = _load_daily_stage3_avg(str(ds.ANALYSIS_DB_PATH), sel_hole)
+
+    hist_hole_dated = pd.DataFrame()
+    if not hist_hole.empty:
+        hist_hole_dated = hist_hole.copy()
+        hist_hole_dated['日付'] = pd.to_datetime(hist_hole_dated['実行日時']).dt.strftime('%Y-%m-%d')
+
+    available_months = sorted(
+        {d[:7] for d in daily_avg.index}
+        | ({d for d in hist_hole_dated['日付'].str[:7]} if not hist_hole_dated.empty else set()),
+        reverse=True,
+    )
+
+    if not available_months:
+        st.info('カレンダー表示用のデータがありません。')
+    else:
+        sel_month = st.selectbox('表示月', available_months, index=0, key='calendar_month')
+        year, month = int(sel_month[:4]), int(sel_month[5:7])
+
+        st.markdown('**統合スコア日次平均（high_prob平均・0〜1）**')
+        if daily_avg.empty:
+            st.caption('stage3_scoresデータがありません。')
+        else:
+            z, text = _month_grid(daily_avg.to_dict(), year, month)
+            fig_cal = go.Figure(data=go.Heatmap(
+                z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
+                text=text, texttemplate='%{text}',
+                colorscale='YlOrRd', zmin=0.0, zmax=1.0,
+                hoverongaps=False,
+            ))
+            fig_cal.update_layout(title=f'{sel_month} 統合スコア日次平均', height=280)
+            st.plotly_chart(fig_cal, use_container_width=True)
+
+        if hist_hole_dated.empty:
+            st.caption('pattern_historyデータがありません(パターン別の内訳は表示できません)。')
+        else:
+            pattern_daily = hist_hole_dated.groupby(['パターン', '日付'])['スコア'].mean()
+            available_patterns = [
+                p for p in _PATTERN_LABELS.keys() if p in hist_hole_dated['パターン'].unique()
+            ]
+            tabs = st.tabs([_PATTERN_LABELS.get(p, p) for p in available_patterns])
+            for tab, pattern in zip(tabs, available_patterns):
+                with tab:
+                    score_map = pattern_daily.loc[pattern].to_dict()
+                    z2, text2 = _month_grid(score_map, year, month)
+                    fig_pat = go.Figure(data=go.Heatmap(
+                        z=z2, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z2.shape[0])],
+                        text=text2, texttemplate='%{text}',
+                        colorscale='RdBu', zmid=0.0, zmin=-1.0, zmax=1.0,
+                        hoverongaps=False,
+                    ))
+                    fig_pat.update_layout(
+                        title=f'{sel_month} {_PATTERN_LABELS.get(pattern, pattern)}', height=280
+                    )
+                    st.plotly_chart(fig_pat, use_container_width=True)
+
 
 def memo_simple(profiles: pd.DataFrame) -> str:
     """
@@ -424,8 +639,8 @@ def memo_simple(profiles: pd.DataFrame) -> str:
             'データがありません。fase2/run_store_profile.py を先に実行してください。'
         )
 
-    weights = _load_weights()
-    synth_df = _synthesize_scores(profiles, weights)
+    weights = load_weights()
+    synth_df = synthesize_scores(profiles, weights)
 
     if synth_df.empty:
         return '【狙い目メモ】\n合成スコアを計算できませんでした。'
@@ -465,7 +680,7 @@ def memo_simple(profiles: pd.DataFrame) -> str:
 
             # 熱い台
             if db_path_val:
-                hot = _load_hot_machines(db_path_val, str(row.ホール名), _HOT_MACHINES_N)
+                hot = load_hot_machines(db_path_val, str(row.ホール名), _HOT_MACHINES_N)
                 if hot:
                     lines.append('   熱い台:')
                     for m in hot:
@@ -514,7 +729,7 @@ def render_detail() -> None:
         )
         return
 
-    profiles = _load_all_profiles()
+    profiles = load_all_profiles()
 
     with st.spinner('データ読み込み中...'):
         dashboard_detail(profiles)
@@ -552,7 +767,7 @@ def main() -> None:
     if mode == 'detail':
         _run_streamlit_dashboard()
     else:
-        profiles = _load_all_profiles()
+        profiles = load_all_profiles()
         print(memo_simple(profiles))
 
 

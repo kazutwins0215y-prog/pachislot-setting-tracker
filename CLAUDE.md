@@ -22,8 +22,10 @@
 | [`fase2/patterns.py`](fase2/patterns.py) | 実装済み | 移動台検出・幅型パターン(S_全台系/新台/移動台)・深さ型パターン(S_鉄板台/ローテ/据え置き)・αブレンド。S_鉄板台は該当日のみ効果量ベースでスコア付与(検出条件は`teppan_conditions`へ保存)、αは固定0.3(旧ウォークフォワード学習は当日リークのため停止、Stage7で再設計予定) |
 | [`fase2/score.py`](fase2/score.py) | 実装済み | S_稼働低さ・合成スコアΣ(wᵢ×Sᵢ)÷Σ(wᵢ)・店舗プロファイル管理 |
 | [`fase2/app_a.py`](fase2/app_a.py) | 実装済み | 機能A: Streamlit 店内比較・可視化ツール（店舗分析/台番号/機種名の3ビュー）。`render()`で本体を公開し`app.py`から呼び出し可能 |
-| [`fase2/app_b.py`](fase2/app_b.py) | 実装済み(再設計検討中) | 機能B: 振り返りダッシュボード + 狙い目メモ。`render_detail()`で詳細ダッシュボード本体を公開し`app.py`から呼び出し可能。再設計方針(トップページ・カレンダーヒートマップ等)は[`fase2/追加検討_機能B再設計.md`](fase2/追加検討_機能B再設計.md)参照(2026-07時点で実装未着手) |
-| [`fase2/app.py`](fase2/app.py) | 実装済み | 機能A・機能Bを1つのWebページに統合するエントリポイント（サイドバーの選択メニューで切替）。`streamlit run app.py`で起動 |
+| [`fase2/app_b.py`](fase2/app_b.py) | 実装済み(再設計Phase1〜5実装済み・Phase6は将来対応) | 機能B: 振り返りダッシュボード + 狙い目メモ。`render_detail()`で詳細ダッシュボード本体を公開し`app.py`から呼び出し可能。個別店舗詳細に検知期間履歴・当月カレンダーヒートマップ(統合スコア日次平均+パターン別内訳)を追加済み。再設計の詳細は[`fase2/データ分析_skill.md`](fase2/データ分析_skill.md)、Phase6(将来項目)は[`fase2/今後の実装予定.md`](fase2/今後の実装予定.md)参照 |
+| [`fase2/app_top.py`](fase2/app_top.py) | 実装済み(機能B再設計Phase4) | トップページ: 当日の店舗ランキング(符号付き合成スコア)・当日の熱い台・翌日予測ランキング(S_鉄板台、`prediction_log`の最新行+`prediction_accuracy`の的中率)。`render()`で本体を公開し`app.py`から呼び出し可能 |
+| [`fase2/app.py`](fase2/app.py) | 実装済み | トップページ・機能A・機能Bを1つのWebページに統合するエントリポイント（サイドバーの選択メニューで切替）。`streamlit run app.py`で起動 |
+| [`fase2/evaluate_predictions.py`](fase2/evaluate_predictions.py) | 実装済み(機能B再設計Stage7-2) | `prediction_log`とレプリカの実測差枚を突き合わせ、Spearman相関・Precision@N・リフトを`prediction_accuracy`へ集計。`python evaluate_predictions.py`で実行(翌日以降の実データがレプリカに入ってから意味を持つ) |
 | [`fase2/multi_store.py`](fase2/multi_store.py) | 実装済み(2026-07再設計) | Stage1b+Stage5+Stage6: 機種別デシルカーブ(bin_curves)学習と**LOSO交差検証ゲート**(旧実装は循環学習だったため、直交化残差が翌観測日のRNG証拠を予測できた場合のみw3>0・γ_storeを保存。不合格時はw3=0=回転数チャンネル無効)・検証(Tier再現性/マクロ整合性)。`python multi_store.py`で全店舗一括実行 |
 | [`fase2/data_source.py`](fase2/data_source.py) | 実装済み | fase2共通のデータ読み込み層。入力=Tursoレプリカ(`ホールデータ/turso_replica.db`、読み取り専用)・分析成果物の保存先=分析DB(`ホールデータ/analysis.db`)のパスと接続を集約 |
 | [`fase2/run_store_profile.py`](fase2/run_store_profile.py) | 実装済み | 1店舗分のpreprocess→patterns→scoreパイプラインを通しで実行し、分析DBの`stage3_scores`(Stage3出力)と`store_profile`を更新するバッチ(`--hole <店舗名>`で特定店舗のみ)。fase4(日次自動実行)が実装されるまでの間、新規店舗取込時やデータ更新後に手動実行する運用補助スクリプト |
@@ -48,3 +50,8 @@
 - 分析DB: `ホールデータ/analysis.db`（fase2の成果物`stage3_scores`/`store_profile`。ローカル専用・`fase2/run_store_profile.py`で再生成可能）
 - 旧ローカルSQLite: `ホールデータ/{ホール名スラッグ}.db`（Turso移行前の生データのアーカイブ。現在はどのコードからも参照されない。`.gitignore`でGit管理対象外。Turso移行時に`fase1/merge_stores_for_turso.py`で1ファイルに統合しUpload DB機能で移行済み）
 - 対象サイト: `ana-slo.com`
+
+## Claude Codeスキル
+
+- 「新店舗を追加」「新しいホールを追加」→ [`.claude/skills/add-new-store/SKILL.md`](.claude/skills/add-new-store/SKILL.md)（stores.jsonへの登録・バックフィル日数指定・fase2側の反映手順）
+- 「機能A/Bを起動」「アプリを起動」→ [`.claude/skills/launch-app/SKILL.md`](.claude/skills/launch-app/SKILL.md)（Streamlitアプリの起動コマンド）

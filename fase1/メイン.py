@@ -24,7 +24,7 @@ MIN_SLEEP     = 10   # 最低待機時間（秒）
 BATCH_SIZE    = 20   # この件数ごとに長めの休憩を挟む
 BATCH_BREAK   = 60 * 5  # バッチ休憩時間（秒）
 
-INITIAL_BACKFILL_DAYS = 90   # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか
+INITIAL_BACKFILL_DAYS = int(os.environ.get('INITIAL_BACKFILL_DAYS', 90))  # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか（環境変数で一時的に上書き可能）
 COLLECT_UNTIL_DAYS_AGO = 2   # 何日前までを収集対象にするか（サイト側の当日・前日データ未更新に備える）
 RETRY_LOOKBACK_DAYS = 14     # 取得失敗等で空いた未処理日(ギャップ)を何日前まで再試行するか
 
