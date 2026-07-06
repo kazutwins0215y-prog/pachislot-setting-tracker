@@ -20,66 +20,62 @@ app_a.py — 店内比較・可視化ツール (Streamlit)
 """
 import math
 import sqlite3
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-_WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
+import data_source as ds
 
-_DB_ROOT = Path(__file__).parent.parent / 'ホールデータ'
+_WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
 
 
 # ── DB ユーティリティ ─────────────────────────────────────────────────
 
-def _find_db_files() -> list[Path]:
-    if _DB_ROOT.exists():
-        return sorted(_DB_ROOT.glob('*.db'))
-    return []
-
-
-def _get_hole_names(db_path: str) -> list[str]:
+def _load_stage3_scores(hole_name: str) -> pd.DataFrame:
+    """分析DB(analysis.db)からstage3_scoresを読む。未作成なら空DFを返す。"""
+    if not ds.ANALYSIS_DB_PATH.exists():
+        return pd.DataFrame()
     try:
-        con = sqlite3.connect(db_path)
+        con = sqlite3.connect(str(ds.ANALYSIS_DB_PATH))
         try:
-            df = pd.read_sql_query('SELECT DISTINCT ホール名 FROM slot_data', con)
-            return df['ホール名'].dropna().tolist()
-        except Exception:
-            return []
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return pd.DataFrame()
+            return pd.read_sql_query(
+                'SELECT 日付, 機種名, 台番号, log_odds, high_prob, is_invalid '
+                'FROM stage3_scores WHERE ホール名 = ?',
+                con,
+                params=(hole_name,),
+            )
         finally:
             con.close()
     except Exception:
-        return []
+        return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False)
-def _load_data_cached(db_path: str, hole_name: str) -> tuple[pd.DataFrame, str, str]:
+def _load_data_cached(hole_name: str) -> tuple[pd.DataFrame, str, str]:
     """データ読み込み + スコア計算をキャッシュ（UIコールなし）。"""
     import time
     t0 = time.perf_counter()
 
-    con = sqlite3.connect(db_path)
+    con = ds.connect_replica()
     try:
         df = pd.read_sql_query(
             'SELECT * FROM slot_data WHERE ホール名 = ?',
             con,
             params=(hole_name,),
         )
-        tables = pd.read_sql_query(
-            "SELECT name FROM sqlite_master WHERE type='table'", con
-        )['name'].tolist()
-        if 'stage3_scores' in tables:
-            scores = pd.read_sql_query(
-                'SELECT 日付, 機種名, 台番号, log_odds, high_prob, is_invalid '
-                'FROM stage3_scores WHERE ホール名 = ?',
-                con,
-                params=(hole_name,),
-            )
-            df = df.merge(scores, on=['日付', '機種名', '台番号'], how='left')
     finally:
         con.close()
+
+    scores = _load_stage3_scores(hole_name)
+    if not scores.empty:
+        df = df.merge(scores, on=['日付', '機種名', '台番号'], how='left')
 
     for col in ['台番号', '回転数', '差枚', 'BB', 'RB', 'ART']:
         if col in df.columns:
@@ -114,9 +110,10 @@ def _load_data_cached(db_path: str, hole_name: str) -> tuple[pd.DataFrame, str, 
     return df, warn_msg, info_msg
 
 
-def load_data(db_path: str, hole_name: str) -> pd.DataFrame:
-    """slot_data と stage3_scores を結合して読み込む。stage3_scores がない場合は preprocess でオンザフライ計算。"""
-    df, warn_msg, info_msg = _load_data_cached(db_path, hole_name)
+def load_data(hole_name: str) -> pd.DataFrame:
+    """slot_data(レプリカ) と stage3_scores(分析DB) を結合して読み込む。
+    stage3_scores がない場合は preprocess でオンザフライ計算。"""
+    df, warn_msg, info_msg = _load_data_cached(hole_name)
     if warn_msg:
         st.sidebar.warning(warn_msg)
     st.sidebar.caption(info_msg)
@@ -629,23 +626,16 @@ def view_by_machine(df: pd.DataFrame) -> None:
 
 def render() -> None:
     """機能Aの画面本体。単独実行(main)・統合アプリ(app.py)の両方から呼べる。"""
-    db_files = _find_db_files()
-    if not db_files:
-        st.error('ホールデータ/*.db が見つかりません。fase1 でデータ収集を先に実行してください。')
+    try:
+        hole_names = ds.list_holes()
+    except FileNotFoundError:
+        st.error(ds.MISSING_REPLICA_MSG)
         return
-
-    db_map = {p.stem: str(p) for p in db_files}
-    sel_db = st.sidebar.selectbox('DBファイル（ホール）', list(db_map.keys()))
-    db_path = db_map[sel_db]
-
-    hole_names = _get_hole_names(db_path)
     if not hole_names:
-        st.error(f'{sel_db}.db に slot_data テーブルが見つかりません。')
+        st.error('レプリカDBに店舗データがありません。fase1 でデータ収集を先に実行してください。')
         return
-    if len(hole_names) == 1:
-        hole_name = hole_names[0]
-    else:
-        hole_name = st.sidebar.selectbox('ホール名', hole_names)
+
+    hole_name = st.sidebar.selectbox('ホール名', hole_names)
 
     st.title(hole_name)
 
@@ -653,7 +643,7 @@ def render() -> None:
         _load_data_cached.clear()
 
     with st.spinner('データ読み込み中... (初回のみ時間がかかります)'):
-        df = load_data(db_path, hole_name)
+        df = load_data(hole_name)
 
     if df.empty:
         st.warning('このDBにデータがありません。')

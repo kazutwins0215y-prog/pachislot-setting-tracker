@@ -1,9 +1,16 @@
 import os
 import logging
+from pathlib import Path
 
 import libsql
 
 logger = logging.getLogger(__name__)
+
+# Turso埋め込みレプリカ(SQLite互換のローカルファイル)。
+# 書き込みはTurso(プライマリ)へ委譲され、sync()でこのファイルに最新状態が反映される。
+# fase2(分析・可視化)はTursoへ直接接続せず、このファイルを読み取り専用で参照する
+# (読み取り行数課金の回避と、fase2をlibsql非依存に保つため)。
+REPLICA_PATH = Path(__file__).resolve().parent.parent / 'ホールデータ' / 'turso_replica.db'
 
 _CREATE_TABLE_SQL = '''
     CREATE TABLE IF NOT EXISTS slot_data (
@@ -61,17 +68,45 @@ def _to_prob(s) -> float | None:
 
 
 def get_connection():
-    """Turso(libSQL)への接続を返す。TURSO_DATABASE_URL / TURSO_AUTH_TOKEN 環境変数が必須。"""
-    return libsql.connect(
-        database=os.environ['TURSO_DATABASE_URL'],
+    """
+    Turso(libSQL)への埋め込みレプリカ接続を返す。
+    TURSO_DATABASE_URL / TURSO_AUTH_TOKEN 環境変数が必須。
+
+    接続時にsync()を実行し、リモートの最新状態をローカルレプリカへ反映する
+    (初回はフルダウンロードになるため時間がかかる)。以降の読み取りはローカル、
+    書き込みはリモートプライマリへ委譲される。書き込み後にsync_replica()を
+    呼ぶことでローカルファイルも最新化される。
+    """
+    REPLICA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = libsql.connect(
+        str(REPLICA_PATH),
+        sync_url=os.environ['TURSO_DATABASE_URL'],
         auth_token=os.environ['TURSO_AUTH_TOKEN'],
     )
+    con.sync()
+    return con
+
+
+def sync_replica(con) -> bool:
+    """リモートの最新状態をローカルレプリカへ反映する。失敗してもFalseを返すのみ
+    (収集済みデータはリモートに書き込み済みで、同期失敗は次回実行時に回復するため)。"""
+    try:
+        con.sync()
+        return True
+    except Exception as e:
+        logger.warning(f'ローカルレプリカの同期に失敗しました(次回実行時に再同期されます): {e}')
+        return False
 
 
 def setup_db(con):
     cur = con.cursor()
     cur.execute(_CREATE_TABLE_SQL)
     cur.execute(_CREATE_MISSING_TABLE_SQL)
+    # UNIQUE制約のインデックスは先頭列が日付のため WHERE ホール名=? に使えない。
+    # Tursoは読み取り行数課金であり、全表スキャン回避のためこのインデックスが必須。
+    cur.execute(
+        'CREATE INDEX IF NOT EXISTS idx_slot_hole_date ON slot_data (ホール名, 日付)'
+    )
     con.commit()
 
 

@@ -1,45 +1,34 @@
 """
-run_store_profile.py — 1店舗分のパイプラインを通しで実行し store_profile を更新する
+run_store_profile.py — 1店舗分のパイプラインを通しで実行し分析DBを更新する
 
 preprocess.py(Stage0〜4) → patterns.py(幅型/深さ型/αブレンド) → score.py(S_稼働低さ・
-合成・store_profile書き込み) を順に実行する。機能A/Bは既存の store_profile を読むだけ
-なので、新しく取り込んだ店舗(store_profileテーブル未作成)や、データ更新後の再計算には
-このスクリプトを実行する必要がある。
+合成・store_profile/stage3_scores書き込み) を順に実行する。
 
-fase4(日次自動実行)が実装されるまでの間、このスクリプトを手動実行することで
-機能B(振り返りダッシュボード/狙い目メモ)に店舗を反映できる。
+データの流れ:
+    ホールデータ/turso_replica.db (fase1が維持するTursoレプリカ・読み取り専用)
+        → 本スクリプトで再計算
+        → ホールデータ/analysis.db (stage3_scores / store_profile)
+
+機能A/Bは analysis.db を読むだけなので、データ更新後(fase1収集後)や
+新規店舗取込時にはこのスクリプトを実行する必要がある。
+fase4(日次自動実行)が実装されるまでの間の手動運用補助スクリプト。
 
 実行方法:
-    python run_store_profile.py                    # ホールデータ/ 配下の全DBを更新
-    python run_store_profile.py --db yasuda7.db     # 特定DBのみ更新
+    python run_store_profile.py                       # レプリカ内の全店舗を更新
+    python run_store_profile.py --hole yasuda7        # 特定店舗のみ更新
 """
 import argparse
-import json
 import sys
-from pathlib import Path
 
+import data_source as ds
 import preprocess as pp
 import patterns as pt
 import score as sc
 
-_DB_ROOT = Path(__file__).parent.parent / 'ホールデータ'
 
-
-def _hole_name_for_db(db_path: Path) -> str | None:
+def _existing_gamma_store(analysis_db: str, hole_name: str) -> float | None:
     import sqlite3
-    con = sqlite3.connect(str(db_path))
-    try:
-        rows = con.execute('SELECT DISTINCT ホール名 FROM slot_data').fetchall()
-    except Exception:
-        return None
-    finally:
-        con.close()
-    return rows[0][0] if len(rows) == 1 else None
-
-
-def _existing_gamma_store(db_path: Path, hole_name: str) -> float | None:
-    import sqlite3
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(analysis_db)
     try:
         tables = [r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -55,18 +44,14 @@ def _existing_gamma_store(db_path: Path, hole_name: str) -> float | None:
         con.close()
 
 
-def run_for_db(db_path: str, hole_name: str | None = None) -> None:
-    """指定DBのslot_dataから store_profile を再計算して書き込む。"""
-    db_path_p = Path(db_path)
-    if hole_name is None:
-        hole_name = _hole_name_for_db(db_path_p)
-    if hole_name is None:
-        print(f'  [スキップ] {db_path_p.name}: ホール名を特定できません。')
-        return
+def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str | None = None) -> None:
+    """指定店舗のslot_dataから stage3_scores / store_profile を再計算して書き込む。"""
+    replica_db = replica_db or str(ds.REPLICA_DB_PATH)
+    analysis_db = analysis_db or str(ds.ANALYSIS_DB_PATH)
 
-    df = pp.load_slot_data(str(db_path_p), hole_name)
+    df = pp.load_slot_data(replica_db, hole_name)
     if df.empty:
-        print(f'  [スキップ] {db_path_p.name}: slot_dataが空です。')
+        print(f'  [スキップ] {hole_name}: slot_dataが空です。')
         return
     df = pp.normalize(df)
 
@@ -76,9 +61,16 @@ def run_for_db(db_path: str, hole_name: str | None = None) -> None:
     scored = pp.compute_log_odds(scored)
     scored = pp.mark_invalid(scored, machine_tier, specs)
 
+    # Stage3出力を保存(機能Aの初期表示高速化・機能Bの「熱い台」が読む)
+    sc.write_stage3_scores(analysis_db, hole_name, scored)
+
     events_df = pt.detect_all_events(scored)
     scored = pt.compute_breadth_scores(scored, events_df)
-    scored = pt.compute_depth_scores(scored)
+    teppan_details: list[dict] = []
+    scored = pt.compute_depth_scores(scored, teppan_details=teppan_details)
+    # S_鉄板台の検出条件(どのカレンダー候補/周期で有意か)を保存。
+    # 「明日は該当日か」の判断材料として機能Bが参照する
+    sc.write_teppan_conditions(analysis_db, hole_name, teppan_details)
 
     alphas = pt.learn_all_alphas(scored, hole_name)
     for score_col in pt.BLENDABLE_SCORES:
@@ -90,34 +82,34 @@ def run_for_db(db_path: str, hole_name: str | None = None) -> None:
     weights = pp.load_weights(str(pp.WEIGHTS_PATH)) if pp.WEIGHTS_PATH.exists() else {}
     synthesized = sc.synthesize(scored, weights)
 
-    gamma_store = _existing_gamma_store(db_path_p, hole_name)
-    sc.update_store_profile(str(db_path_p), hole_name, synthesized, gamma_store=gamma_store)
-    print(f'  [完了] {hole_name}: store_profile を更新しました({len(synthesized):,}行)。')
+    gamma_store = _existing_gamma_store(analysis_db, hole_name)
+    sc.update_store_profile(analysis_db, hole_name, synthesized, gamma_store=gamma_store)
+    print(f'  [完了] {hole_name}: stage3_scores / store_profile を更新しました({len(synthesized):,}行)。')
 
 
 def main() -> None:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
 
-    parser = argparse.ArgumentParser(description='store_profile を再計算して更新する')
-    parser.add_argument('--db', default=None, help='ホールデータ/ 配下のDBファイル名(省略時は全件)')
+    parser = argparse.ArgumentParser(description='stage3_scores / store_profile を再計算して更新する')
+    parser.add_argument('--hole', default=None, help='店舗名(省略時はレプリカ内の全店舗)')
     args = parser.parse_args()
 
-    if args.db:
-        db_files = [_DB_ROOT / args.db]
-    else:
-        db_files = sorted(_DB_ROOT.glob('*.db')) if _DB_ROOT.exists() else []
-
-    if not db_files:
-        print('対象DBが見つかりません。')
+    try:
+        holes = ds.list_holes()
+    except FileNotFoundError as e:
+        print(e)
         return
 
-    print(f'{len(db_files)}件のDBを処理します。')
-    for db_path in db_files:
-        if not db_path.exists():
-            print(f'  [スキップ] {db_path.name}: ファイルが存在しません。')
-            continue
-        run_for_db(str(db_path))
+    if args.hole:
+        if args.hole not in holes:
+            print(f'店舗 {args.hole!r} がレプリカDBに見つかりません。存在する店舗: {holes}')
+            return
+        holes = [args.hole]
+
+    print(f'{len(holes)}店舗を処理します。')
+    for hole_name in holes:
+        run_for_hole(hole_name)
 
 
 if __name__ == '__main__':

@@ -13,6 +13,14 @@ S_稼働低さ (score_kadou_hikusha):
     振り返り分析ごとに store_profile テーブルを再計算・更新
     γ_store は multi_store.py の Stage5 で学習されたら保存される
 
+Stage3スコア保存 (write_stage3_scores):
+    台×日ごとのlog_odds/high_prob/is_invalidを分析DBへ保存
+    機能A(可視化の初期表示高速化)・機能B(熱い台)が読む
+
+鉄板台検出条件保存 (write_teppan_conditions):
+    S_鉄板台がどの条件(カレンダー候補/周期)で有意だったかを分析DBへ保存
+    「明日は該当日か」の判断・機能B再設計のトップページ表示に使う
+
 依存: patterns.py (各サブスコア列), preprocess.py (回転数列)
 """
 import sqlite3
@@ -150,6 +158,104 @@ def synthesize(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     out['有効サブスコア数'] = valid_count
 
     return out
+
+
+_CREATE_STAGE3_SCORES_SQL = '''
+    CREATE TABLE IF NOT EXISTS stage3_scores (
+        日付       TEXT NOT NULL,
+        ホール名   TEXT NOT NULL,
+        機種名     TEXT NOT NULL,
+        台番号     INTEGER NOT NULL,
+        log_odds   REAL,
+        high_prob  REAL,
+        is_invalid INTEGER,
+        PRIMARY KEY (日付, ホール名, 機種名, 台番号)
+    )
+'''
+
+
+def write_stage3_scores(db_path: str, hole_name: str, df_scored: pd.DataFrame) -> None:
+    """
+    Stage3出力(log_odds / high_prob / is_invalid)を台×日単位で分析DBへ保存する。
+    店舗単位で全削除→再挿入(再計算のたびに全量を最新化する)。
+    機能A(app_a: 初期表示の高速化)・機能B(app_b: 熱い台)がこのテーブルを読む。
+    """
+    required = ['日付', '機種名', '台番号', 'log_odds', 'high_prob', 'is_invalid']
+    missing = [c for c in required if c not in df_scored.columns]
+    if missing:
+        raise ValueError(f'stage3_scores保存に必要な列がありません: {missing}')
+
+    sub = df_scored.dropna(subset=['日付', '機種名', '台番号'])
+    rows = [
+        (
+            str(r.日付), hole_name, str(r.機種名), int(r.台番号),
+            None if pd.isna(r.log_odds) else float(r.log_odds),
+            None if pd.isna(r.high_prob) else float(r.high_prob),
+            int(bool(r.is_invalid)),
+        )
+        for r in sub.itertuples()
+    ]
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_STAGE3_SCORES_SQL)
+        con.execute('DELETE FROM stage3_scores WHERE ホール名 = ?', (hole_name,))
+        con.executemany(
+            '''
+            INSERT OR REPLACE INTO stage3_scores
+                (日付, ホール名, 機種名, 台番号, log_odds, high_prob, is_invalid)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+_CREATE_TEPPAN_CONDITIONS_SQL = '''
+    CREATE TABLE IF NOT EXISTS teppan_conditions (
+        ホール名 TEXT NOT NULL,
+        機種名   TEXT NOT NULL,
+        台番号   INTEGER NOT NULL,
+        経路     TEXT NOT NULL,
+        条件     TEXT NOT NULL,
+        効果量   REAL,
+        更新日時 TEXT
+    )
+'''
+
+
+def write_teppan_conditions(db_path: str, hole_name: str, details: list[dict]) -> None:
+    """
+    S_鉄板台の検出条件(patterns.score_teppandaiのdetails_out)を分析DBへ保存する。
+    店舗単位で全削除→再挿入。detailsが空でも古い行の削除は行う
+    (再計算で検出されなくなった条件を残さないため)。
+    """
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = [
+        (hole_name, d['機種名'], int(d['台番号']), d['経路'], d['条件'],
+         None if d.get('効果量') is None else float(d['効果量']), now)
+        for d in details
+        if d.get('ホール名') == hole_name
+    ]
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_TEPPAN_CONDITIONS_SQL)
+        con.execute('DELETE FROM teppan_conditions WHERE ホール名 = ?', (hole_name,))
+        if rows:
+            con.executemany(
+                '''
+                INSERT INTO teppan_conditions
+                    (ホール名, 機種名, 台番号, 経路, 条件, 効果量, 更新日時)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                rows,
+            )
+        con.commit()
+    finally:
+        con.close()
 
 
 def update_store_profile(

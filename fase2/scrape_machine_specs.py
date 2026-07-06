@@ -311,18 +311,15 @@ def scrape_one(session: requests.Session, machine_name: str) -> dict:
 
 
 def load_target_machines() -> list[str]:
-    import sqlite3
-    import glob
+    """レプリカDBに存在する全機種名(specs取得対象)を返す。"""
+    import data_source as ds
 
-    hall_dir = BASE_DIR.parent / 'ホールデータ'
-    names = set()
-    for db_path in glob.glob(str(hall_dir / '*.db')):
-        con = sqlite3.connect(db_path)
+    con = ds.connect_replica()
+    try:
         cur = con.cursor()
         cur.execute("SELECT DISTINCT 機種名 FROM slot_data")
-        for (name,) in cur.fetchall():
-            if name:
-                names.add(name)
+        names = {name for (name,) in cur.fetchall() if name}
+    finally:
         con.close()
     return sorted(n for n in names if n not in SKIP_MACHINES)
 

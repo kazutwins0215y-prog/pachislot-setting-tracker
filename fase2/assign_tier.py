@@ -20,20 +20,19 @@ Tier判定方針(データ分析_skill.md Stage1aに準拠):
 
 実行方法: python fase2/assign_tier.py
 """
-import glob
 import json
 import re
-import sqlite3
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 
+import data_source as ds
+
 BASE_DIR = Path(__file__).resolve().parent
 RAW_PATH = BASE_DIR / 'raw_specs_scraped.json'
 SPECS_PATH = BASE_DIR / 'machine_setting_specs.json'
-HALL_DIR = BASE_DIR.parent / 'ホールデータ'
 
 # ── 列名正規化ルール ──────────────────────────────────────────
 BB_EXACT = ['BIG', 'BB確率', 'BB']
@@ -230,19 +229,17 @@ _RATE_CORR_THRESHOLD = 0.5
 
 
 def load_all_hall_data() -> pd.DataFrame:
-    frames = []
-    for db_path in glob.glob(str(HALL_DIR / '*.db')):
-        con = sqlite3.connect(db_path)
-        try:
-            df = pd.read_sql_query(
-                "SELECT 機種名, 回転数, 差枚, BB確率, RB確率, ART確率 FROM slot_data", con
-            )
-        finally:
-            con.close()
-        for col in ['回転数', '差枚', 'BB確率', 'RB確率', 'ART確率']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True)
+    """レプリカDBから全店舗の実測データ(Tier B/C判定用)を読み込む。"""
+    con = ds.connect_replica()
+    try:
+        df = pd.read_sql_query(
+            "SELECT 機種名, 回転数, 差枚, BB確率, RB確率, ART確率 FROM slot_data", con
+        )
+    finally:
+        con.close()
+    for col in ['回転数', '差枚', 'BB確率', 'RB確率', 'ART確率']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
 
 
 def judge_ab_tier(df: pd.DataFrame, machine_name: str) -> dict:

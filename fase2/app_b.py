@@ -27,7 +27,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-_DB_ROOT = Path(__file__).parent.parent / 'ホールデータ'
+import data_source as ds
+
 _WEIGHTS_PATH = Path(__file__).parent / 'weights.json'
 
 # store_profile.パターン列の値 → 表示名
@@ -69,12 +70,6 @@ def _load_weights() -> dict[str, float]:
     return _DEFAULT_WEIGHTS
 
 
-def _find_db_files() -> list[Path]:
-    if _DB_ROOT.exists():
-        return sorted(_DB_ROOT.glob('*.db'))
-    return []
-
-
 def _load_profile_from_db(db_path: str) -> pd.DataFrame:
     """単一DBから store_profile を読み込む。テーブルがなければ空DFを返す。"""
     try:
@@ -97,15 +92,15 @@ def _load_profile_from_db(db_path: str) -> pd.DataFrame:
 
 
 def _load_all_profiles() -> pd.DataFrame:
-    """全 DB の store_profile を統合して返す。"""
-    frames = [_load_profile_from_db(str(p)) for p in _find_db_files()]
-    frames = [f for f in frames if not f.empty]
-    if not frames:
-        return pd.DataFrame(
-            columns=['ホール名', 'パターン', 'スコア', '信頼度',
-                     'gamma_store', '更新日時', 'db_path']
-        )
-    return pd.concat(frames, ignore_index=True)
+    """分析DB(analysis.db)の store_profile を全店舗分読み込んで返す。"""
+    if ds.ANALYSIS_DB_PATH.exists():
+        profiles = _load_profile_from_db(str(ds.ANALYSIS_DB_PATH))
+        if not profiles.empty:
+            return profiles
+    return pd.DataFrame(
+        columns=['ホール名', 'パターン', 'スコア', '信頼度',
+                 'gamma_store', '更新日時', 'db_path']
+    )
 
 
 def _synthesize_scores(profiles: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
@@ -262,7 +257,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
     if profiles.empty:
         st.warning(
             'store_profile データがありません。'
-            'score.py の update_store_profile を先に実行してください。'
+            'fase2/run_store_profile.py を先に実行してください。'
         )
         return
 
@@ -426,7 +421,7 @@ def memo_simple(profiles: pd.DataFrame) -> str:
     if profiles.empty:
         return (
             '【狙い目メモ】\n'
-            'データがありません。score.py の update_store_profile を先に実行してください。'
+            'データがありません。fase2/run_store_profile.py を先に実行してください。'
         )
 
     weights = _load_weights()
@@ -482,7 +477,7 @@ def memo_simple(profiles: pd.DataFrame) -> str:
                             f'  (高設定確率: {prob:.1%})'
                         )
                 else:
-                    lines.append('   熱い台: Stage3スコアなし（preprocess.py を先に実行）')
+                    lines.append('   熱い台: Stage3スコアなし（run_store_profile.py を先に実行）')
             else:
                 lines.append('   熱い台: DB参照不可')
 
@@ -512,23 +507,14 @@ def render_detail() -> None:
 
     st.title('機能B-詳細: 振り返りダッシュボード')
 
-    db_files = _find_db_files()
-    if not db_files:
+    if not ds.ANALYSIS_DB_PATH.exists():
         st.error(
-            'ホールデータ/*.db が見つかりません。'
-            'fase1 でデータ収集を先に実行してください。'
+            f'分析DBが見つかりません: {ds.ANALYSIS_DB_PATH}\n\n'
+            'fase2/run_store_profile.py を先に実行してください。'
         )
         return
 
-    st.sidebar.header('データ選択')
-    scope = st.sidebar.radio('表示対象', ['全店舗（全DB統合）', '特定DBのみ'], index=0)
-
-    if scope == '特定DBのみ':
-        db_map = {p.stem: str(p) for p in db_files}
-        sel_db = st.sidebar.selectbox('DBファイル', list(db_map.keys()))
-        profiles = load_store_profiles(db_map[sel_db])
-    else:
-        profiles = _load_all_profiles()
+    profiles = _load_all_profiles()
 
     with st.spinner('データ読み込み中...'):
         dashboard_detail(profiles)

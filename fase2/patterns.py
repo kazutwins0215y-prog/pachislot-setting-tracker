@@ -347,6 +347,23 @@ def lomb_scargle_screen(series: pd.Series, timestamps: pd.Series) -> list[float]
     return [float(periods[i]) for i in range(len(periods)) if pgram[i] > 0.4]
 
 
+_WEEKDAY_NAMES = ['月', '火', '水', '木', '金', '土', '日']
+
+
+def calendar_candidates(dt: pd.DatetimeIndex) -> dict[str, np.ndarray]:
+    """
+    既知カレンダー17候補(曜日7 + 日付末尾10 + ゾロ目1)の日付マスクを返す。
+    calendar_test(検定)と score_teppandai(該当日スコア付与)で共用する。
+    """
+    candidates: dict[str, np.ndarray] = {}
+    for i, name in enumerate(_WEEKDAY_NAMES):
+        candidates[f'曜日_{name}'] = (dt.dayofweek == i)
+    for d in range(10):
+        candidates[f'末尾_{d}'] = (dt.day % 10 == d)
+    candidates['ゾロ目'] = np.isin(dt.day, [11, 22])
+    return candidates
+
+
 def calendar_test(
     series: pd.Series,
     dates: pd.Series,
@@ -358,18 +375,14 @@ def calendar_test(
     check_missing_bias_fn: preprocess.check_missing_bias を渡す。
 
     Returns:
-        {候補名: {'p_adj': float, 'effect_size': float, 'significant': bool}}
+        {候補名: {'p_raw': float, 'effect_size': float, 'significant': bool}}
+        ※ p_raw はBH補正前の生p値(補正は significant フラグにのみ反映)。
+          旧キー名 p_adj は「補正済み」と誤解を招くため2026-07に改名。
     """
     dt = pd.to_datetime(dates.values, errors='coerce')
     mini_df = pd.DataFrame({'is_invalid': series.isna().values}, index=series.index)
 
-    day_names = ['月', '火', '水', '木', '金', '土', '日']
-    candidates: dict[str, np.ndarray] = {}
-    for i, name in enumerate(day_names):
-        candidates[f'曜日_{name}'] = (dt.dayofweek == i)
-    for d in range(10):
-        candidates[f'末尾_{d}'] = (dt.day % 10 == d)
-    candidates['ゾロ目'] = np.isin(dt.day, [11, 22])
+    candidates = calendar_candidates(dt)
 
     names_list = list(candidates.keys())
     p_values: list[float] = []
@@ -407,7 +420,7 @@ def calendar_test(
     results: dict = {}
     for i, name in enumerate(names_list):
         results[name] = {
-            'p_adj': p_values[i],
+            'p_raw': p_values[i],
             'effect_size': effect_sizes[i],
             'significant': (bool(significant_flags[i])
                             and effect_sizes[i] >= EFFECT_SIZE_THRESHOLD
@@ -432,16 +445,59 @@ def benjamini_hochberg(p_values: list[float], alpha: float = FDR_ALPHA) -> list[
     return reject
 
 
+TEPPAN_PHASE_BINS = 5  # pdm_confirmと同じ位相ビン数
+
+
+def _phase_day_scores(hp: pd.Series, lag: int, n_bins: int = TEPPAN_PHASE_BINS) -> np.ndarray:
+    """
+    確認済み周期lagについて、位相ビンごとの平均high_probが全体平均を上回るビンに
+    属する日へ (ビン平均 − 全体平均) / 0.5 のスコア(0〜1)を付与して返す。
+    該当しない日は0.0。0.5の正規化はscore_zentaiki等と同じ規約。
+
+    ※ 位相は「観測順インデックス」基準(既存のACF/PDMと同じ近似)。
+      営業日が飛ぶと暦日とはズレる点に注意。
+    """
+    x = hp.values.astype(float)
+    out = np.zeros(len(x))
+    valid = ~np.isnan(x)
+    if int(valid.sum()) < 10:
+        return out
+    overall = float(np.nanmean(x))
+    t = np.arange(len(x))
+    phases = (t % lag) / lag
+    bins = (phases * n_bins).astype(int) % n_bins
+    for b in range(n_bins):
+        m = (bins == b) & valid
+        if int(m.sum()) < 2:
+            continue
+        diff = float(np.mean(x[m])) - overall
+        if diff > 0:
+            # 該当ビンに属する日全体(欠測日含む=そのビンの日は熱いという予測)
+            out[bins == b] = min(1.0, diff / 0.5)
+    return out
+
+
 def score_teppandai(
     df: pd.DataFrame,
     machine_name: str,
     unit_col: str = '台番号',
+    details_out: list | None = None,
 ) -> pd.Series:
     """
-    S_鉄板台: 2経路を統合した鉄板台スコア(0〜1)。
-    メイン経路: ACF → PDM → Lomb-Scargle(判定不能率高い台)
-    別経路: カレンダー17候補の検定
-    両経路が一致 → 確信度UP / 未知周期のみ → 別枠記録
+    S_鉄板台: 2経路統合の鉄板台スコア(0〜1)。**該当日のみ**にスコアを付与する。
+
+    [2026-07 仕様変更] 旧実装は検出台の全日に定数(1.0/0.6)を付与しており、
+    「特定条件の日に入る」という鉄板台の性質と逆に、非該当日の狙い目度を
+    押し上げて該当日のコントラストを消していた。現仕様:
+    - カレンダー経路: 有意候補(例: 末尾7)に合致する日のみ、効果量(rank-biserial)をスコアに
+    - 周期経路(ACF→PDM / Lomb-Scargle): 確認済み周期の高位相ビンに属する日のみ、
+      (ビン平均−全体平均)/0.5 をスコアに
+    - 両経路は noisy-or (1-(1-a)(1-b)) で統合(両経路一致日ほど高スコア)
+    - 非該当日・未検出台は NaN(synthesizeで除外・再正規化。
+      「非該当日は低設定寄り」の負スコア化は機能B再設計の符号付き拡張時に検討)
+
+    details_out: listを渡すと検出条件(経路/条件/効果量)を台単位で追記する
+    (どの条件で有意だったかを機能B等で表示するためのメタデータ)。
     履歴14日未満の台は NaN(検出不可扱い)。
     """
     from preprocess import check_missing_bias  # 循環インポート回避のため局所import
@@ -465,31 +521,64 @@ def score_teppandai(
         n_invalid = int(hp.isna().sum())
         invalid_rate_val = n_invalid / n_total
 
-        # ── メイン経路 ──
-        main_significant = False
+        # ── 周期経路: 確認済み周期ごとに該当日スコア(複数周期はmax) ──
+        main_scores = np.zeros(n_total)
         if invalid_rate_val > INVALID_RATE_THRESHOLD:
             ts = pd.Series(np.arange(n_total, dtype=float))
-            main_significant = len(lomb_scargle_screen(hp, ts)) > 0
+            for period in lomb_scargle_screen(hp, ts):
+                lag = max(2, int(round(period)))
+                day_scores = _phase_day_scores(hp, lag)
+                if day_scores.max() > 0:
+                    main_scores = np.maximum(main_scores, day_scores)
+                    if details_out is not None:
+                        details_out.append({
+                            'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
+                            '経路': '周期(Lomb-Scargle)', '条件': f'周期{lag}日(観測順)',
+                            '効果量': round(float(day_scores.max()), 3),
+                        })
         else:
             sig_lags = acf_screen(hp)
             if sig_lags:
                 pdm_result = pdm_confirm(hp, sig_lags)
-                main_significant = any(v['confirmed'] for v in pdm_result.values())
+                for lag, res in pdm_result.items():
+                    if not res['confirmed']:
+                        continue
+                    day_scores = _phase_day_scores(hp, lag)
+                    if day_scores.max() > 0:
+                        main_scores = np.maximum(main_scores, day_scores)
+                        if details_out is not None:
+                            details_out.append({
+                                'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
+                                '経路': '周期(ACF+PDM)', '条件': f'周期{lag}日(観測順)',
+                                '効果量': round(float(1.0 - res['theta']), 3),
+                            })
 
-        # ── カレンダー経路 ──
+        # ── カレンダー経路: 有意候補に合致する日のみ効果量をスコアに ──
+        cal_scores = np.zeros(n_total)
         date_series = pd.Series(grp_sorted['日付'].values)
         cal_results = calendar_test(hp, date_series, check_missing_bias)
-        calendar_significant = any(v['significant'] for v in cal_results.values())
+        significant_names = [n for n, v in cal_results.items() if v['significant']]
+        if significant_names:
+            dt_idx = pd.to_datetime(date_series.values, errors='coerce')
+            candidates = calendar_candidates(dt_idx)
+            for name in significant_names:
+                effect = float(np.clip(cal_results[name]['effect_size'], 0.0, 1.0))
+                day_mask = np.asarray(candidates[name], dtype=bool)
+                cal_scores = np.maximum(cal_scores, np.where(day_mask, effect, 0.0))
+                if details_out is not None:
+                    details_out.append({
+                        'ホール名': hole, '機種名': machine_name, '台番号': int(unit),
+                        '経路': 'カレンダー', '条件': name,
+                        '効果量': round(effect, 3),
+                    })
 
-        # ── 2経路統合 ──
-        if main_significant and calendar_significant:
-            unit_score = 1.0
-        elif main_significant or calendar_significant:
-            unit_score = 0.6
-        else:
+        # ── 2経路統合(noisy-or): 両経路が同じ日を指すほど高スコア ──
+        combined = 1.0 - (1.0 - main_scores) * (1.0 - cal_scores)
+        combined = np.where(combined > 0, combined, np.nan)
+        if np.isnan(combined).all():
             continue  # 検出不可 → NaN のまま
 
-        scores.loc[grp_sorted.index] = unit_score
+        scores.loc[grp_sorted.index] = combined
 
     return scores
 
@@ -599,14 +688,17 @@ def score_sueki(df: pd.DataFrame) -> pd.Series:
     return scores
 
 
-def compute_depth_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """全深さ型サブスコアを計算して列追加した DataFrame を返す。"""
+def compute_depth_scores(df: pd.DataFrame, teppan_details: list | None = None) -> pd.DataFrame:
+    """
+    全深さ型サブスコアを計算して列追加した DataFrame を返す。
+    teppan_details: listを渡すとS_鉄板台の検出条件(経路/条件/効果量)を追記する。
+    """
     out = df.copy()
     teppan = pd.Series(np.nan, index=out.index)
     rotation = pd.Series(np.nan, index=out.index)
     for machine in out['機種名'].dropna().unique():
         mask = out['機種名'] == machine
-        teppan[mask] = score_teppandai(out, machine).reindex(out.index[mask])
+        teppan[mask] = score_teppandai(out, machine, details_out=teppan_details).reindex(out.index[mask])
         rotation[mask] = score_rotation(out, machine).reindex(out.index[mask])
     out['S_鉄板台'] = teppan
     out['S_ローテ'] = rotation
@@ -709,37 +801,27 @@ def blend(
     return result
 
 
+FIXED_ALPHA = 0.3  # 暫定固定値(短期3:長期7)。ウォークフォワードα学習は停止中(下記docstring参照)
+
+
 def learn_all_alphas(
     df: pd.DataFrame,
     hole_name: str,
     scores: list[str] = BLENDABLE_SCORES,
 ) -> dict:
     """
-    全対象スコア(BLENDABLE_SCORES)のαを店舗×スコア別に学習する。
-    Returns: {スコア名: α}
+    [2026-07 仕様変更] 固定α(FIXED_ALPHA)を返す。
+
+    旧実装のウォークフォワード学習は停止した。理由:
+    - ターゲット(当日の店舗平均high_prob)に対し、特徴量のS_全台系等は
+      まさにその当日のhigh_probから計算されており、同日情報のリークで
+      実質自己回帰になっていた(αが「未来の予測に効く比率」を表さない)
+    - compute_short_term_scoreは末尾M日窓を1回計算して貼るだけで、
+      各時点tにおける短期版になっておらず、α推定の実効サンプルが末尾のみだった
+    真のウォークフォワード(特徴=t時点までで計算、ターゲット=t+1の実測差枚)は
+    Stage7(予測精度の自己検証ループ)として機能B再設計とあわせて再実装する。
+    walk_forward_alpha関数はその際の再利用に備えて残置(現在未使用)。
+
+    Returns: {スコア名: FIXED_ALPHA}
     """
-    hole_df = df[df['ホール名'] == hole_name].copy()
-    alphas: dict = {}
-
-    for score_col in scores:
-        if score_col not in hole_df.columns or 'high_prob' not in hole_df.columns:
-            alphas[score_col] = 0.0
-            continue
-
-        short_series = compute_short_term_score(hole_df, score_col)
-        hole_df['_short'] = short_series
-
-        daily = hole_df.groupby('日付').agg(
-            long_score=(score_col, 'mean'),
-            short_score=('_short', 'mean'),
-        )
-        daily_target = hole_df.groupby('日付')['high_prob'].mean()
-
-        alphas[score_col] = walk_forward_alpha(
-            daily['long_score'],
-            daily['short_score'],
-            daily_target,
-        )
-
-    hole_df.drop(columns=['_short'], errors='ignore', inplace=True)
-    return alphas
+    return {score_col: FIXED_ALPHA for score_col in scores}

@@ -37,7 +37,14 @@ INVALID_THRESHOLD = 5           # 期待発生回数の下限
 MISSING_BIAS_THRESHOLD = 0.12   # 判定不能率差の初期閾値(12pt)
 BET_PER_GAME = 3                # パチスロ標準ベット枚数(機械割⇔差枚/Gの換算に使用)
 KAITEN_ZSCORE_MIN_DAYS = 5      # 台内zスコアに必要な最低履歴日数
-_DEFAULT_CHANNEL_WEIGHTS = {'w1': 1.0, 'w2': 0.5, 'w3': 1.0}
+
+# w3=0.0: 回転数チャンネルは既定で無効。
+# 旧実装のStage1b/5は「logLR_rngから作ったカーブをlogLR_rngで検証する」循環学習で、
+# RNG証拠の二重計上になっていたため停止した(2026-07)。multi_store.pyの
+# LOSO交差検証(validate_kaiten_channel)に合格した場合のみ、学習済みw3>0が
+# stage3_channel_weights.jsonに書き込まれて有効化される。
+_DEFAULT_CHANNEL_WEIGHTS = {'w1': 1.0, 'w2': 0.5, 'w3': 0.0}
+_DEFAULT_ORTH_PARAMS = {'orth_a': 0.0, 'orth_b': 0.0}
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +70,16 @@ def load_bin_curves() -> dict:
 
 def load_channel_weights() -> dict:
     """
-    multi_store.py(Stage5)が学習したStage3チャンネル重み(w1/w2/w3)を読み込む。
-    未学習の場合は暫定既定値(w1=1.0, w2=0.5, w3=1.0)を返す。
+    multi_store.py(Stage5)が学習したStage3チャンネル重み(w1/w2/w3)と
+    直交化パラメータ(orth_a/orth_b)を読み込む。
+    未学習の場合は既定値(w1=1.0, w2=0.5, w3=0.0=回転数チャンネル無効)を返す。
+    w3はmulti_store.validate_kaiten_channel(LOSO交差検証)に合格した場合のみ正になる。
     """
+    defaults = {**_DEFAULT_CHANNEL_WEIGHTS, **_DEFAULT_ORTH_PARAMS}
     if CHANNEL_WEIGHTS_PATH.exists():
         loaded = json.loads(CHANNEL_WEIGHTS_PATH.read_text(encoding='utf-8'))
-        return {**_DEFAULT_CHANNEL_WEIGHTS, **loaded}
-    return dict(_DEFAULT_CHANNEL_WEIGHTS)
+        return {**defaults, **loaded}
+    return defaults
 
 
 # ── Stage 0: 正規化 ──────────────────────────────────────────────
@@ -316,13 +326,26 @@ def compute_kaiten_zscore(df: pd.DataFrame, min_days: int = KAITEN_ZSCORE_MIN_DA
     return z.where((counts >= min_days) & (sigma > 0))
 
 
-def compute_logLR_kaiten_column(df: pd.DataFrame, bin_curves: dict) -> pd.Series:
+def compute_logLR_kaiten_column(
+    df: pd.DataFrame,
+    bin_curves: dict,
+    orth_a: float = 0.0,
+    orth_b: float = 0.0,
+) -> pd.Series:
     """
     チャンネル③: kaiten_zscore を機種別デシルカーブ(bin_curves、multi_store.pyの
     Stage1b/5で複数店舗データから学習)に通してlogLR_kaitenを求める。
 
     bin_curvesに機種が無い(未学習)場合、またはkaiten_zscoreがNaN(履歴不足)の
     場合は0.0(寄与なし)。df に 'kaiten_zscore' 列が無ければ自動計算する。
+
+    orth_a/orth_b: 直交化パラメータ(multi_store.pyで学習)。0以外を渡すと、
+    カーブ値から同一行のlogLR_rngで説明できる成分を除いた残差
+    (curve − (orth_a + orth_b × logLR_rng)) を返す。カーブがlogLR_rngを教師に
+    学習されている以上、素のカーブ値をStage3で加算するとRNG証拠の二重計上に
+    なるため、有効化時は必ず直交化して「回転数だけが持つ独立成分」に絞る。
+    直交化はカーブ値を持つ行(=シグナルのある行)にのみ適用する
+    (シグナルの無い行に−(a+b·y1)を注入しないため)。
     """
     out = pd.Series(0.0, index=df.index)
     if not bin_curves:
@@ -331,6 +354,8 @@ def compute_logLR_kaiten_column(df: pd.DataFrame, bin_curves: dict) -> pd.Series
     zscore = df['kaiten_zscore'] if 'kaiten_zscore' in df.columns else compute_kaiten_zscore(df)
     percentile = pd.Series(stats.norm.cdf(zscore.fillna(0.0)), index=df.index)
     decile = np.minimum((percentile * 10).astype(int), 9)
+
+    use_orth = (orth_a != 0.0 or orth_b != 0.0) and 'logLR_rng' in df.columns
 
     for machine_name, grp_idx in df.groupby('機種名', sort=False).groups.items():
         curve = bin_curves.get(machine_name)
@@ -341,7 +366,11 @@ def compute_logLR_kaiten_column(df: pd.DataFrame, bin_curves: dict) -> pd.Series
         if target_idx.empty:
             continue
         decile_vals = decile.loc[target_idx].to_numpy(dtype=int)
-        out.loc[target_idx] = np.asarray(curve, dtype=float)[decile_vals]
+        vals = np.asarray(curve, dtype=float)[decile_vals]
+        if use_orth:
+            y1 = df.loc[target_idx, 'logLR_rng'].fillna(0.0).to_numpy(dtype=float)
+            vals = vals - (orth_a + orth_b * y1)
+        out.loc[target_idx] = vals
 
     return out
 
@@ -507,7 +536,14 @@ def compute_all_logLR(
         bin_curves = load_bin_curves()
     if bin_curves:
         df['kaiten_zscore'] = compute_kaiten_zscore(df)
-        df['logLR_kaiten'] = compute_logLR_kaiten_column(df, bin_curves)
+        # 直交化パラメータ(multi_store.pyがLOSO検証時に学習)を適用し、
+        # RNG証拠と独立な成分だけをチャンネル③に残す(二重計上の防止)
+        params = load_channel_weights()
+        df['logLR_kaiten'] = compute_logLR_kaiten_column(
+            df, bin_curves,
+            orth_a=float(params.get('orth_a', 0.0)),
+            orth_b=float(params.get('orth_b', 0.0)),
+        )
     else:
         # multi_store.py(Stage1b/5)で複数店舗データから学習するまでは0.0
         df['logLR_kaiten'] = 0.0
@@ -532,7 +568,9 @@ def compute_log_odds(
     w1: RNGチャンネル / w2: 差枚チャンネル / w3: 回転数行動チャンネル(Stage5で学習)
 
     各引数を省略した場合は stage3_channel_weights.json (multi_store.py の
-    Stage5が学習) から自動読み込みする。未学習時の既定値は w1=1.0, w2=0.5, w3=1.0。
+    Stage5が学習) から自動読み込みする。未学習時の既定値は w1=1.0, w2=0.5,
+    **w3=0.0(回転数チャンネル無効)**。w3はmulti_store.pyのLOSO交差検証に
+    合格した場合のみ正の学習値が保存される(循環学習・二重計上対策、2026-07)。
 
     [NOTE] w2=0.5 は暫定値。per-game 正規化後もチャンネル間の識別力に差が残るため
     控えめに設定。Stage5の重み学習後に改めて調整すること。
