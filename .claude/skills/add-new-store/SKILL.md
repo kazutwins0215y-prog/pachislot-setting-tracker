@@ -83,4 +83,4 @@ python run_store_profile.py --hole <店舗名（stores.jsonのスラッグと同
 
 - `fase1/stores.json`に新スラッグが追加されている
 - `ホールデータ/analysis.db`の`store_profile`テーブルに新店舗の行が存在する（`run_store_profile.py`実行後）
-- 機能A（`app_a.py`）の店舗選択に新店舗が表示される
+- 統合アプリ（`streamlit run fase2/app.py`）ホームページの店舗検索に新店舗が表示され、店舗トップページ(機能A/機能B)が開ける

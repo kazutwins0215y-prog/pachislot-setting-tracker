@@ -4,6 +4,11 @@ app_b.py — 振り返り分析ダッシュボード + 狙い目メモ
 【機能B-詳細: 振り返り分析ダッシュボード】
   用途: 蓄積データからのパターン検出結果・店舗プロファイルをじっくり見る
   内容: 各サブスコアの値と内訳 / 信頼度 / γ_store / 複数店舗の横並び比較
+  画面は2分割で公開:
+    render_overview(profiles)          … 店舗横断(ランキング・サブスコア比較・ヒートマップ)
+                                          → app.pyのホームページに表示
+    render_store_detail(profiles, 店名) … 個別店舗詳細(内訳・検知期間履歴・カレンダー)
+                                          → app.pyの店舗トップページに表示
 
 【機能B-簡潔: 狙い目メモ】
   用途: 次回「家を出る前」に確認する要約
@@ -15,10 +20,9 @@ app_b.py — 振り返り分析ダッシュボード + 狙い目メモ
 依存: score.py (合成スコア・store_profile)
 
 実行方法:
-  streamlit run app_b.py -- --mode detail
-  python app_b.py --mode simple
+  Streamlit画面は app.py から呼ばれる(単独起動は廃止)
+  テキストメモ: python app_b.py
 """
-import argparse
 import json
 import sqlite3
 import sys
@@ -361,13 +365,13 @@ def load_store_profiles(db_path: str) -> pd.DataFrame:
     return _load_profile_from_db(db_path)
 
 
-def dashboard_detail(profiles: pd.DataFrame) -> None:
+def render_overview(profiles: pd.DataFrame) -> None:
     """
-    機能B-詳細: Streamlit で全サブスコア・内訳・信頼度・γ_storeを表示する。
+    機能B-横断: 店舗ランキング・サブスコア比較・全サブスコアヒートマップを表示する。
+    app.pyのホームページから呼ばれる。
     """
     import streamlit as st
     import plotly.express as px
-    import plotly.graph_objects as go
 
     if profiles.empty:
         st.warning(
@@ -385,16 +389,11 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
         'マイナス=弱い(該当日が少ない/非該当日が多い)ことを示します。'
     )
 
-    # ── サイドバー設定 ──
-    st.sidebar.subheader('表示設定')
-    min_rel = st.sidebar.slider('最低信頼度フィルタ', 0.0, 1.0, 0.0, 0.05)
-    show_gamma = st.sidebar.checkbox('γ_store を表示', value=True)
-
     # ── 1. 店舗ランキング ──
     st.subheader('店舗ランキング（合成スコア）')
 
     if not synth_df.empty:
-        disp = synth_df[synth_df['平均信頼度'] >= min_rel].copy()
+        disp = synth_df.copy()
         disp['合成スコア'] = disp['合成スコア'].map(
             lambda x: f'{x:.3f}' if pd.notna(x) else 'N/A'
         )
@@ -428,8 +427,6 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
                 pivot_df[['ホール名', rel_col]].rename(columns={rel_col: '信頼度'}),
                 on='ホール名', how='left',
             )
-            # 最低信頼度でフィルタ
-            bar_df = bar_df[bar_df['信頼度'].fillna(0) >= min_rel]
 
         bar_df = bar_df.sort_values('スコア', ascending=True)
 
@@ -445,7 +442,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
             fig.update_layout(height=max(280, len(bar_df) * 42 + 80))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info('表示できるデータがありません（信頼度フィルタを緩めてください）。')
+            st.info('表示できるデータがありません。')
     else:
         st.info('サブスコアデータがありません。')
 
@@ -474,16 +471,31 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
     else:
         st.info('サブスコアデータがありません。')
 
-    st.divider()
 
-    # ── 4. 個別店舗詳細 ──
-    st.subheader('個別店舗詳細')
-
-    hole_names = profiles['ホール名'].unique().tolist()
-    sel_hole = st.selectbox('ホール名', sorted(hole_names), key='detail_hole')
+def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
+    """
+    機能B-個別店舗詳細: サブスコア内訳・γ_store・検知期間履歴・カレンダーヒートマップ。
+    app.pyの店舗トップページから店舗固定で呼ばれる。
+    """
+    import streamlit as st
+    import plotly.express as px
+    import plotly.graph_objects as go
 
     hole_grp = profiles[profiles['ホール名'] == sel_hole].copy()
+    if hole_grp.empty:
+        st.info(
+            f'{sel_hole} の store_profile データがありません。'
+            'fase2/run_store_profile.py を先に実行してください。'
+        )
+        return
+
     hole_grp['表示名'] = hole_grp['パターン'].map(_PATTERN_LABELS)
+
+    st.subheader(f'{sel_hole} — サブスコア詳細')
+    st.caption(
+        'サブスコアは符号付き([-1, 1]): プラス=そのパターンが強く出ている、'
+        'マイナス=弱い(該当日が少ない/非該当日が多い)ことを示します。'
+    )
 
     col1, col2 = st.columns([1, 1])
 
@@ -496,7 +508,7 @@ def dashboard_detail(profiles: pd.DataFrame) -> None:
         st.dataframe(tbl, use_container_width=True, hide_index=True)
 
         # γ_store
-        if 'gamma_store' in hole_grp.columns and show_gamma:
+        if 'gamma_store' in hole_grp.columns:
             gv = hole_grp['gamma_store'].dropna()
             if not gv.empty:
                 st.metric('γ_store', f'{float(gv.iloc[0]):.4f}')
@@ -713,62 +725,17 @@ def memo_simple(profiles: pd.DataFrame) -> str:
     return '\n'.join(lines)
 
 
-# ── Streamlit エントリポイント ────────────────────────────────────
-
-
-def render_detail() -> None:
-    """機能B-詳細の画面本体。単独実行(_run_streamlit_dashboard)・統合アプリ(app.py)の両方から呼べる。"""
-    import streamlit as st
-
-    st.title('機能B-詳細: 振り返りダッシュボード')
-
-    if not ds.ANALYSIS_DB_PATH.exists():
-        st.error(
-            f'分析DBが見つかりません: {ds.ANALYSIS_DB_PATH}\n\n'
-            'fase2/run_store_profile.py を先に実行してください。'
-        )
-        return
-
-    profiles = load_all_profiles()
-
-    with st.spinner('データ読み込み中...'):
-        dashboard_detail(profiles)
-
-
-def _run_streamlit_dashboard() -> None:
-    """Streamlit ダッシュボード本体。`streamlit run app_b.py -- --mode detail` で呼ばれる。"""
-    import streamlit as st
-
-    st.set_page_config(page_title='機能B: 振り返りダッシュボード', layout='wide')
-    render_detail()
-
-
 # ── メイン ───────────────────────────────────────────────────────
 
 
 def main() -> None:
+    """機能B-簡潔: 狙い目メモをテキスト出力する(`python app_b.py`)。"""
     # Windows のコンソール(cp932)は █/░ 等の記号をエンコードできず crash するため utf-8 に固定する。
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
 
-    parser = argparse.ArgumentParser(
-        description='機能B: 振り返りダッシュボード + 狙い目メモ'
-    )
-    # choices を使わず文字列として受け取る。
-    # Streamlit が内部引数を付加するケースや前方一致("simpl" 等)に対応するため
-    # parse_known_args + 前方一致正規化で処理する。
-    parser.add_argument('--mode', default='simple',
-                        help='detail: Streamlit ダッシュボード / simple: テキストメモ（既定）')
-    args, _ = parser.parse_known_args()
-
-    raw = args.mode.strip().lower()
-    mode = 'detail' if raw.startswith('d') else 'simple'
-
-    if mode == 'detail':
-        _run_streamlit_dashboard()
-    else:
-        profiles = load_all_profiles()
-        print(memo_simple(profiles))
+    profiles = load_all_profiles()
+    print(memo_simple(profiles))
 
 
 if __name__ == '__main__':

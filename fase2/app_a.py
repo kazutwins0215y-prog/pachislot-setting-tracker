@@ -3,20 +3,20 @@ app_a.py — 店内比較・可視化ツール (Streamlit)
 
 用途: 来店前/来店中に1店舗内の台を手動で見比べる
 
-フィルタ軸: 期間 / 機種 / 台番号レンジ / 推定設定レンジ / 列・島
-
 表示ビュー:
   [店舗単位] 月ごとの合計差枚数の平均、任意月の日次差枚数推移
-  [台ごと]   台ごとの期待値・差枚バーチャート / 1台または1列の日次トレンド折れ線 /
-             島内レイアウトに沿ったヒートマップ
-  [任意2軸] 上記フィルタ軸・指標から任意の2軸を選んで比較
+  [台番号]   台番号別の日次トレンド折れ線(機種名サジェスト・台番号末尾絞り込み付き)
+  [機種名]   機種名別の日次トレンド折れ線(台番号末尾での色分けにも対応)
+
+絞り込み(データ範囲・日付絞り込み・機種名/台番号選択)は各ビュー本文内で行う
+(旧サイドバーフィルタは廃止)。
 
 注意: 運用しながら必要な図を追加していく想定(確定版ではない)
 
 依存: preprocess.py (load_slot_data / high_prob), score.py (合成スコア・内訳)
 
 実行方法:
-  streamlit run fase2/app_a.py
+  app.py の店舗トップページから render(hole_name) で呼ばれる(単独起動は廃止)
 """
 import math
 import sqlite3
@@ -115,49 +115,8 @@ def load_data(hole_name: str) -> pd.DataFrame:
     stage3_scores がない場合は preprocess でオンザフライ計算。"""
     df, warn_msg, info_msg = _load_data_cached(hole_name)
     if warn_msg:
-        st.sidebar.warning(warn_msg)
-    st.sidebar.caption(info_msg)
-    return df
-
-
-# ── フィルタ UI ──────────────────────────────────────────────────────
-
-def filter_ui(df: pd.DataFrame) -> pd.DataFrame:
-    """Streamlit サイドバーにフィルタUIを表示し、絞り込み済みDataFrameを返す。"""
-    st.sidebar.subheader('フィルタ')
-    st.sidebar.divider()
-
-    # 期間
-    if '日付' in df.columns and df['日付'].notna().any():
-        d_min = df['日付'].min().date()
-        d_max = df['日付'].max().date()
-        date_range = st.sidebar.date_input('期間', value=(d_min, d_max), min_value=d_min, max_value=d_max)
-        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-            s, e = date_range
-            df = df[(df['日付'].dt.date >= s) & (df['日付'].dt.date <= e)]
-
-    # 機種名
-    if '機種名' in df.columns:
-        machines = sorted(df['機種名'].dropna().unique().tolist())
-        sel = st.sidebar.multiselect('機種名', machines, default=[])
-        if sel:
-            df = df[df['機種名'].isin(sel)]
-
-    # 台番号
-    if '台番号' in df.columns and df['台番号'].notna().any():
-        nos = sorted(df['台番号'].dropna().astype(int).unique().tolist())
-        sel_nos = st.sidebar.multiselect('台番号', nos, default=[])
-        if sel_nos:
-            df = df[df['台番号'].isin(sel_nos)]
-
-    # 推定設定レンジ (high_prob が存在する場合のみ)
-    if 'high_prob' in df.columns and df['high_prob'].notna().any():
-        p_range = st.sidebar.slider('高設定確率 (high_prob)', 0.0, 1.0, (0.0, 1.0), step=0.05)
-        mask = df['high_prob'].isna() | (
-            (df['high_prob'] >= p_range[0]) & (df['high_prob'] <= p_range[1])
-        )
-        df = df[mask]
-
+        st.warning(warn_msg)
+    st.caption(info_msg)
     return df
 
 
@@ -624,22 +583,9 @@ def view_by_machine(df: pd.DataFrame) -> None:
 
 # ── メイン ───────────────────────────────────────────────────────────
 
-def render() -> None:
-    """機能Aの画面本体。単独実行(main)・統合アプリ(app.py)の両方から呼べる。"""
-    try:
-        hole_names = ds.list_holes()
-    except FileNotFoundError:
-        st.error(ds.MISSING_REPLICA_MSG)
-        return
-    if not hole_names:
-        st.error('レプリカDBに店舗データがありません。fase1 でデータ収集を先に実行してください。')
-        return
-
-    hole_name = st.sidebar.selectbox('ホール名', hole_names)
-
-    st.title(hole_name)
-
-    if st.sidebar.button('キャッシュをクリア（新データ反映）'):
+def render(hole_name: str) -> None:
+    """機能Aの画面本体。app.pyの店舗トップページから店舗固定で呼ばれる。"""
+    if st.button('キャッシュをクリア（新データ反映）', key='a_clear_cache'):
         _load_data_cached.clear()
 
     with st.spinner('データ読み込み中... (初回のみ時間がかかります)'):
@@ -649,22 +595,15 @@ def render() -> None:
         st.warning('このDBにデータがありません。')
         return
 
-    # サイドバー情報
-    st.sidebar.divider()
     info = f'総行数: {len(df):,}'
     if df['日付'].notna().any():
-        info += f'\n{df["日付"].min().date()} 〜 {df["日付"].max().date()}'
-    st.sidebar.caption(info)
+        info += f' ／ {df["日付"].min().date()} 〜 {df["日付"].max().date()}'
     has_scores = 'high_prob' in df.columns and df['high_prob'].notna().any()
-    st.sidebar.caption('Stage3スコア: あり' if has_scores else 'Stage3スコア: なし（生データのみ）')
+    info += ' ／ Stage3スコア: あり' if has_scores else ' ／ Stage3スコア: なし（生データのみ）'
+    st.caption(info)
 
-    df = filter_ui(df)
-
-    if df.empty:
-        st.warning('フィルタ条件に合うデータがありません。条件を緩めてください。')
-        return
-
-    view = st.radio('ビュー', ['店舗分析', '台番号', '機種名'], horizontal=True, label_visibility='collapsed')
+    view = st.radio('ビュー', ['店舗分析', '台番号', '機種名'], horizontal=True,
+                    label_visibility='collapsed', key='a_view')
     st.divider()
 
     if view == '店舗分析':
@@ -673,12 +612,3 @@ def render() -> None:
         view_by_slot(df)
     else:
         view_by_machine(df)
-
-
-def main() -> None:
-    st.set_page_config(page_title='機能A: 店内比較', layout='wide')
-    render()
-
-
-if __name__ == '__main__':
-    main()
