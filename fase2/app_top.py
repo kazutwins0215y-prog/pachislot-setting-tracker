@@ -1,21 +1,23 @@
 """
-app_top.py — 機能B再設計 Phase 4: トップページ(当日・翌日ランキング)
+app_top.py — 機能B再設計 Phase4 + 2026-07 UIリニューアル: トップページ
 
 【トップページ】
   用途: 家を出る前に「今どの店が狙い目か」「明日どの台が狙い目か」を一目で確認する
   内容:
-    1. 店舗ランキング(当日・符号付き合成スコア。プラス=狙い目、マイナス=避けるべき店)
-    2. 当日の熱い台(店舗別、stage3_scoresのhigh_prob上位)
-    3. 翌日予測ランキング(S_鉄板台。prediction_logの最新行+prediction_accuracyの的中率)
+    1. render_recommend_stores(): MM/DD(曜)のおすすめ店舗
+       (当日・符号付き合成スコアのプラス上位3+マイナス下位3、表形式・色分け)
+    2. render_hot_predictions(): MM/DD(曜)の熱い台予測
+       (店舗ごと/全店舗横断、個別台・機種・ローテ・新台・増台・移動台・据えの7タブ)
 
-的中率・信頼度が低くても翌日予測候補を非表示にはしない(機能B再設計1節の決定通り。
+的中率・信頼度が低くても候補を非表示にはしない(機能B再設計1節の決定通り。
 最終判断は人間が行う前提)。的中率はPhase3のprediction_accuracyを読むだけで、
 ここでは計算しない(集計ロジックの二重実装を避けるため evaluate_predictions.py に一任)。
 
-依存: app_b.py(店舗ランキング・熱い台の既存実装を再利用), patterns.py(calendar_candidates),
-      score.py 経由で作成される prediction_log / prediction_accuracy テーブル
+依存: app_b.py(合成スコア計算の既存実装を再利用), data_source.py(analysis.db接続),
+      score.py 経由で作成される stage3_scores / store_profile / prediction_log / prediction_accuracy
 
-実行方法: app.py のホームページから render() で呼ばれる(単独起動は廃止)
+実行方法: app.py のホームページから render_recommend_stores() / render_hot_predictions() で
+          呼ばれる(単独起動は廃止)
 """
 import json
 import sqlite3
@@ -28,7 +30,15 @@ import data_source as ds
 import patterns as pt
 from evaluate_predictions import MIN_SAMPLES
 
-_TOP_N_PREDICTIONS = 15  # 翌日予測ランキングのグラフ表示件数(暫定値)
+_TOP_N_STORES = 3        # おすすめ店舗ランキングの上位/下位件数
+_TOP_N_PER_STORE = 3     # 店舗ごとの予測タブの表示件数
+_TOP_N_CROSS_STORE = 5   # 全店舗横断タブの表示件数
+_WEEKDAY_LABELS = ['月', '火', '水', '木', '金', '土', '日']
+
+# 7タブの暫定閾値(実データ運用しながら調整する前提。fase2/今後の実装予定.md参照)
+_RELIABILITY_GATE = 0.4     # ローテ/新台増台/移動台/据え置きタブの店舗単位信頼度ゲート
+_BREADTH_SCORE_GATE = 0.3   # 新台増台/移動台タブの台単位スコアしきい値
+_SUEKI_SCORE_GATE = 0.5     # 据え置きタブの台単位スコアしきい値
 
 
 # ── データ読み込み ────────────────────────────────────────────────
@@ -147,17 +157,48 @@ def _accuracy_text(acc_row: pd.Series | None) -> str:
     return ' / '.join(bits)
 
 
+# ── 対象日ラベル ──────────────────────────────────────────────────
+
+
+def _load_target_date(analysis_db: str) -> str | None:
+    """prediction_log(S_鉄板台)の最新の対象日(YYYY-MM-DD)を返す。無ければNone。"""
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'prediction_log' not in tables:
+                return None
+            row = pd.read_sql_query(
+                "SELECT MAX(対象日) AS d FROM prediction_log WHERE 予測種別 = 'S_鉄板台'", con
+            )
+        finally:
+            con.close()
+    except Exception:
+        return None
+    if row.empty or pd.isna(row['d'].iloc[0]):
+        return None
+    return str(row['d'].iloc[0])
+
+
+def _date_label(date_str: str | None) -> str:
+    """MM/DD(曜)形式のラベルを返す。対象日が無ければ今日の日付を使う。"""
+    ts = pd.Timestamp(date_str) if date_str else pd.Timestamp.now()
+    return f'{ts.strftime("%m/%d")}({_WEEKDAY_LABELS[ts.dayofweek]})'
+
+
 # ── Streamlit エントリポイント ────────────────────────────────────
 
 
-def render() -> None:
-    """当日・翌日ランキング本体。app.pyのホームページから呼ばれる。"""
+def render_recommend_stores() -> None:
+    """
+    「MM/DD(曜)のおすすめ店舗」本体。app.pyのホームページから呼ばれる。
+    合成スコアのプラス上位3+マイナス下位3の計6店舗を表形式・色分けで表示する。
+    """
     import streamlit as st
-    import plotly.express as px
 
     import ui_theme as ui
-
-    st.header('当日・翌日ランキング')
 
     if not ds.ANALYSIS_DB_PATH.exists():
         st.error(
@@ -172,109 +213,308 @@ def render() -> None:
         profiles = ab.load_all_profiles()
         weights = ab.load_weights()
         synth_df = ab.synthesize_scores(profiles, weights)
-        pred_df = _load_latest_predictions(analysis_db)
-        acc_df = _load_prediction_accuracy(analysis_db)
+        target_date = _load_target_date(analysis_db)
 
-    # ── 1. 店舗ランキング(当日) ──
-    st.subheader('店舗ランキング')
+    st.header(f'{_date_label(target_date)}のおすすめ店舗')
 
     if synth_df.empty:
         st.warning(
             'store_profile データがありません。'
             'fase2/run_store_profile.py を先に実行してください。'
         )
-    else:
-        ranked = synth_df.sort_values('合成スコア', ascending=True)
-        fig = px.bar(
-            ranked, x='合成スコア', y='ホール名', orientation='h',
-            color='合成スコア', color_continuous_scale=ui.DIVERGING,
-            range_x=[-1, 1], range_color=[-1, 1],
-        )
-        ui.apply_mobile_layout(fig, height=max(280, len(ranked) * 32 + 80))
-        st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
+        return
 
-    st.divider()
+    ranked = synth_df.dropna(subset=['合成スコア']).sort_values('合成スコア', ascending=False)
+    if ranked.empty:
+        st.info('合成スコアを計算できる店舗がありません。')
+        return
 
-    # ── 2. 当日の熱い台(店舗別) ──
-    st.subheader('当日の熱い台(店舗別)')
+    combined = pd.concat(
+        [ranked.head(_TOP_N_STORES), ranked.tail(_TOP_N_STORES)]
+    ).drop_duplicates(subset=['ホール名'])
 
-    if synth_df.empty:
-        st.info('店舗データがありません。')
-    else:
-        for row in synth_df.itertuples():
-            db_path_val = str(row.db_path) if getattr(row, 'db_path', None) else ''
-            with st.expander(str(row.ホール名)):
-                if not db_path_val:
-                    st.caption('DB参照不可')
-                    continue
-                hot = ab.load_hot_machines(db_path_val, str(row.ホール名))
-                if not hot:
-                    st.caption('Stage3スコアなし(run_store_profile.py を先に実行)')
-                    continue
-                hot_df = pd.DataFrame(hot)
-                hot_df['high_prob'] = hot_df['high_prob'].map(lambda x: f'{float(x):.1%}')
-                st.dataframe(hot_df, use_container_width=True, hide_index=True)
+    disp = combined[['ホール名', '合成スコア']].reset_index(drop=True)
+    styled = ui.style_signed(disp, ['合成スコア']).format({'合成スコア': '{:+.3f}'})
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    st.divider()
 
-    # ── 3. 翌日予測ランキング(S_鉄板台) ──
-    st.subheader('翌日予測')
+# ── 熱い台予測: データ読み込み ────────────────────────────────────
 
-    if pred_df.empty:
-        st.info(
-            'prediction_logに翌日予測データがありません。'
-            'run_store_profile.py を実行すると蓄積されます。'
+
+def _load_latest_snapshot(analysis_db: str) -> pd.DataFrame:
+    """
+    stage3_scoresから店舗ごとの最新日(is_invalid除外)のスナップショットを1クエリで返す。
+    幅型/深さ型サブスコア列(score.py Stage B拡張分)を含む。テーブルが無ければ空DF。
+    """
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return pd.DataFrame()
+            return pd.read_sql_query(
+                '''
+                SELECT s.* FROM stage3_scores s
+                JOIN (
+                    SELECT ホール名, MAX(日付) AS max_date
+                    FROM stage3_scores
+                    WHERE is_invalid IS NULL OR is_invalid != 1
+                    GROUP BY ホール名
+                ) m ON s.ホール名 = m.ホール名 AND s.日付 = m.max_date
+                WHERE s.is_invalid IS NULL OR s.is_invalid != 1
+                ''',
+                con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_store_reliabilities(analysis_db: str) -> dict[tuple[str, str], float]:
+    """store_profileから(ホール名, パターンキー)→信頼度の辞書を返す。"""
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'store_profile' not in tables:
+                return {}
+            df = pd.read_sql_query('SELECT ホール名, パターン, 信頼度 FROM store_profile', con)
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    return {(r['ホール名'], r['パターン']): r['信頼度'] for _, r in df.iterrows()}
+
+
+# ── 熱い台予測: 7タブの中身 ───────────────────────────────────────
+
+_TAB_NAMES = ['個別台', '機種', 'ローテ', '新台', '増台', '移動台', '据え']
+
+
+def _tab_individual(
+    pred_df: pd.DataFrame, acc_lookup: dict, hole: str | None, top_n: int
+) -> pd.DataFrame | None:
+    """個別台タブ: ブレンド値上位N台+的中率(prediction_accuracy実データ)。"""
+    if 'ホール名' not in pred_df.columns:
+        return None
+    df = pred_df if hole is None else pred_df[pred_df['ホール名'] == hole]
+    df = df.dropna(subset=['ブレンド値']).sort_values('ブレンド値', ascending=False).head(top_n)
+    if df.empty:
+        return None
+    df = df.copy()
+    df['台'] = df['機種名'] + ' ' + df['台番号'].astype(int).astype(str) + '番台'
+    df['的中率'] = df.apply(
+        lambda r: _accuracy_text(acc_lookup.get((r['ホール名'], r['予測種別']))), axis=1
+    )
+    cols = (['ホール名'] if hole is None else []) + ['台', 'ブレンド値', '対象日', '的中率']
+    return df[cols].reset_index(drop=True)
+
+
+def _tab_machine(
+    pred_df: pd.DataFrame, acc_lookup: dict, hole: str | None, top_n: int
+) -> pd.DataFrame | None:
+    """機種タブ: 台のブレンド値を機種単位で平均(暫定)し上位N機種+的中率(店舗全体の参考値)。"""
+    if 'ホール名' not in pred_df.columns:
+        return None
+    df = pred_df if hole is None else pred_df[pred_df['ホール名'] == hole]
+    df = df.dropna(subset=['ブレンド値'])
+    if df.empty:
+        return None
+    grp = df.groupby(['ホール名', '機種名'], as_index=False).agg(
+        平均ブレンド値=('ブレンド値', 'mean'), 台数=('台番号', 'count')
+    )
+    grp = grp.sort_values('平均ブレンド値', ascending=False).head(top_n)
+    if grp.empty:
+        return None
+    grp = grp.copy()
+    grp['的中率'] = grp['ホール名'].map(
+        lambda h: _accuracy_text(acc_lookup.get((h, 'S_鉄板台')))
+    )
+    cols = (['ホール名'] if hole is None else []) + ['機種名', '平均ブレンド値', '台数', '的中率']
+    return grp[cols].reset_index(drop=True)
+
+
+def _tab_rotation(
+    snapshot: pd.DataFrame, reliabilities: dict, hole: str | None, top_n: int
+) -> pd.DataFrame | None:
+    """
+    ローテタブ: S_ローテが非NULL(検出条件はscore_rotation側で担保済み)かつ
+    店舗の's_rote'信頼度が閾値以上の機種を上位N件。
+    """
+    if 'S_ローテ' not in snapshot.columns:
+        return None
+    df = snapshot if hole is None else snapshot[snapshot['ホール名'] == hole]
+    df = df.dropna(subset=['S_ローテ']).copy()
+    if df.empty:
+        return None
+    df['信頼度'] = df['ホール名'].map(lambda h: reliabilities.get((h, 's_rote')))
+    df = df[df['信頼度'].fillna(0) >= _RELIABILITY_GATE]
+    if df.empty:
+        return None
+    df = df.drop_duplicates(subset=['ホール名', '機種名']).sort_values('S_ローテ', ascending=False).head(top_n)
+    df['的中率'] = '検証中'
+    cols = (['ホール名'] if hole is None else []) + ['機種名', 'S_ローテ', '的中率']
+    return df[cols].reset_index(drop=True)
+
+
+def _tab_breadth_unit(
+    snapshot: pd.DataFrame, reliabilities: dict, pattern_key: str,
+    hole: str | None, top_n: int,
+) -> pd.DataFrame | None:
+    """
+    新台/増台/移動台タブ共通: S_新台増台またはS_移動台が閾値超かつ店舗信頼度が閾値以上の台を上位N件。
+    [今後の実装予定.md 1.4節] 新台/増台タブは現状同じS_新台増台データを表示している
+    (detect_eventsが「機種の店舗初出」と「既存機種の台数追加」を区別していないため)。
+    """
+    score_col, rel_key = {
+        's_shintai': ('S_新台増台', 's_shintai'),
+        's_idoudai': ('S_移動台', 's_idoudai'),
+    }[pattern_key]
+
+    if score_col not in snapshot.columns:
+        return None
+    df = snapshot if hole is None else snapshot[snapshot['ホール名'] == hole]
+    df = df.dropna(subset=[score_col]).copy()
+    df = df[df[score_col] > _BREADTH_SCORE_GATE]
+    if df.empty:
+        return None
+    df['信頼度'] = df['ホール名'].map(lambda h: reliabilities.get((h, rel_key)))
+    df = df[df['信頼度'].fillna(0) >= _RELIABILITY_GATE]
+    if df.empty:
+        return None
+    df = df.sort_values(score_col, ascending=False).head(top_n)
+    df = df.copy()
+    df['台'] = df['機種名'] + ' ' + df['台番号'].astype(int).astype(str) + '番台'
+    df['的中率'] = '検証中'
+    cols = (['ホール名'] if hole is None else []) + ['台', score_col, '的中率']
+    return df[cols].reset_index(drop=True)
+
+
+def _tab_sueki(
+    snapshot: pd.DataFrame, reliabilities: dict, hole: str | None, top_n: int
+) -> pd.DataFrame | None:
+    """
+    据えタブ: S_据え置きが閾値超かつ店舗の's_sueki'信頼度が閾値以上の台を上位N件。
+    元プランの「周期条件を満たす場合のみ」は、score_sueki(lag-1自己相関)に離散的な
+    周期検出が存在しないため不採用(スコア閾値のみで判定。今後の実装予定.md参照)。
+    """
+    if 'S_据え置き' not in snapshot.columns:
+        return None
+    df = snapshot if hole is None else snapshot[snapshot['ホール名'] == hole]
+    df = df.dropna(subset=['S_据え置き']).copy()
+    df = df[df['S_据え置き'] > _SUEKI_SCORE_GATE]
+    if df.empty:
+        return None
+    df['信頼度'] = df['ホール名'].map(lambda h: reliabilities.get((h, 's_sueki')))
+    df = df[df['信頼度'].fillna(0) >= _RELIABILITY_GATE]
+    if df.empty:
+        return None
+    df = df.sort_values('S_据え置き', ascending=False).head(top_n)
+    df = df.copy()
+    df['台'] = df['機種名'] + ' ' + df['台番号'].astype(int).astype(str) + '番台'
+    df = df.rename(columns={'S_据え置き': '予測スコア'})
+    cols = (['ホール名'] if hole is None else []) + ['台', '予測スコア']
+    return df[cols].reset_index(drop=True)
+
+
+def _render_prediction_tabs(
+    hole: str | None,
+    pred_df: pd.DataFrame,
+    acc_lookup: dict,
+    snapshot: pd.DataFrame,
+    reliabilities: dict,
+    top_n: int,
+) -> None:
+    """7タブ(個別台/機種/ローテ/新台/増台/移動台/据え)を描画する。該当なしは st.info。"""
+    import streamlit as st
+
+    import ui_theme as ui
+
+    builders = {
+        '個別台': (lambda: _tab_individual(pred_df, acc_lookup, hole, top_n), 'ブレンド値'),
+        '機種': (lambda: _tab_machine(pred_df, acc_lookup, hole, top_n), '平均ブレンド値'),
+        'ローテ': (lambda: _tab_rotation(snapshot, reliabilities, hole, top_n), 'S_ローテ'),
+        '新台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_shintai', hole, top_n), 'S_新台増台'),
+        '増台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_shintai', hole, top_n), 'S_新台増台'),
+        '移動台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_idoudai', hole, top_n), 'S_移動台'),
+        '据え': (lambda: _tab_sueki(snapshot, reliabilities, hole, top_n), '予測スコア'),
+    }
+
+    tabs = st.tabs(_TAB_NAMES)
+    for tab, name in zip(tabs, _TAB_NAMES):
+        with tab:
+            build_fn, color_col = builders[name]
+            result = build_fn()
+            if result is None or result.empty:
+                st.info('該当なし')
+                continue
+            styled = ui.style_signed(result, [color_col]).format({color_col: '{:+.3f}'})
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+# ── Streamlit エントリポイント: 熱い台予測 ──────────────────────────
+
+
+def render_hot_predictions() -> None:
+    """
+    「MM/DD(曜)の熱い台予測」本体。app.pyのホームページから呼ばれる。
+    6-1 店舗ごとの予測(検索サジェスト→7タブ)・6-2 全店舗横断の予測(同7タブ)の2段構成。
+    """
+    import streamlit as st
+
+    if not ds.ANALYSIS_DB_PATH.exists():
+        st.error(
+            f'分析DBが見つかりません: {ds.ANALYSIS_DB_PATH}\n\n'
+            'fase2/run_store_profile.py を先に実行してください。'
         )
         return
+
+    analysis_db = str(ds.ANALYSIS_DB_PATH)
+
+    with st.spinner('データ読み込み中...'):
+        target_date = _load_target_date(analysis_db)
+        pred_df = _load_latest_predictions(analysis_db)
+        acc_df = _load_prediction_accuracy(analysis_db)
+        snapshot = _load_latest_snapshot(analysis_db)
+        reliabilities = _load_store_reliabilities(analysis_db)
+
+    st.header(f'{_date_label(target_date)}の熱い台予測')
 
     acc_lookup: dict[tuple, pd.Series] = {}
     if not acc_df.empty:
         for _, r in acc_df.iterrows():
             acc_lookup[(r['ホール名'], r['予測種別'])] = r
 
-    pred_df = pred_df.copy()
-    pred_df['根拠'] = pred_df.apply(
-        lambda r: _reason_text(r.get('詳細'), r['対象日']), axis=1
-    )
-    pred_df['的中率'] = pred_df.apply(
-        lambda r: _accuracy_text(acc_lookup.get((r['ホール名'], r['予測種別']))), axis=1
-    )
-    pred_df['台'] = pred_df['機種名'] + ' ' + pred_df['台番号'].astype(str) + '番台'
-    pred_df['ラベル'] = pred_df['ホール名'] + ' / ' + pred_df['台']
+    pred_holes = set(pred_df['ホール名']) if 'ホール名' in pred_df.columns else set()
+    snap_holes = set(snapshot['ホール名']) if 'ホール名' in snapshot.columns else set()
+    holes = sorted(pred_holes | snap_holes)
 
-    ranked_pred = pred_df.dropna(subset=['ブレンド値']).sort_values('ブレンド値', ascending=True)
-    top_pred = pd.concat([ranked_pred.head(_TOP_N_PREDICTIONS), ranked_pred.tail(_TOP_N_PREDICTIONS)]).drop_duplicates(subset=['ラベル'])
+    # ── 6-1 店舗ごとの予測 ──
+    st.subheader('店舗ごとの予測')
+    if not holes:
+        st.info('データがありません。')
+    else:
+        sel_hole = st.selectbox(
+            '店舗を選択', holes, index=None,
+            placeholder='店舗名を選択(入力で絞り込み)',
+            key='hot_pred_hole',
+        )
+        if sel_hole:
+            _render_prediction_tabs(
+                sel_hole, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_PER_STORE
+            )
+        else:
+            st.caption('店舗を選択すると7タブで予測を表示します。')
 
-    if not top_pred.empty:
-        top_pred = top_pred.copy()
-        top_pred['短縮ラベル'] = top_pred.apply(
-            lambda r: '<br>'.join([
-                ui.wrap_label(r['ホール名'], 12),
-                ui.wrap_label(r['機種名'], 12),
-                f"{int(r['台番号'])}番",
-            ]),
-            axis=1,
-        )
-        fig_pred = px.bar(
-            top_pred.sort_values('ブレンド値'), x='ブレンド値', y='短縮ラベル', orientation='h',
-            color='ブレンド値', color_continuous_scale=ui.DIVERGING,
-            range_x=[-1, 1], range_color=[-1, 1],
-            custom_data=['ホール名', '台'],
-        )
-        fig_pred.update_traces(
-            hovertemplate='%{customdata[0]} / %{customdata[1]}<br>ブレンド値: %{x:.3f}<extra></extra>'
-        )
-        ui.apply_mobile_layout(fig_pred, height=max(280, len(top_pred) * 62 + 80))
-        st.plotly_chart(fig_pred, use_container_width=True, config=ui.PLOTLY_CONFIG)
+    st.divider()
 
-    disp_pred = pred_df.sort_values('ブレンド値', ascending=False).copy()
-    disp_pred['ブレンド値'] = disp_pred['ブレンド値'].map(lambda x: f'{x:.3f}' if pd.notna(x) else 'N/A')
-    st.dataframe(
-        disp_pred[['ホール名', '台', 'ブレンド値', '対象日']],
-        use_container_width=True, hide_index=True,
+    # ── 6-2 全店舗横断の予測 ──
+    st.subheader('全店舗横断の予測')
+    _render_prediction_tabs(
+        None, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_CROSS_STORE
     )
-    with st.expander('根拠・的中率の詳細'):
-        st.dataframe(
-            disp_pred[['ホール名', '台', '対象日', '使用データ最終日', '根拠', '的中率']],
-            use_container_width=True, hide_index=True,
-        )

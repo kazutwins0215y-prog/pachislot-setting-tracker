@@ -3,12 +3,12 @@ app.py — ホームページ(店舗検索+ランキング)と店舗トップペ
 
 構成:
   ホームページ(主ページ・起動直後に表示):
-    1. 店舗検索: 店舗名の部分一致で絞り込み、店舗ボタンで店舗トップページへ遷移
-    2. 当日・翌日ランキング(app_top.render)
-    3. 機能B 店舗横断比較(app_b.render_overview: ランキング・サブスコア比較・ヒートマップ)
-  店舗トップページ(店舗ごと・「ホームに戻る」ボタンで復帰):
+    1. 店舗検索: st.selectboxで店舗を選択し店舗トップページへ遷移
+    2. MM/DD(曜)のおすすめ店舗(app_top.render_recommend_stores)
+    3. MM/DD(曜)の熱い台予測(app_top.render_hot_predictions)
+  店舗トップページ(店舗ごと・「ホームに戻る」ボタン+店舗切替selectboxで復帰/移動):
     1. 機能A: 店内比較ダッシュボード(app_a.render)
-    2. 機能B: 個別店舗詳細(app_b.render_store_detail)
+    2. 店舗特徴(app_b.render_store_detail、機能Aの「店舗分析」ビュー選択時のみ表示)
 
 ページ切替は st.session_state['selected_hole'] で管理する(サイドバーは使わない)。
 
@@ -23,7 +23,7 @@ import app_top
 import data_source as ds
 import ui_theme
 
-st.set_page_config(page_title='パチスロ設定判別ツール', layout='centered')
+st.set_page_config(page_title='判別ツール', layout='centered')
 ui_theme.inject_css()
 
 _HOLE_KEY = 'selected_hole'
@@ -46,7 +46,7 @@ def _go_home() -> None:
 
 
 def _render_home(profiles) -> None:
-    st.title('パチスロ設定判別ツール')
+    st.title('判別ツール')
 
     # ── 店舗検索 ──
     with st.container(border=True):
@@ -58,40 +58,50 @@ def _render_home(profiles) -> None:
                 'fase2/run_store_profile.py を先に実行してください。'
             )
         else:
-            query = st.text_input(
-                '店舗名で検索', value='',
-                placeholder='店舗名の一部を入力(空欄で全店舗を表示)',
+            sel = st.selectbox(
+                '店舗名で検索', holes, index=None,
+                placeholder='店舗名を選択(入力で絞り込み)',
                 key='hole_search',
             )
-            matched = [h for h in holes if query.strip() in h] if query.strip() else holes
-            if not matched:
-                st.info('該当する店舗がありません。')
-            for hole in matched:
-                if st.button(hole, key=f'goto_{hole}', use_container_width=True):
-                    st.session_state[_HOLE_KEY] = hole
-                    st.rerun()
+            if sel:
+                st.session_state[_HOLE_KEY] = sel
+                st.rerun()
 
-    # ── 当日・翌日ランキング ──
+    # ── MM/DD(曜)のおすすめ店舗 ──
     with st.container(border=True):
-        app_top.render()
+        app_top.render_recommend_stores()
 
-    # ── 機能B: 店舗横断比較 ──
+    # ── MM/DD(曜)の熱い台予測 ──
     with st.container(border=True):
-        st.header('店舗横断比較')
-        app_b.render_overview(profiles)
+        app_top.render_hot_predictions()
 
 
 def _render_store_page(profiles, hole: str) -> None:
-    st.button('← ホームに戻る', on_click=_go_home, key='back_home', type='primary')
+    col_back, col_search = st.columns([1, 2])
+    with col_back:
+        st.button('← ホームに戻る', on_click=_go_home, key='back_home', type='primary')
+    with col_search:
+        holes = _list_all_holes(profiles)
+        sel = st.selectbox(
+            '店舗を切替', holes, index=None,
+            placeholder='店舗名を選択(入力で絞り込み)',
+            key='store_page_search', label_visibility='collapsed',
+        )
+        if sel and sel != hole:
+            st.session_state[_HOLE_KEY] = sel
+            st.rerun()
+
     st.title(hole)
 
     with st.container(border=True):
         st.header('店内比較(機能A)')
         app_a.render(hole)
 
-    with st.container(border=True):
-        st.header('振り返りダッシュボード(機能B)')
-        app_b.render_store_detail(profiles, hole)
+    # 店舗特徴(機能B)は機能Aの「店舗分析」ビュー選択時のみ表示
+    if st.session_state.get('a_view', '店舗分析') == '店舗分析':
+        with st.container(border=True):
+            st.header('店舗特徴')
+            app_b.render_store_detail(profiles, hole)
 
 
 _profiles = app_b.load_all_profiles()

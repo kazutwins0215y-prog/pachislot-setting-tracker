@@ -356,16 +356,40 @@ _CREATE_STAGE3_SCORES_SQL = '''
 '''
 
 
+# [2026-07 UIリニューアル] トップページ「熱い台予測」7タブが、再計算なしで最新スナップショットを
+# SELECTするだけで済むよう、幅型/深さ型サブスコアも台×日粒度でstage3_scoresへ保存する。
+_STAGE3_PATTERN_COLS = ['S_全台系', 'S_鉄板台', 'S_ローテ', 'S_新台増台', 'S_移動台', 'S_据え置き']
+
+
+def _ensure_stage3_scores_schema(con: sqlite3.Connection) -> None:
+    """
+    [2026-07 UIリニューアル] サブスコア6列を追加するマイグレーション。
+    既存DBはCREATE TABLE IF NOT EXISTSでは列が増えないため、teppan_conditions等と同様
+    PRAGMA table_infoで存在確認してからALTER TABLEする。
+    """
+    con.execute(_CREATE_STAGE3_SCORES_SQL)
+    cols = [row[1] for row in con.execute('PRAGMA table_info(stage3_scores)').fetchall()]
+    for col in _STAGE3_PATTERN_COLS:
+        if col not in cols:
+            con.execute(f'ALTER TABLE stage3_scores ADD COLUMN "{col}" REAL')
+
+
 def write_stage3_scores(db_path: str, hole_name: str, df_scored: pd.DataFrame) -> None:
     """
     Stage3出力(log_odds / high_prob / is_invalid)を台×日単位で分析DBへ保存する。
     店舗単位で全削除→再挿入(再計算のたびに全量を最新化する)。
     機能A(app_a: 初期表示の高速化)・機能B(app_b: 熱い台)がこのテーブルを読む。
+
+    df_scoredに_STAGE3_PATTERN_COLS(幅型/深さ型サブスコア)が含まれていれば併せて保存する
+    (トップページ「熱い台予測」7タブが最新日のスナップショットを再計算なしで参照するため)。
+    含まれない列はNULLのまま保存する(必須列チェックの対象外)。
     """
     required = ['日付', '機種名', '台番号', 'log_odds', 'high_prob', 'is_invalid']
     missing = [c for c in required if c not in df_scored.columns]
     if missing:
         raise ValueError(f'stage3_scores保存に必要な列がありません: {missing}')
+
+    pattern_cols = [c for c in _STAGE3_PATTERN_COLS if c in df_scored.columns]
 
     sub = df_scored.dropna(subset=['日付', '機種名', '台番号'])
     rows = [
@@ -374,20 +398,24 @@ def write_stage3_scores(db_path: str, hole_name: str, df_scored: pd.DataFrame) -
             None if pd.isna(r.log_odds) else float(r.log_odds),
             None if pd.isna(r.high_prob) else float(r.high_prob),
             int(bool(r.is_invalid)),
+            *[
+                None if pd.isna(getattr(r, col)) else float(getattr(r, col))
+                for col in pattern_cols
+            ],
         )
         for r in sub.itertuples()
     ]
 
+    all_cols = ['日付', 'ホール名', '機種名', '台番号', 'log_odds', 'high_prob', 'is_invalid', *pattern_cols]
+    col_list = ', '.join(f'"{c}"' for c in all_cols)
+    placeholders = ', '.join('?' * len(all_cols))
+
     con = sqlite3.connect(db_path)
     try:
-        con.execute(_CREATE_STAGE3_SCORES_SQL)
+        _ensure_stage3_scores_schema(con)
         con.execute('DELETE FROM stage3_scores WHERE ホール名 = ?', (hole_name,))
         con.executemany(
-            '''
-            INSERT OR REPLACE INTO stage3_scores
-                (日付, ホール名, 機種名, 台番号, log_odds, high_prob, is_invalid)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''',
+            f'INSERT OR REPLACE INTO stage3_scores ({col_list}) VALUES ({placeholders})',
             rows,
         )
         con.commit()

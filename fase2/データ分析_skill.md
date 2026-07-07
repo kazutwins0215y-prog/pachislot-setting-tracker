@@ -535,28 +535,28 @@ S_稼働低さ = 基準値に対する「低さ」を正規化(逆数方向)
 
 | 出力 | 用途 | 詳細度 |
 |---|---|---|
-| **トップページ**(2026-07追加) | 当日・翌日の狙い目を最初の1画面で把握する | 店舗ランキング(符号付き合成スコア、1軸で強い店・弱い店とも表示)・当日の熱い台・翌日予測ランキング(S_鉄板台) |
+| **トップページ**(2026-07追加・同月UIリニューアルで再編) | 当日・翌日の狙い目を最初の1画面で把握する | MM/DD(曜)のおすすめ店舗(符号付き合成スコアのプラス上位3+マイナス下位3、表形式・色分け)・MM/DD(曜)の熱い台予測(店舗ごと/全店舗横断、個別台・機種・ローテ・新台・増台・移動台・据えの7タブ) |
 | **機能A: 店内比較・可視化ツール** | 来店前/来店中に1店舗内の台を手動で見比べる | 生データ寄りの簡易指標。手動フィルタ(期間/機種/台番号/推定設定レンジ/列/島など) |
-| **機能B-詳細: 振り返りダッシュボード** | 蓄積データからのパターン検出・店舗プロファイルをじっくり見る | サブスコア内訳(符号付き・強さ/弱さ表示)・信頼度・γ_store・検知期間履歴・当月カレンダーヒートマップを全て表示 |
+| **機能B-詳細: 店舗特徴(個別店舗詳細)**(2026-07UIリニューアルで店舗横断比較render_overviewは削除) | 蓄積データからのパターン検出・店舗プロファイルをじっくり見る | サブスコア内訳(符号付き・縦棒グラフ)・信頼度・γ_store・検知期間履歴(パターン別タブ)・当月カレンダーヒートマップを全て表示 |
 | **機能B-簡潔: 狙い目メモ** | 次回「家を出る前」に見る簡潔な要約 | 結論+最低限の根拠のみ |
 
-**統合エントリポイント(`app.py`、2026-07追加・同月UI再構成)**: `streamlit run app.py`で起動し、2ページ構成を`st.session_state['selected_hole']`で切り替える(サイドバーは使わない。旧サイドバー選択メニュー・サイドバーフィルタ・表示設定は廃止)。
+**統合エントリポイント(`app.py`、2026-07追加・同月UI再構成、同月UIリニューアルで再々編)**: `streamlit run app.py`で起動し、2ページ構成を`st.session_state['selected_hole']`で切り替える(サイドバーは使わない。旧サイドバー選択メニュー・サイドバーフィルタ・表示設定は廃止)。
 
-- **ホームページ(主ページ・起動直後に表示)**: ①店舗検索(店舗名の部分一致テキスト入力＋店舗ボタン一覧。クリックで店舗トップページへ遷移) ②当日・翌日ランキング(`app_top.render()`) ③機能B店舗横断比較(`app_b.render_overview()`: 店舗ランキング・サブスコア比較・全サブスコアヒートマップ)
-- **店舗トップページ(店舗ごと)**: 「← ホームに戻る」ボタン＋店舗名タイトルの下に、①機能A店内比較(`app_a.render(hole_name)`: 店舗分析/台番号/機種名の3ビュー) ②機能B個別店舗詳細(`app_b.render_store_detail(profiles, 店名)`: サブスコア内訳・γ_store・検知期間履歴・当月カレンダーヒートマップ)
+- **ホームページ(主ページ・起動直後に表示)**: ①店舗検索(`st.selectbox`。入力で絞り込み、選択で店舗トップページへ遷移。旧テキスト入力+ボタン列挙は廃止) ②MM/DD(曜)のおすすめ店舗(`app_top.render_recommend_stores()`) ③MM/DD(曜)の熱い台予測(`app_top.render_hot_predictions()`。店舗ごと/全店舗横断の7タブ構成。旧当日・翌日ランキング`render()`・機能B店舗横断比較`render_overview()`は廃止)
+- **店舗トップページ(店舗ごと)**: 「← ホームに戻る」ボタン+店舗切替`st.selectbox`＋店舗名タイトル(折返し防止CSS適用)の下に、①機能A店内比較(`app_a.render(hole_name)`: 店舗分析/台番号/機種名の3ビュー) ②店舗特徴(`app_b.render_store_detail(profiles, 店名)`。**機能Aで「店舗分析」ビュー選択時のみ表示**: サブスコア内訳(縦棒グラフのみ)・γ_store・検知期間履歴(パターン別タブ)・当月カレンダーヒートマップ)
 
-`st.set_page_config`は`app.py`側で1回のみ実行し、`app_top.py`/`app_a.py`/`app_b.py`はモジュールトップレベルにst呼び出しを持たない関数(`render()`/`render(hole_name)`/`render_overview()`+`render_store_detail()`)として画面本体を公開する(fase3の`streamlit_app.py`が`app`モジュールだけをreloadする前提を維持)。**単体起動(`streamlit run app_a.py`等)は廃止**(Streamlitエントリポイントは`app.py`のみ。機能B-簡潔のテキストメモ`python app_b.py`は維持)。
+`st.set_page_config`は`app.py`側で1回のみ実行し、`app_top.py`/`app_a.py`/`app_b.py`はモジュールトップレベルにst呼び出しを持たない関数(`render_recommend_stores()`+`render_hot_predictions()`/`render(hole_name)`/`render_store_detail()`)として画面本体を公開する(fase3の`streamlit_app.py`が`app`モジュールだけをreloadする前提を維持)。**単体起動(`streamlit run app_a.py`等)は廃止**(Streamlitエントリポイントは`app.py`のみ。機能B-簡潔のテキストメモ`python app_b.py`は維持)。
 
-**モバイルファーストUI(`ui_theme.py`、2026-07追加・同月に黒基調ダークテーマへ改修)**: iPhone Safari前提のカードUIの表示層共通モジュール。当初は薄グレー地+白カードのHoYoLAB風だったが、同月中にZZZ(ゼンレスゾーンゼロ)風の黒基調(ページ`#0D0E11`・カード`#1A1C21`)+ライムイエローアクセント`#D6FE3E`へ改修済み。パレット定数`ACCENT/PAGE_BG/CARD_BG/CARD_BORDER/TEXT/TEXT_SUB/GRID/ZERO_LINE/CATEGORICAL(折れ線用8色)/DIVERGING(発散スケール)/SEQ_BLUE(逐次・信頼度用)/SEQ_WARM(カレンダー暖色)`を集約し、app_a/app_top/app_bはこれらを参照する(色の直書き禁止)。**DIVERGINGは2026-07に再改修**: 当初は中間点をダークグレー(`#383835`)にしてRdBuの白発光を回避していたが、ユーザー指定により「マイナス=青・プラス=赤・中間=白」の慣例的なRdBu風配色(`[[0,'#2878E0'],[0.5,'#FFFFFF'],[1,'#F5334F']]`)に変更済み。この結果、スコア0付近のセルが白っぽくなる(実データはほとんどのセルが0付近に集中するため多用される)ことは許容した上での選択。**白中間点により白文字(`ui.TEXT`)が読めなくなる箇所は個別に濃色文字へ切替が必要**(`app_b.py`のパターン別内訳カレンダー`textfont=dict(color=ui.CARD_BG)`が実例。`ui.CARD_BG`は`#383835`→`#F5334F`/`#2878E0`の全域で3:1以上のコントラストを確保できるため採用)。`inject_css()`(`app.py`が起動時に1回呼ぶ。`layout='centered'`・`max-width:680px`中央寄せ・角丸カード・ピルボタン(primaryはライム地+黒文字)・input系16px以上のCSSを注入)と`apply_mobile_layout(fig, height=None, show_colorbar=False)`(全チャート共通のPlotlyレイアウト調整。文字色`TEXT`指定・`colorway=CATEGORICAL`・軸に`gridcolor/zerolinecolor/automargin=True`(ラベル切れ防止)・`hoverlabel`のダークスタイル統一・凡例横型下配置・`dragmode=False`)、`wrap_label(s, width=14)`(長いラベルを`…`省略でなくwidth文字ごとに`<br>`改行して全文表示。旧`short_label`は廃止・置換済み)を提供する。全チャート(app_top×2・app_a×5・app_b×4の計11箇所)は`ui.apply_mobile_layout(fig, height=…)` → `st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)`の順で呼び出す規約に統一。機能(データ・計算ロジック)には一切関与しない表示層のみの変更。テーマ色(`primaryColor`等)は`fase2/.streamlit/config.toml`(ローカル実行用)とリポジトリルート`.streamlit/config.toml`(Streamlit Community Cloud用。cwdがリポジトリルートなためこちらが効く)の2ファイルに同一内容を維持する(相互コピー同期。詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照)。
+**モバイルファーストUI(`ui_theme.py`、2026-07追加・同月に黒基調ダークテーマへ改修)**: iPhone Safari前提のカードUIの表示層共通モジュール。当初は薄グレー地+白カードのHoYoLAB風だったが、同月中にZZZ(ゼンレスゾーンゼロ)風の黒基調(ページ`#0D0E11`・カード`#1A1C21`)+ライムイエローアクセント`#D6FE3E`へ改修済み。パレット定数`ACCENT/PAGE_BG/CARD_BG/CARD_BORDER/TEXT/TEXT_SUB/GRID/ZERO_LINE/CATEGORICAL(折れ線用8色)/DIVERGING(発散スケール)/SEQ_BLUE(逐次・信頼度用)/SEQ_WARM(カレンダー暖色)`を集約し、app_a/app_top/app_bはこれらを参照する(色の直書き禁止)。**DIVERGINGは2026-07に2回改修**: 当初は中間点をダークグレー(`#383835`)にしてRdBuの白発光を回避していたが、ユーザー指定により「マイナス=青・プラス=赤・中間=白」の慣例的なRdBu風配色に変更。**同月のUIリニューアルで両端を再度入れ替え、「プラス=青(`#2878E0`)・マイナス=赤(`#F5334F`)・中間=白」に統一**(`[[0,NEG_COLOR],[0.5,'#FFFFFF'],[1,POS_COLOR]]`、`ui_theme.POS_COLOR`/`NEG_COLOR`定数を新設しサイト全体の色統一を明示)。この結果、スコア0付近のセルが白っぽくなる(実データはほとんどのセルが0付近に集中するため多用される)ことは許容した上での選択。表形式の数値着色にも同じ配色を使う`ui_theme.style_signed(df, cols)`(Styler、font-color着色)を新設し、トップページのおすすめ店舗テーブル・熱い台予測7タブで使用する。**白中間点により白文字(`ui.TEXT`)が読めなくなる箇所は個別に濃色文字へ切替が必要**(`app_b.py`のパターン別内訳カレンダー`textfont=dict(color=ui.CARD_BG)`が実例。`ui.CARD_BG`は`#383835`→`#F5334F`/`#2878E0`の全域で3:1以上のコントラストを確保できるため採用)。`inject_css()`(`app.py`が起動時に1回呼ぶ。`layout='centered'`・`max-width:680px`中央寄せ・角丸カード・ピルボタン(primaryはライム地+黒文字)・input系16px以上のCSSを注入)と`apply_mobile_layout(fig, height=None, show_colorbar=False)`(全チャート共通のPlotlyレイアウト調整。文字色`TEXT`指定・`colorway=CATEGORICAL`・軸に`gridcolor/zerolinecolor/automargin=True`(ラベル切れ防止)・`hoverlabel`のダークスタイル統一・凡例横型下配置・`dragmode=False`)、`wrap_label(s, width=14)`(長いラベルを`…`省略でなくwidth文字ごとに`<br>`改行して全文表示。旧`short_label`は廃止・置換済み)を提供する。全チャート(app_top×2・app_a×5・app_b×4の計11箇所)は`ui.apply_mobile_layout(fig, height=…)` → `st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)`の順で呼び出す規約に統一。機能(データ・計算ロジック)には一切関与しない表示層のみの変更。テーマ色(`primaryColor`等)は`fase2/.streamlit/config.toml`(ローカル実行用)とリポジトリルート`.streamlit/config.toml`(Streamlit Community Cloud用。cwdがリポジトリルートなためこちらが効く)の2ファイルに同一内容を維持する(相互コピー同期。詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照)。
 
 **機能B再設計(2026-07議論・Phase1〜5実装済み、Phase6は将来項目)**:
 
 - **Phase1: `pattern_history`テーブル**(下記データモデル参照)— `store_profile`が最新1行のみ保持するのに対し、`run_store_profile.py`実行のたびに追記のみで積み上げる検知期間履歴用テーブル
 - **Phase2: 符号付きスコア拡張** — 幅型(上記patterns.py参照)・深さ型(S_鉄板台、上記参照)の符号付き化と、`score.synthesize()`/`app_b.py`の信頼度重み減衰(有効重み=weights×reliabilities)。`狙い目度`のレンジは`[0,1]`から`[-1,1]`に変更。`app_b.py`の表示レンジ(`range_x=[-1,1]`)・色スケール(発散配色`ui.DIVERGING`、中央0。2026-07ダーク化改修前は`RdBu`。同月中に再改修し中間点を白へ変更、詳細は上記「モバイルファーストUI」参照)も追随済み
 - **Phase3: Stage7-0〜7-2**(上記patterns.py「S_鉄板台の翌日予測」参照) — `predict_next_day`・`prediction_log`・`evaluate_predictions.py`
-- **Phase4: トップページ**(`app_top.py`) — 店舗ランキング・当日の熱い台は`app_b.py`の既存実装を再利用(二重実装回避のため`load_weights`等の関数を公開関数に改名済み)。翌日予測ランキングは`prediction_log`の最新行をそのまま表示(その場での再計算はしない。リークの心配がなくノイジーOR統合の二重実装も避けられる)。的中率は`prediction_accuracy`を読むだけで、的中率・信頼度が低くても非表示にしない方針
-- **Phase5: 店舗プロファイル拡張**(`app_b.py`、現`render_store_detail()`) — 検知期間履歴(`pattern_history`から「スコア>0」の連続区間を軽量な後処理で検出。統計検定の再実行はしない近似表示)・当月カレンダーヒートマップ(統合スコア日次平均`ui.SEQ_WARM`(旧`YlOrRd`)+パターン別内訳`ui.DIVERGING`(旧`RdBu`。中間点が白のため日数字は`ui.TEXT`でなく`ui.CARD_BG`の濃色文字を使用)。2026-07のモバイルUI改修で「月」「表示項目(統合スコア日次平均+パターン別)」の2 selectboxに切替、選択1枚のみ描画。旧`st.tabs`(パターン数分・最大7個)は廃止)。カレンダーヒートマップは機能Aには追加せず機能Bのみに実装(機能Aは生データ寄りの手動比較ツールという役割を維持するため)
-- **Phase6(将来項目)**: Stage7-4(ウォークフォワードα学習への置き換え)・Stage7-5(S_ローテ・S_据え置きの非該当日判定・翌日予測拡張)。詳細は[`今後の実装予定.md`](今後の実装予定.md)参照
+- **Phase4: トップページ**(`app_top.py`、2026-07UIリニューアルで再実装) — `render_recommend_stores()`(MM/DD(曜)のおすすめ店舗。`ab.synthesize_scores`の合成スコアのプラス上位3+マイナス下位3を表形式・色分けで表示)と`render_hot_predictions()`(MM/DD(曜)の熱い台予測。店舗ごと/全店舗横断の2段構成×個別台・機種・ローテ・新台・増台・移動台・据えの7タブ)に分割。個別台/機種タブは`prediction_log`(S_鉄板台)の最新行+`prediction_accuracy`の的中率をそのまま表示(その場での再計算はしない)。ローテ/新台/増台/移動台/据えタブは`stage3_scores`の最新日スナップショット(`_load_latest_snapshot`、Stage B拡張の6列)+`store_profile`の店舗単位信頼度(`_load_store_reliabilities`)を暫定閾値でフィルタして表示(的中率は集計が無いため常に「検証中」固定。据えタブのみ「予測スコア」として生スコアを表示)。**新台/増台タブは同じ`S_新台増台`データを表示**(`detect_events`が機種の店舗初出と既存機種の台数追加を区別していないため。区別ロジックは今後の実装予定.md参照)
+- **Phase5: 店舗プロファイル拡張**(`app_b.py`、`render_store_detail()`。2026-07UIリニューアルで表示形式を改修) — サブスコア詳細は縦棒グラフのみ(横棒+表は廃止)。検知期間履歴(`pattern_history`から「スコア>0」の連続区間を軽量な後処理で検出。統計検定の再実行はしない近似表示)はパターンごとに`st.tabs`で分割表示。当月カレンダーヒートマップ(統合スコア日次平均`ui.SEQ_WARM`(旧`YlOrRd`)+パターン別内訳`ui.DIVERGING`(旧`RdBu`。中間点が白のため日数字は`ui.TEXT`でなく`ui.CARD_BG`の濃色文字を使用)。「月」「表示項目(統合スコア日次平均+パターン別)」の2 selectboxで選択1枚のみ描画、**第1週が上になるようy軸を反転**(`update_yaxes(autorange='reversed')`))。カレンダーヒートマップは機能Aには追加せず機能Bのみに実装(機能Aは生データ寄りの手動比較ツールという役割を維持するため)。店舗横断比較`render_overview()`(店舗ランキング・サブスコア比較・全サブスコアヒートマップ)は2026-07UIリニューアルで削除(店舗横断のおすすめ表示はPhase4の`render_recommend_stores()`に統合)
+- **Phase6(将来項目)**: Stage7-4(ウォークフォワードα学習への置き換え)・Stage7-5(S_ローテ・S_据え置きの非該当日判定・翌日予測拡張)・新台/増台タブの区別ロジック。詳細は[`今後の実装予定.md`](今後の実装予定.md)参照
 
 **store_profile/stage3_scoresの前提(`run_store_profile.py`、2026-07追加・同月改修)**: 機能B(詳細/簡潔とも)は分析DB(`ホールデータ/analysis.db`)の`store_profile`テーブルを読むだけで、自らpreprocess→patterns→scoreパイプラインを実行しない。新規に取り込んだ店舗はこのテーブルが未作成のため機能Bに表示されない。`python run_store_profile.py`(全店舗一括)または`--hole <店舗名>`(特定店舗)でパイプラインを実行し、`stage3_scores`(Stage3出力の台×日スコア。`score.write_stage3_scores`が店舗単位で全削除→再挿入)と`store_profile`を作成・更新する。2026-07に[`fase4/`](../fase4/)(日次自動実行)を実装し、`fase4/run_daily.py`が全店舗一括を毎日自動実行するようになった。新規店舗取込時の即時反映等では引き続き手動実行も可能。
 
@@ -603,6 +603,18 @@ S_稼働低さ = 基準値に対する「低さ」を正規化(逆数方向)
 | log_odds | REAL | Stage3統合LogOdds |
 | high_prob | REAL | sigmoid(log_odds) → 高設定確率 |
 | is_invalid | INTEGER | 1=判定不能(回転数不足) |
+| S_全台系 | REAL | 幅型サブスコア(2026-07 UIリニューアルで追加。台×日粒度でNULL許容) |
+| S_鉄板台 | REAL | 深さ型サブスコア(同上) |
+| S_ローテ | REAL | 深さ型サブスコア(同上) |
+| S_新台増台 | REAL | 幅型サブスコア(同上) |
+| S_移動台 | REAL | 幅型サブスコア(同上) |
+| S_据え置き | REAL | 深さ型サブスコア(同上) |
+
+上記6列は`run_store_profile.py`の`scored`(`compute_uplimit`実行後、`write_stage3_scores`呼び出し時点)が
+既に保持している値をそのまま保存したもので、算出ロジックの変更ではない。トップページの
+「MM/DD(曜)の熱い台予測」7タブが、台×日単位の再計算なしで最新日のスナップショットを
+SELECTするだけで済むようにするための追加(`score._ensure_stage3_scores_schema`が
+`PRAGMA table_info`方式でALTER TABLEするマイグレーション。既存行はNULLのまま)。
 
 ### `store_profile` テーブル（analysis.db、`score.update_store_profile`が更新）
 

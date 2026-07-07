@@ -5,7 +5,7 @@ description: Use when the user asks to start, launch, run, or open 機能A / 機
 
 # 機能A/B起動 skill
 
-fase2の可視化ツール（機能A: 店内比較、機能B: 振り返りダッシュボード）をローカルでStreamlit起動する手順。
+fase2の可視化ツール（機能A: 店内比較、店舗特徴(機能B)）をローカルでStreamlit起動する手順。
 
 前提: [`CLAUDE.md`](../../../CLAUDE.md)のfase2構成、[`fase2/データ分析_skill.md`](../../../fase2/データ分析_skill.md)を参照。
 
@@ -15,8 +15,9 @@ fase2の可視化ツール（機能A: 店内比較、機能B: 振り返りダッ
 streamlit run fase2/app.py
 ```
 
-起動直後はホームページ（店舗検索＋当日・翌日ランキング＋機能B店舗横断比較）が表示され、
-店舗検索の店舗ボタンから店舗トップページ（機能A店内比較＋機能B個別店舗詳細）へ遷移できる
+起動直後はホームページ（店舗検索＋MM/DD(曜)のおすすめ店舗＋MM/DD(曜)の熱い台予測(7タブ)）が表示され、
+店舗検索のselectboxから店舗トップページ（機能A店内比較＋店舗特徴。店舗特徴は機能Aで「店舗分析」
+ビュー選択時のみ表示）へ遷移できる
 （[`fase2/app.py`](../../../fase2/app.py)）。ブラウザが自動で開かない場合はターミナルに表示される
 `http://localhost:8501` を開く。停止は `Ctrl+C`。
 

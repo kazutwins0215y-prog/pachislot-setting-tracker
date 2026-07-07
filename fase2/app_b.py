@@ -1,14 +1,12 @@
 """
 app_b.py — 振り返り分析ダッシュボード + 狙い目メモ
 
-【機能B-詳細: 振り返り分析ダッシュボード】
+【機能B-詳細: 店舗特徴(個別店舗詳細)】
   用途: 蓄積データからのパターン検出結果・店舗プロファイルをじっくり見る
-  内容: 各サブスコアの値と内訳 / 信頼度 / γ_store / 複数店舗の横並び比較
-  画面は2分割で公開:
-    render_overview(profiles)          … 店舗横断(ランキング・サブスコア比較・ヒートマップ)
-                                          → app.pyのホームページに表示
-    render_store_detail(profiles, 店名) … 個別店舗詳細(内訳・検知期間履歴・カレンダー)
-                                          → app.pyの店舗トップページに表示
+  内容: 各サブスコアの値と内訳 / 信頼度 / γ_store / 検知期間履歴 / カレンダーヒートマップ
+    render_store_detail(profiles, 店名) … app.pyの店舗トップページ「店舗特徴」に表示
+    (2026-07 UIリニューアルで店舗横断比較render_overviewは削除。
+     店舗横断のおすすめ表示はapp_top.render_recommend_stores()に統合済み)
 
 【機能B-簡潔: 狙い目メモ】
   用途: 次回「家を出る前」に確認する要約
@@ -165,34 +163,6 @@ def synthesize_scores(profiles: pd.DataFrame, weights: dict[str, float]) -> pd.D
         .sort_values('合成スコア', ascending=False, na_position='last')
         .reset_index(drop=True)
     )
-
-
-def _pivot_profiles(profiles: pd.DataFrame) -> pd.DataFrame:
-    """
-    store_profile を横持ちに変換:
-      ホール名 × (パターン別スコア・信頼度・γ_store・更新日時) の表形式
-    """
-    if profiles.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for hole_name, grp in profiles.groupby('ホール名'):
-        row: dict = {'ホール名': hole_name}
-        for _, r in grp.iterrows():
-            label = _PATTERN_LABELS.get(str(r['パターン']), str(r['パターン']))
-            row[f'{label}_スコア'] = r['スコア']
-            row[f'{label}_信頼度'] = r['信頼度']
-
-        if 'gamma_store' in grp.columns:
-            gv = grp['gamma_store'].dropna()
-            row['γ_store'] = float(gv.iloc[0]) if not gv.empty else None
-
-        if '更新日時' in grp.columns:
-            row['更新日時'] = grp['更新日時'].max()
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)
 
 
 def load_hot_machines(db_path: str, hole_name: str, n: int = _HOT_MACHINES_N) -> list[dict]:
@@ -365,112 +335,6 @@ def load_store_profiles(db_path: str) -> pd.DataFrame:
     return _load_profile_from_db(db_path)
 
 
-def render_overview(profiles: pd.DataFrame) -> None:
-    """
-    機能B-横断: 店舗ランキング・サブスコア比較・全サブスコアヒートマップを表示する。
-    app.pyのホームページから呼ばれる。
-    """
-    import streamlit as st
-    import plotly.express as px
-
-    import ui_theme as ui
-
-    if profiles.empty:
-        st.warning(
-            'store_profile データがありません。'
-            'fase2/run_store_profile.py を先に実行してください。'
-        )
-        return
-
-    weights = load_weights()
-    synth_df = synthesize_scores(profiles, weights)
-    pivot_df = _pivot_profiles(profiles)
-
-    st.caption('サブスコア: + = 狙い目 / − = 弱い')
-
-    # ── 1. 店舗ランキング ──
-    st.subheader('店舗ランキング（合成スコア）')
-
-    if not synth_df.empty:
-        disp = synth_df.copy()
-        disp['合成スコア'] = disp['合成スコア'].map(
-            lambda x: f'{x:.3f}' if pd.notna(x) else 'N/A'
-        )
-        disp['平均信頼度'] = disp['平均信頼度'].map(lambda x: f'{x:.0%}')
-        st.dataframe(
-            disp[['ホール名', '合成スコア', '平均信頼度', '最高サブスコア']],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-
-    # ── 2. サブスコア棒グラフ比較 ──
-    st.subheader('サブスコア比較（店舗横断）')
-
-    score_cols = [
-        col for col in pivot_df.columns if col.endswith('_スコア')
-    ] if not pivot_df.empty else []
-
-    if score_cols and not pivot_df.empty:
-        pattern_names = [c.replace('_スコア', '') for c in score_cols]
-        sel_pattern = st.selectbox('サブスコア選択', pattern_names, key='detail_pattern')
-        sel_col = f'{sel_pattern}_スコア'
-        rel_col = f'{sel_pattern}_信頼度'
-
-        bar_df = pivot_df[['ホール名', sel_col]].dropna(subset=[sel_col]).copy()
-        bar_df = bar_df.rename(columns={sel_col: 'スコア'})
-
-        if rel_col in pivot_df.columns:
-            bar_df = bar_df.merge(
-                pivot_df[['ホール名', rel_col]].rename(columns={rel_col: '信頼度'}),
-                on='ホール名', how='left',
-            )
-
-        bar_df = bar_df.sort_values('スコア', ascending=True)
-
-        if not bar_df.empty:
-            color_col = '信頼度' if '信頼度' in bar_df.columns else None
-            fig = px.bar(
-                bar_df, x='スコア', y='ホール名', orientation='h',
-                color=color_col,
-                color_continuous_scale=ui.SEQ_BLUE,
-                range_x=[-1, 1],
-            )
-            ui.apply_mobile_layout(fig, height=max(280, len(bar_df) * 42 + 80))
-            st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
-        else:
-            st.info('表示できるデータがありません。')
-    else:
-        st.info('サブスコアデータがありません。')
-
-    st.divider()
-
-    # ── 3. 全サブスコアヒートマップ ──
-    st.subheader('全サブスコアヒートマップ')
-
-    if score_cols and not pivot_df.empty:
-        heat_data = pivot_df.set_index('ホール名')[score_cols].copy()
-        heat_data.columns = [c.replace('_スコア', '') for c in heat_data.columns]
-
-        if not heat_data.dropna(how='all').empty:
-            disp_data = heat_data.rename(columns=lambda c: c[2:] if c.startswith('S_') else c)
-            fig_heat = px.imshow(
-                disp_data,
-                color_continuous_scale=ui.DIVERGING,
-                labels=dict(x='サブスコア', y='ホール名', color='スコア'),
-                zmin=-1, zmax=1,
-                aspect='auto',
-            )
-            ui.apply_mobile_layout(fig_heat, height=max(280, len(heat_data) * 38 + 100))
-            fig_heat.update_xaxes(tickangle=-35, tickfont=dict(size=10))
-            st.plotly_chart(fig_heat, use_container_width=True, config=ui.PLOTLY_CONFIG)
-        else:
-            st.info('ヒートマップ用データがありません。')
-    else:
-        st.info('サブスコアデータがありません。')
-
-
 def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     """
     機能B-個別店舗詳細: サブスコア内訳・γ_store・検知期間履歴・カレンダーヒートマップ。
@@ -497,19 +361,19 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     valid = hole_grp.dropna(subset=['スコア']).copy()
     valid['表示名'] = valid['パターン'].map(_PATTERN_LABELS)
     if not valid.empty:
+        valid['表示名_折返し'] = valid['表示名'].map(lambda s: ui.wrap_label(s, 6))
         fig_bar = px.bar(
             valid,
-            x='スコア', y='表示名', orientation='h',
+            x='表示名_折返し', y='スコア',
             color='信頼度', color_continuous_scale=ui.SEQ_BLUE,
-            range_x=[-1, 1],
+            range_y=[-1, 1],
+            labels={'表示名_折返し': ''},
         )
-        ui.apply_mobile_layout(fig_bar, height=max(280, len(valid) * 45 + 80))
+        ui.apply_mobile_layout(fig_bar, height=320)
+        fig_bar.update_xaxes(tickangle=0)
         st.plotly_chart(fig_bar, use_container_width=True, config=ui.PLOTLY_CONFIG)
-
-    tbl = hole_grp[['表示名', 'スコア', '信頼度']].copy()
-    tbl['スコア'] = tbl['スコア'].map(lambda x: f'{x:.3f}' if pd.notna(x) else '─')
-    tbl['信頼度'] = tbl['信頼度'].map(lambda x: f'{x:.0%}' if pd.notna(x) else '─')
-    st.dataframe(tbl, use_container_width=True, hide_index=True)
+    else:
+        st.info('サブスコアデータがありません。')
 
     # γ_store
     if 'gamma_store' in hole_grp.columns:
@@ -554,14 +418,22 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
             '(fase4の日次自動実行が実装されるまでは手動実行の頻度に応じた粒度になります)。'
         )
     else:
-        disp_periods = periods.sort_values('終了', ascending=False).copy()
-        disp_periods['開始'] = pd.to_datetime(disp_periods['開始']).dt.strftime('%m/%d')
-        disp_periods['終了'] = pd.to_datetime(disp_periods['終了']).dt.strftime('%m/%d')
-        disp_periods['平均スコア'] = disp_periods['平均スコア'].map(lambda x: f'{x:.3f}')
-        st.dataframe(
-            disp_periods[['パターン', '開始', '終了', '平均スコア']],
-            use_container_width=True, hide_index=True,
-        )
+        pattern_tabs = [p for p in _PATTERN_LABELS.values() if p in periods['パターン'].unique()]
+        tabs = st.tabs(pattern_tabs)
+        for tab, pattern_name in zip(tabs, pattern_tabs):
+            with tab:
+                disp_periods = (
+                    periods[periods['パターン'] == pattern_name]
+                    .sort_values('終了', ascending=False)
+                    .copy()
+                )
+                disp_periods['開始'] = pd.to_datetime(disp_periods['開始']).dt.strftime('%m/%d')
+                disp_periods['終了'] = pd.to_datetime(disp_periods['終了']).dt.strftime('%m/%d')
+                disp_periods['平均スコア'] = disp_periods['平均スコア'].map(lambda x: f'{x:.3f}')
+                st.dataframe(
+                    disp_periods[['開始', '終了', '平均スコア']],
+                    use_container_width=True, hide_index=True,
+                )
 
     st.divider()
 
@@ -614,6 +486,7 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
                     hoverongaps=False,
                 ))
                 ui.apply_mobile_layout(fig_cal, height=280)
+                fig_cal.update_yaxes(autorange='reversed')
                 st.plotly_chart(fig_cal, use_container_width=True, config=ui.PLOTLY_CONFIG)
         else:
             pattern_key = next(
@@ -633,6 +506,7 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
                     hoverongaps=False,
                 ))
                 ui.apply_mobile_layout(fig_pat, height=280)
+                fig_pat.update_yaxes(autorange='reversed')
                 st.plotly_chart(fig_pat, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
 
