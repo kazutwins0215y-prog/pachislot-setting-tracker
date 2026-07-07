@@ -1,8 +1,10 @@
 # fase4: 日次自動実行 運用skill
 
-fase1収集→fase2評価(`evaluate_predictions.py`)→fase2分析・予測(`run_store_profile.py`)を
-毎朝無人で直列実行する`fase4/run_daily.py`の運用手順。設計・仕様は
+fase1収集→fase2評価(`evaluate_predictions.py`)→fase2分析・予測(`run_store_profile.py`)→
+fase3分析用Tursoアップロード(`upload_analysis.py`)を毎朝無人で直列実行する
+`fase4/run_daily.py`の運用手順。設計・仕様は
 [`日次自動実行_設計.md`](日次自動実行_設計.md)・[`実装指示書.md`](実装指示書.md)参照。
+アップロードステップの詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照。
 
 ## 前提
 
@@ -95,6 +97,7 @@ py -3.12 run_daily.py --mode morning   # ポーリングあり。起動時刻が
 | 朝タスクが8:15までに全店舗の昨日分を検知できなかった | 正常。ポーリングはPOLL_DEADLINEで打ち切られ評価・分析は実行される。取れなかった店舗は追いタスク(10:30)で回収される想定。機能Bの「使用データ最終日」表示で古いことが分かる |
 | `run_store_profile.py`は走るが予測追記が0件 | 正常(重複ガード)。データが進んでいない店舗は前回と同じ`(ホール名,予測種別,使用データ最終日)`のため自動スキップされる |
 | `evaluate_predictions.py`が失敗する | ERRORログを残しつつ`run_store_profile.py`は実行される(答え合わせの失敗で予測追記を止めない設計)。翌日以降のデータが揃ってから再実行されれば解消することが多い |
+| `upload_analysis.py`が失敗する | ERRORログのみ残しrun_daily自体は正常終了する。翌日の差分実行がウォーターマーク差分で自動的に追いつくため当日中の対応は必須ではない。急ぐ場合は手動で`py -3.12 fase3/upload_analysis.py`を再実行(詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照) |
 
 ## 運用初期の観測タスク(1ヶ月経過後に実施)
 

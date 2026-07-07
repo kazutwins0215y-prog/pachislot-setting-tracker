@@ -29,6 +29,7 @@ EXIT_CODE_FORBIDDEN = 43    # fase1/メイン.pyの403終了コード
 BASE = Path(__file__).resolve().parent.parent
 FASE1_DIR = BASE / 'fase1'
 FASE2_DIR = BASE / 'fase2'
+FASE3_DIR = BASE / 'fase3'
 REPLICA_DB_PATH = BASE / 'ホールデータ' / 'turso_replica.db'
 COLLECTION_LOG_CSV = BASE / 'ホールデータ' / 'collection_log.csv'
 STORES_JSON_PATH = FASE1_DIR / 'stores.json'
@@ -224,6 +225,14 @@ def run_evaluate_and_profile(logger: logging.Logger, stats: RunStats) -> None:
     )
     if profile_exit != 0:
         logger.error(f'run_store_profile.pyが異常終了しました(exit={profile_exit})')
+
+    # 分析用Tursoへの差分upsert(fase3)。失敗しても異常終了させない
+    # (翌日の差分実行がウォーターマーク差分で自動的に追いつくため。設計書「自己修復性」参照)
+    upload_exit = run_subprocess(
+        PY_FASE1_CMD + ['upload_analysis.py'], FASE3_DIR, logger, 'upload_analysis', stats,
+    )
+    if upload_exit != 0:
+        logger.error(f'upload_analysis.pyが異常終了しました(exit={upload_exit})。翌日の差分実行で自動的に追いつきます')
 
 
 def log_summary(
