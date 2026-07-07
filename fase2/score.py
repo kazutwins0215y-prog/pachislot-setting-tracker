@@ -535,6 +535,13 @@ def write_prediction_log(db_path: str, rows: list[dict]) -> None:
     rows各要素キー: 実行日時, 使用データ最終日, 対象日, ホール名, 機種名, 台番号,
     予測種別, 長期スコア, 短期スコア, ブレンド値, 使用alpha, 詳細(dictまたはJSON文字列)。
     ブレンド値がNone(予測不可)の行は呼び出し側で事前に除外しておくこと。
+
+    [fase4随伴改修] 重複追記ガード: (ホール名, 予測種別, 使用データ最終日)の組が
+    既存であれば該当rowsを追記前にスキップする(粒度は台単位ではなくバッチ単位。
+    1回のrun_store_profile実行=1店舗×1予測種別×1データ最終日のバッチのため十分)。
+    データが進んでいない店舗でrun_store_profileを再実行しても、fase4のcatchup/
+    リトライでprediction_logが二重記録されないようにするための単一の防波堤。
+    DELETE/UPDATEは行わずINSERT対象を絞るだけなのでappend-only方針は維持される。
     """
     if not rows:
         return
@@ -542,6 +549,32 @@ def write_prediction_log(db_path: str, rows: list[dict]) -> None:
     con = sqlite3.connect(db_path)
     try:
         con.execute(_CREATE_PREDICTION_LOG_SQL)
+
+        existing_keys: set[tuple] = set()
+        batch_keys = {(r['ホール名'], r['予測種別'], r['使用データ最終日']) for r in rows}
+        for hole_name, pred_type, last_date in batch_keys:
+            found = con.execute(
+                '''
+                SELECT 1 FROM prediction_log
+                WHERE ホール名 = ? AND 予測種別 = ? AND 使用データ最終日 = ?
+                LIMIT 1
+                ''',
+                (hole_name, pred_type, last_date),
+            ).fetchone()
+            if found:
+                existing_keys.add((hole_name, pred_type, last_date))
+
+        if existing_keys:
+            skipped = [r for r in rows if (r['ホール名'], r['予測種別'], r['使用データ最終日']) in existing_keys]
+            rows = [r for r in rows if (r['ホール名'], r['予測種別'], r['使用データ最終日']) not in existing_keys]
+            print(
+                f'  [write_prediction_log] 既存の予測と重複するため{len(skipped)}件をスキップ: '
+                f'{sorted(existing_keys)}'
+            )
+
+        if not rows:
+            return
+
         con.executemany(
             '''
             INSERT INTO prediction_log

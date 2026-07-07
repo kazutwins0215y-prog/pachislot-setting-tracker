@@ -13,7 +13,7 @@ metadata:
 
 ## システム概要
 
-`ana-slo.com` からパチスロホールの台データをスクレイピングし、クラウドDB「Turso」（libSQL/SQLite互換）に保存する。ana-slo.com（Cloudflare）がGitHub Actionsのデータセンター系IPを即403ブロックするため、自動実行（`schedule`）は停止中で、当面はPC上での手動実行（`py -3.12 メイン.py`）のみ。
+`ana-slo.com` からパチスロホールの台データをスクレイピングし、クラウドDB「Turso」（libSQL/SQLite互換）に保存する。ana-slo.com（Cloudflare）がGitHub Actionsのデータセンター系IPを即403ブロックするため、GitHub Actionsでの自動実行（`schedule`）は停止中。代わりに2026-07に[`fase4/`](../fase4/)（タスクスケジューラ+`run_daily.py`）を実装し、自宅PC（住宅用IP）上で`py -3.12 メイン.py`を毎日自動実行する運用に移行済み（詳細は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照）。単体での手動実行も引き続き可能。
 
 ```
 メイン.py（エントリーポイント）
@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS missing_data (
 
 | 関数 | 役割 |
 |---|---|
-| `get_connection()` | Turso DBへの**埋め込みレプリカ接続**を返す（`ホールデータ/turso_replica.db`＋`sync_url`。2026-07変更）。接続時に`sync()`でリモート最新状態をローカルへ反映（初回はフルダウンロード）。読み取りはローカル・書き込みはリモートプライマリへ委譲。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`環境変数が必須 |
+| `get_connection()` | Turso DBへの**埋め込みレプリカ接続**を返す（`ホールデータ/turso_replica.db`＋`sync_url`。2026-07変更）。接続時に`sync()`でリモート最新状態をローカルへ反映（初回はフルダウンロード）。読み取りはローカル・書き込みはリモートプライマリへ委譲。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`環境変数が必須（2026-07にリポジトリルートの`.env`ファイルからの読み込みに対応。`db.py`冒頭で`python-dotenv`の`load_dotenv()`を実行。`.env`は`.gitignore`済みでGit管理対象外） |
 | `sync_replica(con)` | リモート最新状態をローカルレプリカへ反映。失敗しても警告のみ（書き込みはリモートに到達済みで、次回実行時に回復するため） |
 | `setup_db(con)` | 起動時に1回だけ呼ぶ。`CREATE TABLE IF NOT EXISTS`＋`CREATE INDEX IF NOT EXISTS idx_slot_hole_date (ホール名, 日付)`。UNIQUE制約のインデックスは先頭列が日付のため`WHERE ホール名=?`に効かず、Tursoの読み取り行数課金では全表スキャン回避が必須（2026-07追加） |
 | `get_processed_dates(con, hole_name)` | 指定ホールの取得済み日付セットを返す。`メイン.py`で店舗ごとの日付範囲自動算出に使う |
@@ -226,9 +226,12 @@ scraper.get_info()
 `input()`による対話入力は廃止。`stores.json`（`{"stores": ["スラッグ1", "スラッグ2", ...]}`）から対象ホール一覧を読み込み、1つのTurso接続(`con`)を使い回して店舗ごとに処理する。
 
 ```python
+EXIT_CODE_FORBIDDEN = 43  # 403検知時の専用終了コード(fase4/run_daily.pyが判別に使う)
+
 def main():
     stores = load_stores()
     con = get_connection()
+    forbidden = False
     try:
         setup_db(con)
         try:
@@ -236,10 +239,16 @@ def main():
                 process_store(con, hole_name)
         except AccessForbiddenError as e:
             logger.error(f'アクセス拒否(403)のため全店舗の処理を中止します: {e}')
+            forbidden = True
         sync_replica(con)  # fase2が読むローカルレプリカを最新化
     finally:
         con.close()
+
+    if forbidden:
+        sys.exit(EXIT_CODE_FORBIDDEN)
 ```
+
+- 2026-07(fase4導入)に403検知時の終了コードを追加。従来は403捕捉後も`sync_replica`を経て**exit 0(正常終了)**していたため呼び出し元が403を判別できなかった。`sync_replica`・`con.close()`は従来どおり実行した上で最後に`sys.exit(43)`する。通常終了・その他の例外の挙動は変えていない。呼び出し元`fase4/run_daily.py`はこのexit 43でその日の評価・分析をスキップする（詳細は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照）
 
 ### 日付範囲の自動算出（無人実行対応）
 
@@ -248,7 +257,7 @@ def main():
 ロジックは`compute_remaining_days(processed, today)`（純関数、2026-07切り出し）に集約。
 
 ```python
-end_date = today - timedelta(days=COLLECT_UNTIL_DAYS_AGO)  # デフォルト2日前まで
+end_date = today - timedelta(days=COLLECT_UNTIL_DAYS_AGO)  # デフォルト1日前(前日)まで
 
 if processed:
     last_date = max(dt.strptime(d, '%Y-%m-%d') for d in processed)
@@ -260,8 +269,8 @@ else:
     start_date = today - timedelta(days=INITIAL_BACKFILL_DAYS)  # デフォルト90日
 ```
 
-- `COLLECT_UNTIL_DAYS_AGO`（デフォルト2日前）: サイト側が当日・前日分をまだ更新していない可能性があるため、直近2日分は収集対象から外す。次回実行時に自動的にキャッチアップされる
-- 日次実行が想定通り毎日走っていれば「前々日1日分」だけになり数分で終わる
+- `COLLECT_UNTIL_DAYS_AGO`（デフォルト1日前、2026-07にfase4導入とあわせて2日前→1日前へ短縮）: サイトは前日分を23:00〜翌10:00頃にページ一括更新するため中間状態を取り込むリスクがなく、当日分だけ収集対象から外せば足りる。未更新だった日は`RETRY_LOOKBACK_DAYS`のギャップ再試行が翌日以降拾う。この短縮により翌日予測（機能B）の対象日が「昨日」から「今日」になった
+- 日次実行が想定通り毎日走っていれば「前日1日分」だけになり数分で終わる
 - 実行が数日〜数週間空いても、最終取得日からのギャップを自動的に埋める（固定の「直近N日」方式だと長期間の抜けが永久に埋まらないため、この方式を採用）
 - **`RETRY_LOOKBACK_DAYS`（デフォルト14日、2026-07追加）**: 途中の日が取得失敗した場合、旧実装（最終日の翌日から）ではその日が永久にスキップされた。直近14日は未処理日を走査対象に含めることで自動再試行する。取得済みの日は`processed`で除外されるため再取得はしない。サイト側にページ自体が無い日（店休日等）も14日間は再試行されるが、1日1リクエストの追加で許容範囲。14日より古い失敗日は再試行されない（手動でDBを確認して対応）
 - 新規店舗（`stores.json`に追加した直後で取得済みデータが0件）は`INITIAL_BACKFILL_DAYS`分だけ初回バックフィルする（この場合も収集終了日は`end_date`まで）
@@ -351,7 +360,7 @@ finally:
 | fase2との連携 | 店舗別SQLiteファイルをfase2が直接読む | **Turso埋め込みレプリカ**（`ホールデータ/turso_replica.db`、2026-07追加）。Turso移行後「fase1はTursoに書くがfase2はローカルの旧DBしか読まない」断絶が生じていたため、`get_connection()`をリモート直接続から埋め込みレプリカ接続に変更。fase2はこのレプリカファイルをsqlite3で読み取り専用参照する（旧店舗別DBはアーカイブ扱い） |
 
 - Turso無料枠はストレージ5GB。店舗数・蓄積データ増加により将来逼迫する可能性があるため、運用しながら使用量を監視し、必要に応じて有料プラン（Developer: $4.99〜/月、9GBストレージ）への移行を検討する
-- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み（現在は`workflow_dispatch`の手動検証用途のみで使用）
+- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み（現在は`workflow_dispatch`の手動検証用途のみで使用）。ローカルPC手動実行時はリポジトリルートの`.env`ファイル（`.gitignore`済み・`python-dotenv`で読み込み）に同じ2つの値を設定する
 - ローカル実行にはPython 3.12を使用（3.14では`libsql`のビルドに失敗するため。詳細は「db.py」節参照）
 - 詳細な移行方針は[`要件定義.md`](../要件定義.md)「3. 配信・公開」参照
 

@@ -551,9 +551,9 @@ S_稼働低さ = 基準値に対する「低さ」を正規化(逆数方向)
 - **Phase5: 店舗プロファイル拡張**(`app_b.py`の`dashboard_detail()`) — 検知期間履歴(`pattern_history`から「スコア>0」の連続区間を軽量な後処理で検出。統計検定の再実行はしない近似表示)・当月カレンダーヒートマップ2層(統合スコア日次平均`YlOrRd`+パターン別内訳`RdBu`、タブ切替)。カレンダーヒートマップは機能Aには追加せず機能Bのみに実装(機能Aは生データ寄りの手動比較ツールという役割を維持するため)
 - **Phase6(将来項目)**: Stage7-4(ウォークフォワードα学習への置き換え)・Stage7-5(S_ローテ・S_据え置きの非該当日判定・翌日予測拡張)。詳細は[`今後の実装予定.md`](今後の実装予定.md)参照
 
-**store_profile/stage3_scoresの前提(`run_store_profile.py`、2026-07追加・同月改修)**: 機能B(詳細/簡潔とも)は分析DB(`ホールデータ/analysis.db`)の`store_profile`テーブルを読むだけで、自らpreprocess→patterns→scoreパイプラインを実行しない。新規に取り込んだ店舗はこのテーブルが未作成のため機能Bに表示されない。`python run_store_profile.py`(全店舗一括)または`--hole <店舗名>`(特定店舗)でパイプラインを実行し、`stage3_scores`(Stage3出力の台×日スコア。`score.write_stage3_scores`が店舗単位で全削除→再挿入)と`store_profile`を作成・更新する。fase4(日次自動実行)が実装されるまでの間の運用補助スクリプト。
+**store_profile/stage3_scoresの前提(`run_store_profile.py`、2026-07追加・同月改修)**: 機能B(詳細/簡潔とも)は分析DB(`ホールデータ/analysis.db`)の`store_profile`テーブルを読むだけで、自らpreprocess→patterns→scoreパイプラインを実行しない。新規に取り込んだ店舗はこのテーブルが未作成のため機能Bに表示されない。`python run_store_profile.py`(全店舗一括)または`--hole <店舗名>`(特定店舗)でパイプラインを実行し、`stage3_scores`(Stage3出力の台×日スコア。`score.write_stage3_scores`が店舗単位で全削除→再挿入)と`store_profile`を作成・更新する。2026-07に[`fase4/`](../fase4/)(日次自動実行)を実装し、`fase4/run_daily.py`が全店舗一括を毎日自動実行するようになった。新規店舗取込時の即時反映等では引き続き手動実行も可能。
 
-> **既知の運用リスク(2026-07-07発覚)**: fase1(`メイン.py`)がTursoレプリカを最新化しても、fase2側で`run_store_profile.py`を実行し忘れると`stage3_scores`/`store_profile`は古いままになり、特定の店舗だけ機能Bの予測日付が他店舗より大幅に遅れる(実例: マルハン新宿東宝ビル店のみ`stage3_scores`が2026-06-03で停止、他店舗は2026-07-04まで更新済みという乖離が発生していた)。原因は特定できていないが、レプリカ側(生データ)は全店舗同じ日付まで取得できていたことから、fase2側の再計算バッチが一部店舗だけ漏れた/失敗したまま気づかれずにいたと考えられる。**予防策**: データ収集後は`--hole`を付けずに`python run_store_profile.py`(全店舗一括)を定期的に実行し、特定店舗だけ更新が滞っていないか各店舗の`stage3_scores`最大日付を確認する運用にする(fase4の日次自動実行が実装されるまでの暫定対応)。
+> **既知の運用リスク(2026-07-07発覚、fase4導入で解消見込み)**: fase1(`メイン.py`)がTursoレプリカを最新化しても、fase2側で`run_store_profile.py`を実行し忘れると`stage3_scores`/`store_profile`は古いままになり、特定の店舗だけ機能Bの予測日付が他店舗より大幅に遅れる(実例: マルハン新宿東宝ビル店のみ`stage3_scores`が2026-06-03で停止、他店舗は2026-07-04まで更新済みという乖離が発生していた)。原因は特定できていないが、レプリカ側(生データ)は全店舗同じ日付まで取得できていたことから、fase2側の再計算バッチが一部店舗だけ漏れた/失敗したまま気づかれずにいたと考えられる。**予防策**: `fase4/run_daily.py`が`--hole`を付けずに`run_store_profile.py`(全店舗一括)を毎日自動実行するため、実行し忘れ自体は解消される見込み。手動運用時は引き続き全店舗一括での定期実行を推奨。
 
 機能A の実装済みビュー（`app_a.py` / `streamlit run fase2/app_a.py`）:
 
@@ -637,7 +637,7 @@ S_鉄板台がどの条件で有意だったかの台単位メタデータ。`ru
 | 信頼度 | REAL | 実行時点の信頼度 |
 | 実行日時 | TEXT | |
 
-表示側(`app_b.py`の`_detect_pattern_periods`)は「スコア>0が連続している区間」を軽量な後処理でまとめて検出期間として可視化する(統計検定の再実行はしない近似表示、しきい値は暫定0.0)。過去に記録済みの行は書き換えない(append-only)。fase4(日次自動実行)が未実装の間は`run_store_profile.py`の手動実行頻度に応じて日付方向の粒度が粗くなる既知の制約がある。
+表示側(`app_b.py`の`_detect_pattern_periods`)は「スコア>0が連続している区間」を軽量な後処理でまとめて検出期間として可視化する(統計検定の再実行はしない近似表示、しきい値は暫定0.0)。過去に記録済みの行は書き換えない(append-only)。2026-07に[`fase4/`](../fase4/)(日次自動実行)を実装し`run_store_profile.py`は毎日自動実行されるようになったため、日付方向の粒度は日次で揃う。
 
 ### `prediction_log` テーブル（analysis.db、`score.write_prediction_log`が更新。機能B再設計Stage7-1・2026-07追加）
 
@@ -658,6 +658,13 @@ S_鉄板台の翌日予測結果を**追記のみ**(DELETEしない)で記録す
 | ブレンド値 | REAL | 実際に使ったFIXED_ALPHAでの予測値 |
 | 使用alpha | REAL | |
 | 詳細 | TEXT | JSON({"周期日数": [...], "カレンダー条件": [...]}) |
+
+**重複追記ガード(2026-07・fase4導入の随伴改修)**: `write_prediction_log`はINSERT前に
+(ホール名, 予測種別, 使用データ最終日)の組が既存かを照会し、**該当する組のrowsを丸ごと
+追記前にスキップ**する(粒度は台単位ではなくバッチ単位。1回の`run_store_profile.py`実行=
+1店舗×1予測種別×1データ最終日のバッチのため十分)。データが進んでいない店舗で
+`run_store_profile.py`を再実行しても、fase4のcatchup実行や手動再実行で同じ予測が
+二重記録されない。DELETE/UPDATEは行わずINSERT対象を絞るだけなのでappend-only方針は維持される。
 
 ### `prediction_accuracy` テーブル（analysis.db、`evaluate_predictions.evaluate`が更新。機能B再設計Stage7-2・2026-07追加）
 

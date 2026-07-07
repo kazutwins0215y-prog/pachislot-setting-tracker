@@ -25,7 +25,7 @@ BATCH_SIZE    = 20   # この件数ごとに長めの休憩を挟む
 BATCH_BREAK   = 60 * 5  # バッチ休憩時間（秒）
 
 INITIAL_BACKFILL_DAYS = int(os.environ.get('INITIAL_BACKFILL_DAYS', 90))  # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか（環境変数で一時的に上書き可能）
-COLLECT_UNTIL_DAYS_AGO = 2   # 何日前までを収集対象にするか（サイト側の当日・前日データ未更新に備える）
+COLLECT_UNTIL_DAYS_AGO = 1   # 何日前までを収集対象にするか（サイトは前日分を23:00〜翌10:00頃にページ一括更新するため中間状態の取り込みリスクなし。未更新日はRETRY_LOOKBACK_DAYSのギャップ再試行が翌日以降拾う）
 RETRY_LOOKBACK_DAYS = 14     # 取得失敗等で空いた未処理日(ギャップ)を何日前まで再試行するか
 
 STORES_FILE = os.path.join(os.path.dirname(__file__), 'stores.json')
@@ -94,6 +94,13 @@ def process_store(con, hole_name: str):
                 raise
             except Exception as e:
                 logger.error(f'{hole_name}: {day} の処理に失敗: {e}')
+                # 書き込み失敗でトランザクションが開きっぱなしのまま残ると、次の日の
+                # 書き込みが「connection has reached an invalid state, started with Txn」で
+                # 巻き添え失敗するため、ここで後始末してから次の日へ進む
+                try:
+                    con.rollback()
+                except Exception as rollback_err:
+                    logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
             if i < len(remaining) - 1:
                 if (i + 1) % BATCH_SIZE == 0:
                     logger.info(f'{i + 1}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
@@ -110,9 +117,13 @@ def process_store(con, hole_name: str):
         session.close()
 
 
+EXIT_CODE_FORBIDDEN = 43  # 403検知時の専用終了コード(fase4/run_daily.pyが判別に使う)
+
+
 def main():
     stores = load_stores()
     con = get_connection()
+    forbidden = False
     try:
         setup_db(con)
         try:
@@ -120,11 +131,15 @@ def main():
                 process_store(con, hole_name)
         except AccessForbiddenError as e:
             logger.error(f'アクセス拒否(403)のため全店舗の処理を中止します: {e}')
+            forbidden = True
         # 書き込みはリモートへ委譲済みのため、最後にローカルレプリカへ反映して
         # fase2(分析・可視化)が最新データを読めるようにする
         sync_replica(con)
     finally:
         con.close()
+
+    if forbidden:
+        sys.exit(EXIT_CODE_FORBIDDEN)
 
 
 if __name__ == '__main__':
