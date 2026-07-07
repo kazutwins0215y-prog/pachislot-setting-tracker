@@ -9,8 +9,8 @@
 |---|---|---|---|
 | 1. データ収集 | [`fase1/`](fase1/) | 実装済み（Turso対応・埋め込みレプリカ連携済み。GitHub Actions自動実行は403ブロックのため停止中） | `メイン.py` / `scraper.py` / `db.py` / `sync_replica.py` / `stores.json` |
 | 2. 設定推測・パターン分析 | [`fase2/`](fase2/) | 実装済み | 下表参照 |
-| 3. 配信・公開（iPhone Web閲覧） | [`fase3/`](fase3/) | Stage A実装済み・Stage Bコード実装済み（デプロイ自体は運用者が任意のタイミングで実施） | Stage A: TursoDB移行は完了。GitHub Actionsでの自動実行はCloudflareにデータセンターIPをブロックされるため停止し、当面PC手動実行に戻した。Stage B: `upload_analysis.py`（分析DB6テーブルを分析専用Tursoへ差分upsert）/ `analysis_turso.py`（接続ヘルパー）/ `bootstrap.py`+`streamlit_app.py`（Streamlit Community Cloud用エントリポイント。2DBをsyncしfase2/app.pyを無改修のまま起動）。詳細は[`fase3/配信公開_skill.md`](fase3/配信公開_skill.md)参照 |
-| 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み（タスクスケジューラ登録は運用者が任意のタイミングで実施） | `run_daily.py`（朝6:30ポーリング実行＋10:30追い実行。fase1収集→`evaluate_predictions.py`→`run_store_profile.py`→`fase3/upload_analysis.py`（分析用Tursoへの差分アップロード）を直列実行し、`ホールデータ/collection_log.csv`にサイト更新検知時刻を記録） |
+| 3. 配信・公開（iPhone Web閲覧） | [`fase3/`](fase3/) | Stage A実装済み・**Stage Bデプロイ完了(2026-07-07)** | Stage A: TursoDB移行は完了。GitHub Actionsでの自動実行はCloudflareにデータセンターIPをブロックされるため停止し、当面PC手動実行に戻した。Stage B: 分析用Turso(`pachislot-analysis`)を新設し`upload_analysis.py`（分析DB6テーブルを差分upsert）/ `analysis_turso.py`（接続ヘルパー）/ `bootstrap.py`+`streamlit_app.py`（Streamlit Community Cloud用エントリポイント）を実装、Streamlit Community Cloudへデプロイ済み。実データ約40万行の`--full`・差分upsertを実機検証済み。詳細は[`fase3/配信公開_skill.md`](fase3/配信公開_skill.md)参照 |
+| 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み・**タスクスケジューラ登録済み** | `run_daily.py`（朝6:30ポーリング実行＋10:30追い実行。fase1収集→`evaluate_predictions.py`→`run_store_profile.py`→`fase3/upload_analysis.py`（分析用Tursoへの差分アップロード）を直列実行し、`ホールデータ/collection_log.csv`にサイト更新検知時刻を記録）。**2026-07-07判明・対策済み**: バッテリー駆動時のモダンスタンバイ強制スリープでタスクが異常終了(0xC000013A)する事例を確認し、`SetThreadExecutionState`によるスリープ防止リクエストを実行中に有効化する対策を追加（根本対策は実行時間帯のAC電源接続。詳細は[`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md)参照） |
 
 > ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え（**埋め込みレプリカ方式**: 書き込みはTursoへ委譲しつつ`ホールデータ/turso_replica.db`をローカルに維持し、fase2はこのレプリカを読む）、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜2日前。直近14日の取得失敗日は自動再試行。403発生時は全店舗中止）に変更。**GitHub Actionsでの自動実行(`schedule`)は、ana-slo.com(Cloudflare)がデータセンター系IPを即403ブロックすることが判明したため停止中**（`workflow_dispatch`の手動トリガーのみ残す）。当面はPC上で`py -3.12 メイン.py`を手動実行し、Tursoへ書き込む運用。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
 
@@ -52,7 +52,7 @@
 - クラウドDB: Turso（libSQL/SQLite互換、Primary Location: Tokyo/nrt）。`fase1/db.py`が`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`環境変数で**埋め込みレプリカ接続**（GitHub Secretsに登録済み）
 - Tursoレプリカ: `ホールデータ/turso_replica.db`（fase1が実行終了時のsyncで維持するSQLite互換ファイル。**fase2はTursoへ直接接続せずこれを読み取り専用参照する**。収集せず同期だけ行う場合は`py -3.12 fase1/sync_replica.py`）
 - 分析DB: `ホールデータ/analysis.db`（fase2の成果物`stage3_scores`/`store_profile`。ローカル専用・`fase2/run_store_profile.py`で再生成可能）
-- クラウドDB(分析用): Turso（生データDBとは物理分離された別DB。同じorganization・同じTokyo/nrt）。`fase3/analysis_turso.py`が`TURSO_ANALYSIS_DATABASE_URL`/`TURSO_ANALYSIS_AUTH_TOKEN`環境変数で**埋め込みレプリカ接続**し、`fase3/upload_analysis.py`が`analysis.db`の6テーブルを差分upsertする
+- クラウドDB(分析用): Turso、DB名`pachislot-analysis`（生データDBと物理分離・同じorganization・同じグループ`analytics`/`aws-ap-northeast-1`に作成済み）。`fase3/analysis_turso.py`が`TURSO_ANALYSIS_DATABASE_URL`/`TURSO_ANALYSIS_AUTH_TOKEN`環境変数で**埋め込みレプリカ接続**し、`fase3/upload_analysis.py`が`analysis.db`の6テーブルを差分upsertする
 - 分析用Tursoレプリカ: `ホールデータ/turso_analysis_replica.db`（`upload_analysis.py`が維持する埋め込みレプリカ。ウォーターマーク読み取り専用・消えても次回syncで再生成される）
 - 旧ローカルSQLite: `ホールデータ/{ホール名スラッグ}.db`（Turso移行前の生データのアーカイブ。現在はどのコードからも参照されない。`.gitignore`でGit管理対象外。Turso移行時に`fase1/merge_stores_for_turso.py`で1ファイルに統合しUpload DB機能で移行済み）
 - 対象サイト: `ana-slo.com`

@@ -16,6 +16,10 @@ fase3分析用Tursoアップロード(`upload_analysis.py`)を毎朝無人で直
 
 ## タスクスケジューラ登録コマンド
 
+**登録済み(2026-07-07確認)**: `PachislotDaily_Morning`/`PachislotDaily_Catchup`は
+既にこのPCに登録されている(`Get-ScheduledTask -TaskName 'PachislotDaily_*'`で確認可能)。
+以下は再登録・別PCへの登録が必要な場合の手順。
+
 PowerShellを**管理者権限**で開いて実行する(`schtasks /create`はスリープ解除オプションを
 指定できないため`Register-ScheduledTask`を使う)。パスは実際のリポジトリ配置に合わせてある。
 
@@ -98,6 +102,7 @@ py -3.12 run_daily.py --mode morning   # ポーリングあり。起動時刻が
 | `run_store_profile.py`は走るが予測追記が0件 | 正常(重複ガード)。データが進んでいない店舗は前回と同じ`(ホール名,予測種別,使用データ最終日)`のため自動スキップされる |
 | `evaluate_predictions.py`が失敗する | ERRORログを残しつつ`run_store_profile.py`は実行される(答え合わせの失敗で予測追記を止めない設計)。翌日以降のデータが揃ってから再実行されれば解消することが多い |
 | `upload_analysis.py`が失敗する | ERRORログのみ残しrun_daily自体は正常終了する。翌日の差分実行がウォーターマーク差分で自動的に追いつくため当日中の対応は必須ではない。急ぐ場合は手動で`py -3.12 fase3/upload_analysis.py`を再実行(詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照) |
+| `Get-ScheduledTaskInfo`の`LastTaskResult`が`3221225786`(16進`0xC000013A`=プロセス強制終了) | **原因判明・対策済み(2026-07-07)**。Windowsの電源イベントログ(`Get-WinEvent -LogName System`)を確認したところ、タスク起動と同時刻に「Austerity Battery Drain Budget Exceeded」「Standby Battery Budget Exceeded」等の理由でモダンスタンバイがより深いスリープ/休止へ強制移行しており、実行中の`run_daily.py`自体が巻き込まれて強制終了していた。**バッテリー駆動時にモダンスタンバイが積極的に電力を絞る挙動**が原因で、`WakeToRun`はPCを起こすことは保証するが起動後にOSが再スリープすることは防がない。対策として`run_daily.py`起動直後に`SetThreadExecutionState`(Win32 API)でスリープ防止をOSにリクエストし、終了時(`finally`)に解除する処理を追加した。**根本対策として朝6:30・10:30の時間帯はPCをAC電源に接続しておくことを推奨**(バッテリー駆動そのものを避けるのが最も確実) |
 
 ## 運用初期の観測タスク(1ヶ月経過後に実施)
 
