@@ -373,6 +373,8 @@ def render_overview(profiles: pd.DataFrame) -> None:
     import streamlit as st
     import plotly.express as px
 
+    import ui_theme as ui
+
     if profiles.empty:
         st.warning(
             'store_profile データがありません。'
@@ -384,10 +386,7 @@ def render_overview(profiles: pd.DataFrame) -> None:
     synth_df = synthesize_scores(profiles, weights)
     pivot_df = _pivot_profiles(profiles)
 
-    st.caption(
-        'サブスコアは符号付き([-1, 1]): プラス=そのパターンが強く出ている、'
-        'マイナス=弱い(該当日が少ない/非該当日が多い)ことを示します。'
-    )
+    st.caption('サブスコア: + = 狙い目 / − = 弱い')
 
     # ── 1. 店舗ランキング ──
     st.subheader('店舗ランキング（合成スコア）')
@@ -437,10 +436,9 @@ def render_overview(profiles: pd.DataFrame) -> None:
                 color=color_col,
                 color_continuous_scale='Blues',
                 range_x=[-1, 1],
-                title=f'{sel_pattern} — 店舗別スコア比較',
             )
-            fig.update_layout(height=max(280, len(bar_df) * 42 + 80))
-            st.plotly_chart(fig, use_container_width=True)
+            ui.apply_mobile_layout(fig, height=max(280, len(bar_df) * 42 + 80))
+            st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
         else:
             st.info('表示できるデータがありません。')
     else:
@@ -456,16 +454,17 @@ def render_overview(profiles: pd.DataFrame) -> None:
         heat_data.columns = [c.replace('_スコア', '') for c in heat_data.columns]
 
         if not heat_data.dropna(how='all').empty:
+            disp_data = heat_data.rename(columns=lambda c: c[2:] if c.startswith('S_') else c)
             fig_heat = px.imshow(
-                heat_data,
+                disp_data,
                 color_continuous_scale='RdBu',
                 labels=dict(x='サブスコア', y='ホール名', color='スコア'),
-                title='店舗 × サブスコア ヒートマップ',
                 zmin=-1, zmax=1,
                 aspect='auto',
             )
-            fig_heat.update_layout(height=max(280, len(heat_data) * 38 + 100))
-            st.plotly_chart(fig_heat, use_container_width=True)
+            ui.apply_mobile_layout(fig_heat, height=max(280, len(heat_data) * 38 + 100))
+            fig_heat.update_xaxes(tickangle=-35, tickfont=dict(size=10))
+            st.plotly_chart(fig_heat, use_container_width=True, config=ui.PLOTLY_CONFIG)
         else:
             st.info('ヒートマップ用データがありません。')
     else:
@@ -481,6 +480,8 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     import plotly.express as px
     import plotly.graph_objects as go
 
+    import ui_theme as ui
+
     hole_grp = profiles[profiles['ホール名'] == sel_hole].copy()
     if hole_grp.empty:
         st.info(
@@ -492,48 +493,34 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     hole_grp['表示名'] = hole_grp['パターン'].map(_PATTERN_LABELS)
 
     st.subheader(f'{sel_hole} — サブスコア詳細')
-    st.caption(
-        'サブスコアは符号付き([-1, 1]): プラス=そのパターンが強く出ている、'
-        'マイナス=弱い(該当日が少ない/非該当日が多い)ことを示します。'
-    )
 
-    col1, col2 = st.columns([1, 1])
+    valid = hole_grp.dropna(subset=['スコア']).copy()
+    valid['表示名'] = valid['パターン'].map(_PATTERN_LABELS)
+    if not valid.empty:
+        fig_bar = px.bar(
+            valid,
+            x='スコア', y='表示名', orientation='h',
+            color='信頼度', color_continuous_scale='Blues',
+            range_x=[-1, 1],
+        )
+        ui.apply_mobile_layout(fig_bar, height=max(280, len(valid) * 45 + 80))
+        st.plotly_chart(fig_bar, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
-    with col1:
-        st.markdown(f'**{sel_hole} — サブスコア内訳**')
+    tbl = hole_grp[['表示名', 'スコア', '信頼度']].copy()
+    tbl['スコア'] = tbl['スコア'].map(lambda x: f'{x:.3f}' if pd.notna(x) else '─')
+    tbl['信頼度'] = tbl['信頼度'].map(lambda x: f'{x:.0%}' if pd.notna(x) else '─')
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-        tbl = hole_grp[['表示名', 'スコア', '信頼度']].copy()
-        tbl['スコア'] = tbl['スコア'].map(lambda x: f'{x:.3f}' if pd.notna(x) else '─')
-        tbl['信頼度'] = tbl['信頼度'].map(lambda x: f'{x:.0%}' if pd.notna(x) else '─')
-        st.dataframe(tbl, use_container_width=True, hide_index=True)
+    # γ_store
+    if 'gamma_store' in hole_grp.columns:
+        gv = hole_grp['gamma_store'].dropna()
+        if not gv.empty:
+            st.metric('γ_store', f'{float(gv.iloc[0]):.4f}')
+        else:
+            st.caption('γ_store: 未学習（Stage5・複数店舗データが必要）')
 
-        # γ_store
-        if 'gamma_store' in hole_grp.columns:
-            gv = hole_grp['gamma_store'].dropna()
-            if not gv.empty:
-                st.metric('γ_store', f'{float(gv.iloc[0]):.4f}')
-            else:
-                st.caption('γ_store: 未学習（Stage5・複数店舗データが必要）')
-
-        if '更新日時' in hole_grp.columns:
-            st.caption(f'最終更新: {hole_grp["更新日時"].max()}')
-
-    with col2:
-        valid = hole_grp.dropna(subset=['スコア']).copy()
-        valid['表示名'] = valid['パターン'].map(_PATTERN_LABELS)
-        if not valid.empty:
-            fig_bar = px.bar(
-                valid,
-                x='スコア', y='表示名', orientation='h',
-                color='信頼度', color_continuous_scale='Blues',
-                range_x=[-1, 1],
-                title=f'{sel_hole} サブスコア',
-            )
-            fig_bar.update_layout(
-                height=max(280, len(valid) * 45 + 80),
-                margin=dict(t=40, b=20),
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
+    if '更新日時' in hole_grp.columns:
+        st.caption(f'最終更新: {hole_grp["更新日時"].max()}')
 
     # 低信頼度の警告
     low_rel = hole_grp[hole_grp['信頼度'].fillna(0) < _LOW_RELIABILITY_THRESHOLD]
@@ -568,20 +555,19 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
         )
     else:
         disp_periods = periods.sort_values('終了', ascending=False).copy()
+        disp_periods['開始'] = pd.to_datetime(disp_periods['開始']).dt.strftime('%m/%d')
+        disp_periods['終了'] = pd.to_datetime(disp_periods['終了']).dt.strftime('%m/%d')
         disp_periods['平均スコア'] = disp_periods['平均スコア'].map(lambda x: f'{x:.3f}')
-        disp_periods['平均信頼度'] = disp_periods['平均信頼度'].map(
-            lambda x: f'{x:.0%}' if pd.notna(x) else '─'
+        st.dataframe(
+            disp_periods[['パターン', '開始', '終了', '平均スコア']],
+            use_container_width=True, hide_index=True,
         )
-        st.dataframe(disp_periods, use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # ── 6. 当月カレンダーヒートマップ(2層) ──
+    # ── 6. 当月カレンダーヒートマップ ──
     st.subheader(f'{sel_hole} — カレンダーヒートマップ（店舗内の絶対評価）')
-    st.caption(
-        '他店との比較ではなく、この店舗の中で相対的に強い日/弱い日を示します。'
-        '1枚目は日次平均high_prob(stage3_scores)、2枚目以降はパターン別(pattern_history)の内訳です。'
-    )
+    st.caption('他店との比較ではなく、この店舗の中で相対的に強い日/弱い日を示します。')
 
     daily_avg = _load_daily_stage3_avg(str(ds.ANALYSIS_DB_PATH), sel_hole)
 
@@ -599,45 +585,53 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     if not available_months:
         st.info('カレンダー表示用のデータがありません。')
     else:
-        sel_month = st.selectbox('表示月', available_months, index=0, key='calendar_month')
-        year, month = int(sel_month[:4]), int(sel_month[5:7])
-
-        st.markdown('**統合スコア日次平均（high_prob平均・0〜1）**')
-        if daily_avg.empty:
-            st.caption('stage3_scoresデータがありません。')
-        else:
-            z, text = _month_grid(daily_avg.to_dict(), year, month)
-            fig_cal = go.Figure(data=go.Heatmap(
-                z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
-                text=text, texttemplate='%{text}',
-                colorscale='YlOrRd', zmin=0.0, zmax=1.0,
-                hoverongaps=False,
-            ))
-            fig_cal.update_layout(title=f'{sel_month} 統合スコア日次平均', height=280)
-            st.plotly_chart(fig_cal, use_container_width=True)
-
-        if hist_hole_dated.empty:
-            st.caption('pattern_historyデータがありません(パターン別の内訳は表示できません)。')
-        else:
+        available_patterns: list[str] = []
+        pattern_daily = pd.Series(dtype=float)
+        if not hist_hole_dated.empty:
             pattern_daily = hist_hole_dated.groupby(['パターン', '日付'])['スコア'].mean()
             available_patterns = [
                 p for p in _PATTERN_LABELS.keys() if p in hist_hole_dated['パターン'].unique()
             ]
-            tabs = st.tabs([_PATTERN_LABELS.get(p, p) for p in available_patterns])
-            for tab, pattern in zip(tabs, available_patterns):
-                with tab:
-                    score_map = pattern_daily.loc[pattern].to_dict()
-                    z2, text2 = _month_grid(score_map, year, month)
-                    fig_pat = go.Figure(data=go.Heatmap(
-                        z=z2, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z2.shape[0])],
-                        text=text2, texttemplate='%{text}',
-                        colorscale='RdBu', zmid=0.0, zmin=-1.0, zmax=1.0,
-                        hoverongaps=False,
-                    ))
-                    fig_pat.update_layout(
-                        title=f'{sel_month} {_PATTERN_LABELS.get(pattern, pattern)}', height=280
-                    )
-                    st.plotly_chart(fig_pat, use_container_width=True)
+        metric_options = ['統合スコア日次平均'] + [_PATTERN_LABELS.get(p, p) for p in available_patterns]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_month = st.selectbox('表示月', available_months, index=0, key='calendar_month')
+        with c2:
+            sel_metric = st.selectbox('表示項目', metric_options, index=0, key='calendar_metric')
+
+        year, month = int(sel_month[:4]), int(sel_month[5:7])
+
+        if sel_metric == '統合スコア日次平均':
+            if daily_avg.empty:
+                st.caption('stage3_scoresデータがありません。')
+            else:
+                z, text = _month_grid(daily_avg.to_dict(), year, month)
+                fig_cal = go.Figure(data=go.Heatmap(
+                    z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
+                    text=text, texttemplate='%{text}', textfont=dict(size=11),
+                    colorscale='YlOrRd', zmin=0.0, zmax=1.0,
+                    hoverongaps=False,
+                ))
+                ui.apply_mobile_layout(fig_cal, height=280)
+                st.plotly_chart(fig_cal, use_container_width=True, config=ui.PLOTLY_CONFIG)
+        else:
+            pattern_key = next(
+                (p for p in available_patterns if _PATTERN_LABELS.get(p, p) == sel_metric), None
+            )
+            if pattern_key is None:
+                st.caption('pattern_historyデータがありません(パターン別の内訳は表示できません)。')
+            else:
+                score_map = pattern_daily.loc[pattern_key].to_dict()
+                z2, text2 = _month_grid(score_map, year, month)
+                fig_pat = go.Figure(data=go.Heatmap(
+                    z=z2, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z2.shape[0])],
+                    text=text2, texttemplate='%{text}', textfont=dict(size=11),
+                    colorscale='RdBu', zmid=0.0, zmin=-1.0, zmax=1.0,
+                    hoverongaps=False,
+                ))
+                ui.apply_mobile_layout(fig_pat, height=280)
+                st.plotly_chart(fig_pat, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
 
 def memo_simple(profiles: pd.DataFrame) -> str:

@@ -155,6 +155,8 @@ def render() -> None:
     import streamlit as st
     import plotly.express as px
 
+    import ui_theme as ui
+
     st.header('当日・翌日ランキング')
 
     if not ds.ANALYSIS_DB_PATH.exists():
@@ -174,8 +176,7 @@ def render() -> None:
         acc_df = _load_prediction_accuracy(analysis_db)
 
     # ── 1. 店舗ランキング(当日) ──
-    st.subheader('店舗ランキング(当日・総合狙い目度)')
-    st.caption('1本の軸で表示: プラス=狙い目、マイナス=避けるべき店')
+    st.subheader('店舗ランキング')
 
     if synth_df.empty:
         st.warning(
@@ -188,18 +189,9 @@ def render() -> None:
             ranked, x='合成スコア', y='ホール名', orientation='h',
             color='合成スコア', color_continuous_scale='RdBu',
             range_x=[-1, 1], range_color=[-1, 1],
-            title='店舗別 総合狙い目度',
         )
-        fig.update_layout(height=max(280, len(ranked) * 42 + 80))
-        st.plotly_chart(fig, use_container_width=True)
-
-        disp = synth_df.copy()
-        disp['合成スコア'] = disp['合成スコア'].map(lambda x: f'{x:.3f}' if pd.notna(x) else 'N/A')
-        disp['平均信頼度'] = disp['平均信頼度'].map(lambda x: f'{x:.0%}')
-        st.dataframe(
-            disp[['ホール名', '合成スコア', '平均信頼度', '最高サブスコア']],
-            use_container_width=True, hide_index=True,
-        )
+        ui.apply_mobile_layout(fig, height=max(280, len(ranked) * 32 + 80))
+        st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
     st.divider()
 
@@ -226,11 +218,7 @@ def render() -> None:
     st.divider()
 
     # ── 3. 翌日予測ランキング(S_鉄板台) ──
-    st.subheader('翌日予測ランキング(S_鉄板台)')
-    st.caption(
-        '的中率・信頼度が低くても非表示にはしません(最終判断は人間が行う前提)。'
-        '対象日はrun_store_profile.py実行時点の「使用データ最終日の翌日」です。'
-    )
+    st.subheader('翌日予測')
 
     if pred_df.empty:
         st.info(
@@ -258,18 +246,31 @@ def render() -> None:
     top_pred = pd.concat([ranked_pred.head(_TOP_N_PREDICTIONS), ranked_pred.tail(_TOP_N_PREDICTIONS)]).drop_duplicates(subset=['ラベル'])
 
     if not top_pred.empty:
+        top_pred = top_pred.copy()
+        top_pred['短縮ラベル'] = top_pred.apply(
+            lambda r: f"{ui.short_label(r['ホール名'], 8)} {ui.short_label(r['機種名'], 10)} {int(r['台番号'])}番",
+            axis=1,
+        )
         fig_pred = px.bar(
-            top_pred.sort_values('ブレンド値'), x='ブレンド値', y='ラベル', orientation='h',
+            top_pred.sort_values('ブレンド値'), x='ブレンド値', y='短縮ラベル', orientation='h',
             color='ブレンド値', color_continuous_scale='RdBu',
             range_x=[-1, 1], range_color=[-1, 1],
-            title='翌日予測スコア(上位・下位)',
+            custom_data=['ホール名', '台'],
         )
-        fig_pred.update_layout(height=max(280, len(top_pred) * 32 + 80))
-        st.plotly_chart(fig_pred, use_container_width=True)
+        fig_pred.update_traces(
+            hovertemplate='%{customdata[0]} / %{customdata[1]}<br>ブレンド値: %{x:.3f}<extra></extra>'
+        )
+        ui.apply_mobile_layout(fig_pred, height=max(280, len(top_pred) * 32 + 80))
+        st.plotly_chart(fig_pred, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
     disp_pred = pred_df.sort_values('ブレンド値', ascending=False).copy()
     disp_pred['ブレンド値'] = disp_pred['ブレンド値'].map(lambda x: f'{x:.3f}' if pd.notna(x) else 'N/A')
     st.dataframe(
-        disp_pred[['ホール名', '台', '対象日', '使用データ最終日', 'ブレンド値', '根拠', '的中率']],
+        disp_pred[['ホール名', '台', 'ブレンド値', '対象日']],
         use_container_width=True, hide_index=True,
     )
+    with st.expander('根拠・的中率の詳細'):
+        st.dataframe(
+            disp_pred[['ホール名', '台', '対象日', '使用データ最終日', '根拠', '的中率']],
+            use_container_width=True, hide_index=True,
+        )

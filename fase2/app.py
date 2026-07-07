@@ -21,11 +21,12 @@ import app_a
 import app_b
 import app_top
 import data_source as ds
+import ui_theme
 
-st.set_page_config(page_title='パチスロ設定判別ツール', layout='wide')
+st.set_page_config(page_title='パチスロ設定判別ツール', layout='centered')
+ui_theme.inject_css()
 
 _HOLE_KEY = 'selected_hole'
-_SEARCH_COLS = 3  # 店舗ボタンの列数
 
 
 def _list_all_holes(profiles) -> list[str]:
@@ -48,52 +49,49 @@ def _render_home(profiles) -> None:
     st.title('パチスロ設定判別ツール')
 
     # ── 店舗検索 ──
-    st.header('店舗検索')
-    holes = _list_all_holes(profiles)
-    if not holes:
-        st.error(
-            '店舗データがありません。fase1のデータ収集と '
-            'fase2/run_store_profile.py を先に実行してください。'
-        )
-    else:
-        query = st.text_input(
-            '店舗名で検索', value='',
-            placeholder='店舗名の一部を入力(空欄で全店舗を表示)',
-            key='hole_search',
-        )
-        matched = [h for h in holes if query.strip() in h] if query.strip() else holes
-        if not matched:
-            st.info('該当する店舗がありません。')
-        cols = st.columns(_SEARCH_COLS)
-        for i, hole in enumerate(matched):
-            with cols[i % _SEARCH_COLS]:
+    with st.container(border=True):
+        st.header('店舗検索')
+        holes = _list_all_holes(profiles)
+        if not holes:
+            st.error(
+                '店舗データがありません。fase1のデータ収集と '
+                'fase2/run_store_profile.py を先に実行してください。'
+            )
+        else:
+            query = st.text_input(
+                '店舗名で検索', value='',
+                placeholder='店舗名の一部を入力(空欄で全店舗を表示)',
+                key='hole_search',
+            )
+            matched = [h for h in holes if query.strip() in h] if query.strip() else holes
+            if not matched:
+                st.info('該当する店舗がありません。')
+            for hole in matched:
                 if st.button(hole, key=f'goto_{hole}', use_container_width=True):
                     st.session_state[_HOLE_KEY] = hole
                     st.rerun()
 
-    st.divider()
-
     # ── 当日・翌日ランキング ──
-    app_top.render()
-
-    st.divider()
+    with st.container(border=True):
+        app_top.render()
 
     # ── 機能B: 店舗横断比較 ──
-    st.header('店舗横断比較')
-    app_b.render_overview(profiles)
+    with st.container(border=True):
+        st.header('店舗横断比較')
+        app_b.render_overview(profiles)
 
 
 def _render_store_page(profiles, hole: str) -> None:
-    st.button('← ホームに戻る', on_click=_go_home, key='back_home')
+    st.button('← ホームに戻る', on_click=_go_home, key='back_home', type='primary')
     st.title(hole)
 
-    st.header('店内比較(機能A)')
-    app_a.render(hole)
+    with st.container(border=True):
+        st.header('店内比較(機能A)')
+        app_a.render(hole)
 
-    st.divider()
-
-    st.header('振り返りダッシュボード(機能B)')
-    app_b.render_store_detail(profiles, hole)
+    with st.container(border=True):
+        st.header('振り返りダッシュボード(機能B)')
+        app_b.render_store_detail(profiles, hole)
 
 
 _profiles = app_b.load_all_profiles()

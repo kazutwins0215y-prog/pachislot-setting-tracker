@@ -27,6 +27,7 @@ import plotly.express as px
 import streamlit as st
 
 import data_source as ds
+import ui_theme as ui
 
 _WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
 
@@ -142,35 +143,31 @@ def view_store_summary(df: pd.DataFrame) -> None:
         .rename(columns={'合計差枚': '月間累計差枚'})
     )
 
-    col1, col2 = st.columns(2)
+    st.markdown('**月ごとの累計差枚**')
+    fig = px.bar(monthly, x='月', y='月間累計差枚', color_discrete_sequence=['#4C72B0'])
+    _apply_jp_yaxis(fig, monthly['月間累計差枚'].tolist())
+    ui.apply_mobile_layout(fig, height=320)
+    st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
-    with col1:
-        st.markdown('**月ごとの累計差枚**')
-        fig = px.bar(monthly, x='月', y='月間累計差枚', color_discrete_sequence=['#4C72B0'])
-        _apply_jp_yaxis(fig, monthly['月間累計差枚'].tolist())
-        fig.update_layout(height=320, margin=dict(t=10, b=40))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        months = sorted(daily['月'].unique().tolist())
-        sel_month = st.selectbox('月を選択', ['全期間'] + months, key='sum_month')
-        plot = daily if sel_month == '全期間' else daily[daily['月'] == sel_month]
-        plot = plot.sort_values('日付').copy()
-        plot['累計差枚'] = plot['合計差枚'].cumsum()
-        st.markdown(f'**累計差枚推移 — {sel_month}**')
-        fig2 = px.line(plot, x='日付', y='累計差枚', markers=True, color_discrete_sequence=['#4C72B0'])
-        cum = plot['累計差枚'].dropna()
-        y_min2 = float(cum.min()) if not cum.empty else 0.0
-        y_max2 = float(cum.max()) if not cum.empty else 0.0
-        if y_min2 < 0:
-            fig2.add_hrect(y0=y_min2 * 1.1, y1=0, fillcolor='rgba(220,80,80,0.13)', layer='below', line_width=0)
-        if y_max2 > 0:
-            fig2.add_hrect(y0=0, y1=y_max2 * 1.1, fillcolor='rgba(60,180,100,0.13)', layer='below', line_width=0)
-        fig2.add_hline(y=0, line_color='rgba(0,0,0,0.75)', line_width=2.5)
-        fig2.update_xaxes(tickformat='%Y/%m/%d')
-        _apply_jp_yaxis(fig2, cum.tolist())
-        fig2.update_layout(height=320, margin=dict(t=10, b=40))
-        st.plotly_chart(fig2, use_container_width=True)
+    months = sorted(daily['月'].unique().tolist())
+    sel_month = st.selectbox('月を選択', ['全期間'] + months, key='sum_month')
+    plot = daily if sel_month == '全期間' else daily[daily['月'] == sel_month]
+    plot = plot.sort_values('日付').copy()
+    plot['累計差枚'] = plot['合計差枚'].cumsum()
+    st.markdown(f'**累計差枚推移 — {sel_month}**')
+    fig2 = px.line(plot, x='日付', y='累計差枚', markers=True, color_discrete_sequence=['#4C72B0'])
+    cum = plot['累計差枚'].dropna()
+    y_min2 = float(cum.min()) if not cum.empty else 0.0
+    y_max2 = float(cum.max()) if not cum.empty else 0.0
+    if y_min2 < 0:
+        fig2.add_hrect(y0=y_min2 * 1.1, y1=0, fillcolor='rgba(220,80,80,0.13)', layer='below', line_width=0)
+    if y_max2 > 0:
+        fig2.add_hrect(y0=0, y1=y_max2 * 1.1, fillcolor='rgba(60,180,100,0.13)', layer='below', line_width=0)
+    fig2.add_hline(y=0, line_color='rgba(0,0,0,0.75)', line_width=2.5)
+    fig2.update_xaxes(tickformat='%Y/%m/%d')
+    _apply_jp_yaxis(fig2, cum.tolist())
+    ui.apply_mobile_layout(fig2, height=320)
+    st.plotly_chart(fig2, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
 
 # ── ビュー: 台ごとの比較 ─────────────────────────────────────────────
@@ -438,19 +435,20 @@ def view_by_slot(df: pd.DataFrame) -> None:
     fig = px.line(
         agg, x='日付', y=y_axis, color=color_col, markers=True,
         labels={'_seg_label': '台', '台番号_str': '台番号'},
-        title=f'日次 {y_axis} の推移（台番号別）',
     )
-    fig.update_layout(height=480, xaxis_title='日付')
+    fig.update_traces(marker=dict(size=8))
+    fig.update_layout(xaxis_title='日付')
     if y_axis == '統合スコア':
         _apply_score_yaxis(fig)
         _apply_xaxis_date_fmt(fig, agg, period)
     else:
         _apply_chart_style(fig, agg, y_axis, period)
+    ui.apply_mobile_layout(fig, height=380)
 
     event = st.plotly_chart(
         fig, use_container_width=True,
         on_select='rerun', selection_mode='points',
-        key='slot_chart',
+        key='slot_chart', config=ui.PLOTLY_CONFIG,
     )
 
     # クリックした点の素データを表示
@@ -473,13 +471,15 @@ def view_by_slot(df: pd.DataFrame) -> None:
                 st.markdown('---')
                 st.markdown('**選択した点の素データ**')
                 show_cols = [c for c in [
-                    '日付', '台番号', '機種名', '差枚', '回転数',
-                    'BB確率', 'RB確率', 'ART確率', '合成確率', 'high_prob', 'log_odds',
+                    '日付', '台番号', '機種名', '差枚', '回転数', '合成確率', 'high_prob',
                 ] if c in sel_df.columns]
-                st.dataframe(
-                    _fmt_prob_cols(sel_df[show_cols]).sort_values('日付').reset_index(drop=True),
-                    use_container_width=True,
-                )
+                disp_sel = _fmt_prob_cols(sel_df[show_cols]).sort_values('日付').reset_index(drop=True)
+                if 'high_prob' in disp_sel.columns:
+                    disp_sel = disp_sel.rename(columns={'high_prob': '高設定確率'})
+                    disp_sel['高設定確率'] = disp_sel['高設定確率'].apply(
+                        lambda p: f'{float(p):.0%}' if pd.notna(p) else ''
+                    )
+                st.dataframe(disp_sel, use_container_width=True)
 
 
 # ── ビュー: 機種名比較 ───────────────────────────────────────────────
@@ -539,19 +539,19 @@ def view_by_machine(df: pd.DataFrame) -> None:
             st.info('有効なデータがありません。')
             return
         agg = plot_df.groupby(['日付', '_suffix'])[y_axis].mean().reset_index()
-        suffix_label = '・'.join(sorted(mach_slot_suffixes))
         fig = px.line(
             agg, x='日付', y=y_axis, color='_suffix', markers=True,
             labels={'_suffix': '台番号末尾'},
-            title=f'日次 {y_axis} の推移（台番号末尾 {suffix_label} の平均）',
         )
-        fig.update_layout(height=480, xaxis_title='日付')
+        fig.update_traces(marker=dict(size=8))
+        fig.update_layout(xaxis_title='日付')
         if y_axis == '統合スコア':
             _apply_score_yaxis(fig)
             _apply_xaxis_date_fmt(fig, agg, period)
         else:
             _apply_chart_style(fig, agg, y_axis, period)
-        st.plotly_chart(fig, use_container_width=True)
+        ui.apply_mobile_layout(fig, height=380)
+        st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
         return
 
     # 台番号末尾未選択: 機種名ごとに描画
@@ -570,24 +570,22 @@ def view_by_machine(df: pd.DataFrame) -> None:
     agg = plot_df.groupby(['日付', '機種名'])[y_axis].mean().reset_index()
     fig = px.line(
         agg, x='日付', y=y_axis, color='機種名', markers=True,
-        title=f'日次 {y_axis} の推移（機種名別）',
     )
-    fig.update_layout(height=480, xaxis_title='日付')
+    fig.update_traces(marker=dict(size=8))
+    fig.update_layout(xaxis_title='日付')
     if y_axis == '統合スコア':
         _apply_score_yaxis(fig)
         _apply_xaxis_date_fmt(fig, agg, period)
     else:
         _apply_chart_style(fig, agg, y_axis, period)
-    st.plotly_chart(fig, use_container_width=True)
+    ui.apply_mobile_layout(fig, height=380)
+    st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
 
 # ── メイン ───────────────────────────────────────────────────────────
 
 def render(hole_name: str) -> None:
     """機能Aの画面本体。app.pyの店舗トップページから店舗固定で呼ばれる。"""
-    if st.button('キャッシュをクリア（新データ反映）', key='a_clear_cache'):
-        _load_data_cached.clear()
-
     with st.spinner('データ読み込み中... (初回のみ時間がかかります)'):
         df = load_data(hole_name)
 
@@ -595,15 +593,15 @@ def render(hole_name: str) -> None:
         st.warning('このDBにデータがありません。')
         return
 
-    info = f'総行数: {len(df):,}'
     if df['日付'].notna().any():
-        info += f' ／ {df["日付"].min().date()} 〜 {df["日付"].max().date()}'
-    has_scores = 'high_prob' in df.columns and df['high_prob'].notna().any()
-    info += ' ／ Stage3スコア: あり' if has_scores else ' ／ Stage3スコア: なし（生データのみ）'
-    st.caption(info)
+        st.caption(f'{df["日付"].min().date()} 〜 {df["日付"].max().date()}')
 
-    view = st.radio('ビュー', ['店舗分析', '台番号', '機種名'], horizontal=True,
-                    label_visibility='collapsed', key='a_view')
+    view = st.segmented_control(
+        'ビュー', ['店舗分析', '台番号', '機種名'], default='店舗分析',
+        label_visibility='collapsed', key='a_view',
+    )
+    if view is None:
+        view = '店舗分析'
     st.divider()
 
     if view == '店舗分析':
@@ -612,3 +610,6 @@ def render(hole_name: str) -> None:
         view_by_slot(df)
     else:
         view_by_machine(df)
+
+    if st.button('キャッシュをクリア（新データ反映）', key='a_clear_cache'):
+        _load_data_cached.clear()

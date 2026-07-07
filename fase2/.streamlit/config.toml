@@ -1,0 +1,12 @@
+# このファイルはリポジトリルートの .streamlit/config.toml と内容を同期させること
+# (ローカル実行はこのファイル、Streamlit Community Cloudはcwdがリポジトリルートなためルートのファイルが効く)
+
+[theme]
+base = "light"
+primaryColor = "#4C72B0"
+backgroundColor = "#F5F6F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2430"
+
+[client]
+toolbarMode = "minimal"

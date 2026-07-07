@@ -547,13 +547,15 @@ S_稼働低さ = 基準値に対する「低さ」を正規化(逆数方向)
 
 `st.set_page_config`は`app.py`側で1回のみ実行し、`app_top.py`/`app_a.py`/`app_b.py`はモジュールトップレベルにst呼び出しを持たない関数(`render()`/`render(hole_name)`/`render_overview()`+`render_store_detail()`)として画面本体を公開する(fase3の`streamlit_app.py`が`app`モジュールだけをreloadする前提を維持)。**単体起動(`streamlit run app_a.py`等)は廃止**(Streamlitエントリポイントは`app.py`のみ。機能B-簡潔のテキストメモ`python app_b.py`は維持)。
 
+**モバイルファーストUI(`ui_theme.py`、2026-07追加)**: iPhone Safari前提のHoYoLAB風カードUI(薄グレー地+白の角丸カード+ピル型ボタン+1カラム+アクセント色`#4C72B0`)への改修で新設した表示層の共通モジュール。`inject_css()`(`app.py`が起動時に1回呼ぶ。`layout='centered'`・`max-width:680px`中央寄せ・角丸カード・ピルボタン・input系16px以上のCSSを注入)と`apply_mobile_layout(fig, height=None, show_colorbar=False)`(全チャート共通のPlotlyレイアウト調整。`title=None`・凡例横型下配置・`dragmode=False`でページスクロールを阻害しない・`show_colorbar=False`時はカラーバー非表示で横幅確保)、`short_label(s, max_len=14)`(長いラベルの…省略)を提供する。全チャート(app_top×2・app_a×5・app_b×4の計11箇所)は`ui.apply_mobile_layout(fig, height=…)` → `st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)`の順で呼び出す規約に統一。機能(データ・計算ロジック)には一切関与しない表示層のみの変更。テーマ色(`primaryColor`等)は`fase2/.streamlit/config.toml`(ローカル実行用)とリポジトリルート`.streamlit/config.toml`(Streamlit Community Cloud用。cwdがリポジトリルートなためこちらが効く)の2ファイルに同一内容を維持する(相互コピー同期。詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照)。
+
 **機能B再設計(2026-07議論・Phase1〜5実装済み、Phase6は将来項目)**:
 
 - **Phase1: `pattern_history`テーブル**(下記データモデル参照)— `store_profile`が最新1行のみ保持するのに対し、`run_store_profile.py`実行のたびに追記のみで積み上げる検知期間履歴用テーブル
 - **Phase2: 符号付きスコア拡張** — 幅型(上記patterns.py参照)・深さ型(S_鉄板台、上記参照)の符号付き化と、`score.synthesize()`/`app_b.py`の信頼度重み減衰(有効重み=weights×reliabilities)。`狙い目度`のレンジは`[0,1]`から`[-1,1]`に変更。`app_b.py`の表示レンジ(`range_x=[-1,1]`)・色スケール(発散配色`RdBu`、中央0)も追随済み
 - **Phase3: Stage7-0〜7-2**(上記patterns.py「S_鉄板台の翌日予測」参照) — `predict_next_day`・`prediction_log`・`evaluate_predictions.py`
 - **Phase4: トップページ**(`app_top.py`) — 店舗ランキング・当日の熱い台は`app_b.py`の既存実装を再利用(二重実装回避のため`load_weights`等の関数を公開関数に改名済み)。翌日予測ランキングは`prediction_log`の最新行をそのまま表示(その場での再計算はしない。リークの心配がなくノイジーOR統合の二重実装も避けられる)。的中率は`prediction_accuracy`を読むだけで、的中率・信頼度が低くても非表示にしない方針
-- **Phase5: 店舗プロファイル拡張**(`app_b.py`、現`render_store_detail()`) — 検知期間履歴(`pattern_history`から「スコア>0」の連続区間を軽量な後処理で検出。統計検定の再実行はしない近似表示)・当月カレンダーヒートマップ2層(統合スコア日次平均`YlOrRd`+パターン別内訳`RdBu`、タブ切替)。カレンダーヒートマップは機能Aには追加せず機能Bのみに実装(機能Aは生データ寄りの手動比較ツールという役割を維持するため)
+- **Phase5: 店舗プロファイル拡張**(`app_b.py`、現`render_store_detail()`) — 検知期間履歴(`pattern_history`から「スコア>0」の連続区間を軽量な後処理で検出。統計検定の再実行はしない近似表示)・当月カレンダーヒートマップ(統合スコア日次平均`YlOrRd`+パターン別内訳`RdBu`。2026-07のモバイルUI改修で「月」「表示項目(統合スコア日次平均+パターン別)」の2 selectboxに切替、選択1枚のみ描画。旧`st.tabs`(パターン数分・最大7個)は廃止)。カレンダーヒートマップは機能Aには追加せず機能Bのみに実装(機能Aは生データ寄りの手動比較ツールという役割を維持するため)
 - **Phase6(将来項目)**: Stage7-4(ウォークフォワードα学習への置き換え)・Stage7-5(S_ローテ・S_据え置きの非該当日判定・翌日予測拡張)。詳細は[`今後の実装予定.md`](今後の実装予定.md)参照
 
 **store_profile/stage3_scoresの前提(`run_store_profile.py`、2026-07追加・同月改修)**: 機能B(詳細/簡潔とも)は分析DB(`ホールデータ/analysis.db`)の`store_profile`テーブルを読むだけで、自らpreprocess→patterns→scoreパイプラインを実行しない。新規に取り込んだ店舗はこのテーブルが未作成のため機能Bに表示されない。`python run_store_profile.py`(全店舗一括)または`--hole <店舗名>`(特定店舗)でパイプラインを実行し、`stage3_scores`(Stage3出力の台×日スコア。`score.write_stage3_scores`が店舗単位で全削除→再挿入)と`store_profile`を作成・更新する。2026-07に[`fase4/`](../fase4/)(日次自動実行)を実装し、`fase4/run_daily.py`が全店舗一括を毎日自動実行するようになった。新規店舗取込時の即時反映等では引き続き手動実行も可能。

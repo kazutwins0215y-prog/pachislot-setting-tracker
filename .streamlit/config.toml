@@ -1,0 +1,12 @@
+# このファイルは fase2/.streamlit/config.toml と内容を同期させること
+# (Streamlit Community Cloudはcwdがリポジトリルートなためこちらのファイルが効く。ローカル実行はfase2側が効く)
+
+[theme]
+base = "light"
+primaryColor = "#4C72B0"
+backgroundColor = "#F5F6F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2430"
+
+[client]
+toolbarMode = "minimal"
