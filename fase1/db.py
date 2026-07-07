@@ -3,8 +3,11 @@ import logging
 from pathlib import Path
 
 import libsql
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 
 # Turso埋め込みレプリカ(SQLite互換のローカルファイル)。
 # 書き込みはTurso(プライマリ)へ委譲され、sync()でこのファイルに最新状態が反映される。
