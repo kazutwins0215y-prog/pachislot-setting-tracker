@@ -144,7 +144,7 @@ def view_store_summary(df: pd.DataFrame) -> None:
     )
 
     st.markdown('**月ごとの累計差枚**')
-    fig = px.bar(monthly, x='月', y='月間累計差枚', color_discrete_sequence=['#4C72B0'])
+    fig = px.bar(monthly, x='月', y='月間累計差枚', color_discrete_sequence=[ui.ACCENT])
     _apply_jp_yaxis(fig, monthly['月間累計差枚'].tolist())
     ui.apply_mobile_layout(fig, height=320)
     st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
@@ -155,15 +155,15 @@ def view_store_summary(df: pd.DataFrame) -> None:
     plot = plot.sort_values('日付').copy()
     plot['累計差枚'] = plot['合計差枚'].cumsum()
     st.markdown(f'**累計差枚推移 — {sel_month}**')
-    fig2 = px.line(plot, x='日付', y='累計差枚', markers=True, color_discrete_sequence=['#4C72B0'])
+    fig2 = px.line(plot, x='日付', y='累計差枚', markers=True, color_discrete_sequence=[ui.ACCENT])
     cum = plot['累計差枚'].dropna()
     y_min2 = float(cum.min()) if not cum.empty else 0.0
     y_max2 = float(cum.max()) if not cum.empty else 0.0
     if y_min2 < 0:
-        fig2.add_hrect(y0=y_min2 * 1.1, y1=0, fillcolor='rgba(220,80,80,0.13)', layer='below', line_width=0)
+        fig2.add_hrect(y0=y_min2 * 1.1, y1=0, fillcolor='rgba(220,80,80,0.16)', layer='below', line_width=0)
     if y_max2 > 0:
-        fig2.add_hrect(y0=0, y1=y_max2 * 1.1, fillcolor='rgba(60,180,100,0.13)', layer='below', line_width=0)
-    fig2.add_hline(y=0, line_color='rgba(0,0,0,0.75)', line_width=2.5)
+        fig2.add_hrect(y0=0, y1=y_max2 * 1.1, fillcolor='rgba(60,180,100,0.16)', layer='below', line_width=0)
+    fig2.add_hline(y=0, line_color=ui.ZERO_LINE, line_width=2.5)
     fig2.update_xaxes(tickformat='%Y/%m/%d')
     _apply_jp_yaxis(fig2, cum.tolist())
     ui.apply_mobile_layout(fig2, height=320)
@@ -226,11 +226,13 @@ def _apply_xaxis_date_fmt(fig, agg: pd.DataFrame, period: str = '') -> None:
     if period == '1週間' and '日付' in agg.columns:
         dates = sorted(pd.to_datetime(agg['日付'].dropna().unique()))
         if dates:
+            step = max(1, math.ceil(len(dates) / 7))
+            shown = dates[::step]
             fig.update_xaxes(
-                tickvals=dates,
+                tickvals=shown,
                 ticktext=[
-                    f"{d.strftime('%Y/%m/%d')}({_WEEKDAY_JP[d.dayofweek]})"
-                    for d in dates
+                    f"{d.strftime('%m/%d')}({_WEEKDAY_JP[d.dayofweek]})"
+                    for d in shown
                 ],
             )
             return
@@ -246,14 +248,14 @@ def _apply_chart_style(fig, agg: pd.DataFrame, y_col: str, period: str = '') -> 
     if y_min < 0:
         fig.add_hrect(
             y0=y_min * 1.1, y1=0,
-            fillcolor='rgba(220,80,80,0.09)', layer='below', line_width=0,
+            fillcolor='rgba(220,80,80,0.12)', layer='below', line_width=0,
         )
     if y_max > 0:
         fig.add_hrect(
             y0=0, y1=y_max * 1.1,
-            fillcolor='rgba(60,180,100,0.09)', layer='below', line_width=0,
+            fillcolor='rgba(60,180,100,0.12)', layer='below', line_width=0,
         )
-    fig.add_hline(y=0, line_color='rgba(0,0,0,0.45)', line_width=1.5)
+    fig.add_hline(y=0, line_color='rgba(255,255,255,0.4)', line_width=1.5)
     _apply_xaxis_date_fmt(fig, agg, period)
     _apply_jp_yaxis(fig, agg[y_col].tolist())
 

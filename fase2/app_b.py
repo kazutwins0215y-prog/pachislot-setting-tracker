@@ -434,7 +434,7 @@ def render_overview(profiles: pd.DataFrame) -> None:
             fig = px.bar(
                 bar_df, x='スコア', y='ホール名', orientation='h',
                 color=color_col,
-                color_continuous_scale='Blues',
+                color_continuous_scale=ui.SEQ_BLUE,
                 range_x=[-1, 1],
             )
             ui.apply_mobile_layout(fig, height=max(280, len(bar_df) * 42 + 80))
@@ -457,7 +457,7 @@ def render_overview(profiles: pd.DataFrame) -> None:
             disp_data = heat_data.rename(columns=lambda c: c[2:] if c.startswith('S_') else c)
             fig_heat = px.imshow(
                 disp_data,
-                color_continuous_scale='RdBu',
+                color_continuous_scale=ui.DIVERGING,
                 labels=dict(x='サブスコア', y='ホール名', color='スコア'),
                 zmin=-1, zmax=1,
                 aspect='auto',
@@ -500,7 +500,7 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
         fig_bar = px.bar(
             valid,
             x='スコア', y='表示名', orientation='h',
-            color='信頼度', color_continuous_scale='Blues',
+            color='信頼度', color_continuous_scale=ui.SEQ_BLUE,
             range_x=[-1, 1],
         )
         ui.apply_mobile_layout(fig_bar, height=max(280, len(valid) * 45 + 80))
@@ -609,8 +609,8 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
                 z, text = _month_grid(daily_avg.to_dict(), year, month)
                 fig_cal = go.Figure(data=go.Heatmap(
                     z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
-                    text=text, texttemplate='%{text}', textfont=dict(size=11),
-                    colorscale='YlOrRd', zmin=0.0, zmax=1.0,
+                    text=text, texttemplate='%{text}', textfont=dict(size=11, color=ui.TEXT),
+                    colorscale=ui.SEQ_WARM, zmin=0.0, zmax=1.0,
                     hoverongaps=False,
                 ))
                 ui.apply_mobile_layout(fig_cal, height=280)
@@ -624,10 +624,12 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
             else:
                 score_map = pattern_daily.loc[pattern_key].to_dict()
                 z2, text2 = _month_grid(score_map, year, month)
+                # DIVERGINGは中間点が白のため、白文字(ui.TEXT)だと0付近のセルで読めなくなる。
+                # 濃色文字はcard_bg〜赤/青の全域で3:1以上のコントラストを確保できるためこちらを使う。
                 fig_pat = go.Figure(data=go.Heatmap(
                     z=z2, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z2.shape[0])],
-                    text=text2, texttemplate='%{text}', textfont=dict(size=11),
-                    colorscale='RdBu', zmid=0.0, zmin=-1.0, zmax=1.0,
+                    text=text2, texttemplate='%{text}', textfont=dict(size=11, color=ui.CARD_BG),
+                    colorscale=ui.DIVERGING, zmid=0.0, zmin=-1.0, zmax=1.0,
                     hoverongaps=False,
                 ))
                 ui.apply_mobile_layout(fig_pat, height=280)

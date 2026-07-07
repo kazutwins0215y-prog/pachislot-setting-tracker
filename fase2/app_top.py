@@ -187,7 +187,7 @@ def render() -> None:
         ranked = synth_df.sort_values('合成スコア', ascending=True)
         fig = px.bar(
             ranked, x='合成スコア', y='ホール名', orientation='h',
-            color='合成スコア', color_continuous_scale='RdBu',
+            color='合成スコア', color_continuous_scale=ui.DIVERGING,
             range_x=[-1, 1], range_color=[-1, 1],
         )
         ui.apply_mobile_layout(fig, height=max(280, len(ranked) * 32 + 80))
@@ -248,19 +248,23 @@ def render() -> None:
     if not top_pred.empty:
         top_pred = top_pred.copy()
         top_pred['短縮ラベル'] = top_pred.apply(
-            lambda r: f"{ui.short_label(r['ホール名'], 8)} {ui.short_label(r['機種名'], 10)} {int(r['台番号'])}番",
+            lambda r: '<br>'.join([
+                ui.wrap_label(r['ホール名'], 12),
+                ui.wrap_label(r['機種名'], 12),
+                f"{int(r['台番号'])}番",
+            ]),
             axis=1,
         )
         fig_pred = px.bar(
             top_pred.sort_values('ブレンド値'), x='ブレンド値', y='短縮ラベル', orientation='h',
-            color='ブレンド値', color_continuous_scale='RdBu',
+            color='ブレンド値', color_continuous_scale=ui.DIVERGING,
             range_x=[-1, 1], range_color=[-1, 1],
             custom_data=['ホール名', '台'],
         )
         fig_pred.update_traces(
             hovertemplate='%{customdata[0]} / %{customdata[1]}<br>ブレンド値: %{x:.3f}<extra></extra>'
         )
-        ui.apply_mobile_layout(fig_pred, height=max(280, len(top_pred) * 32 + 80))
+        ui.apply_mobile_layout(fig_pred, height=max(280, len(top_pred) * 62 + 80))
         st.plotly_chart(fig_pred, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
     disp_pred = pred_df.sort_values('ブレンド値', ascending=False).copy()
