@@ -616,6 +616,13 @@ S_稼働低さ = 基準値に対する「低さ」を正規化(逆数方向)
 SELECTするだけで済むようにするための追加(`score._ensure_stage3_scores_schema`が
 `PRAGMA table_info`方式でALTER TABLEするマイグレーション。既存行はNULLのまま)。
 
+**注意(2026-07-08判明)**: この`_ensure_stage3_scores_schema`は**ローカル**`analysis.db`のみを
+マイグレーションする。分析用Turso(クラウド側)のテーブルは追従しないため、`stage3_scores`等
+analysis.dbの6テーブルに列を追加・変更した場合は、`fase3/upload_analysis.py`を**次回に限り
+`--full`で実行する**運用ルールを忘れないこと(差分upsertのままだと列数不一致でクラウド反映が
+失敗し続ける)。手順は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)「アルゴリズム変更時の
+`--full`実行手順」参照。
+
 ### `store_profile` テーブル（analysis.db、`score.update_store_profile`が更新）
 
 | カラム | 型 | 内容 |
