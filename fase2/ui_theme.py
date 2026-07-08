@@ -153,3 +153,15 @@ def style_signed(df, cols: list[str]):
     styler = df.style
     style_fn = styler.map if hasattr(styler, 'map') else styler.applymap
     return style_fn(_color, subset=cols)
+
+
+def style_stale_rows(styler, stale_mask: pd.Series):
+    """
+    stale_maskがTrueの行を薄いグレー文字色にする(2026-07-08タスク1: 予測の対象日が
+    最新と異なる=猶予内の古い行であることを、対象日列を読まなくても気づけるようにする)。
+    style_signed等より後に適用すると、対象行の着色を上書きしてグレーで統一される。
+    """
+    def _dim(row):
+        return [f'color: {TEXT_SUB}' if stale_mask.loc[row.name] else '' for _ in row]
+
+    return styler.apply(_dim, axis=1)

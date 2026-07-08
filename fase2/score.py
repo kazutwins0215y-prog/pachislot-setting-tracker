@@ -653,6 +653,13 @@ def _ensure_store_profile_schema(con: sqlite3.Connection) -> None:
         con.execute('ALTER TABLE store_profile ADD COLUMN 上限キャリブレーション値 REAL')
     if '上限信頼度' not in cols:
         con.execute('ALTER TABLE store_profile ADD COLUMN 上限信頼度 REAL')
+    # [2026-07 タスク3追記(c)] 店舗の癖(据え/上げ/下げ)を遷移行列(長期版)から保存する4列。
+    # gamma_store等と同じ「店舗スカラーを全行に複製」方式(縦持ち構造は変えない)。
+    for col in ['遷移_ベース率', '遷移_p_stay', '遷移_p_up']:
+        if col not in cols:
+            con.execute(f'ALTER TABLE store_profile ADD COLUMN "{col}" REAL')
+    if '遷移_ペア数' not in cols:
+        con.execute('ALTER TABLE store_profile ADD COLUMN 遷移_ペア数 INTEGER')
 
 
 def update_store_profile(
@@ -662,20 +669,31 @@ def update_store_profile(
     gamma_store: float | None = None,
     uplimit_value: float | None = None,
     uplimit_reliability: float | None = None,
+    transition_matrix_long: dict | None = None,
 ) -> None:
     """
     store_profile テーブルを最新サブスコア・信頼度で上書き更新する。
     gamma_store は multi_store.py で学習された値(未学習時はNone)。
     uplimit_value/uplimit_reliability は compute_uplimit() の出力
     (店舗高設定上限モデル Step1。未計算時はNone)。
+    transition_matrix_long は patterns.estimate_transition_matrix()の戻り値(長期版、
+    キー: pi, p_stay, p_up, n_pairs)。ペア数不足でNoneの店舗は遷移4列ともNULLになる
+    (2026-07 タスク3追記(c)。店舗の癖(据え/上げ/下げ)を記録。表示UIは別タスク)。
 
     テーブル構造:
       ホール名 TEXT, パターン TEXT, スコア REAL,
       信頼度 REAL, gamma_store REAL,
-      上限キャリブレーション値 REAL, 上限信頼度 REAL, 更新日時 TEXT
+      上限キャリブレーション値 REAL, 上限信頼度 REAL,
+      遷移_ベース率 REAL, 遷移_p_stay REAL, 遷移_p_up REAL, 遷移_ペア数 INTEGER,
+      更新日時 TEXT
       PRIMARY KEY (ホール名, パターン)
     """
     now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    m = transition_matrix_long or {}
+    trans_pi = m.get('pi')
+    trans_p_stay = m.get('p_stay')
+    trans_p_up = m.get('p_up')
+    trans_n_pairs = m.get('n_pairs')
     rows = []
 
     for pattern, score_col in _PATTERN_MAP.items():
@@ -686,7 +704,9 @@ def update_store_profile(
         reliability = compute_reliability(df_scored, score_col)
         rows.append((
             hole_name, pattern, score_val, reliability, gamma_store,
-            uplimit_value, uplimit_reliability, now,
+            uplimit_value, uplimit_reliability,
+            trans_pi, trans_p_stay, trans_p_up, trans_n_pairs,
+            now,
         ))
 
     if not rows:
@@ -699,8 +719,9 @@ def update_store_profile(
             '''
             INSERT OR REPLACE INTO store_profile
                 (ホール名, パターン, スコア, 信頼度, gamma_store,
-                 上限キャリブレーション値, 上限信頼度, 更新日時)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 上限キャリブレーション値, 上限信頼度,
+                 遷移_ベース率, 遷移_p_stay, 遷移_p_up, 遷移_ペア数, 更新日時)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             rows,
         )

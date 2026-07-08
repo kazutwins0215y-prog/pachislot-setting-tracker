@@ -5,8 +5,8 @@ patterns.py — イベント検出・パターンスコア・αブレンド
     K=0前日比較で移動/撤去/増台イベントを検出
 幅型パターン (score_zentaiki / score_shintai / score_idoudai):
     S_全台系 / S_新台増台 / S_移動台 — 1日分データで検出可能
-深さ型パターン (score_teppandai / score_rotation / score_sueki):
-    S_鉄板台(ACF→PDM→Lomb-Scargle / カレンダー検定) / S_ローテ / S_据え置き
+深さ型パターン (score_teppandai / score_rotation / score_sueki_daily):
+    S_鉄板台(ACF→PDM→Lomb-Scargle / カレンダー検定) / S_ローテ / S_据え置き(日次判定)
 αブレンド (blend / walk_forward_alpha / learn_all_alphas):
     長期/短期サブスコアのウォークフォワードα学習
     対象: S_全台系・S_鉄板台・S_ローテ・S_据え置き
@@ -830,7 +830,10 @@ def estimate_transition_matrix(df: pd.DataFrame, hole_name: str) -> dict | None:
     eps = 1e-6  # 0/1に張り付くと予測が定数化するため内側にクリップ
     p_stay = float(np.clip((p_prev * p_curr).sum() / denom_hi, eps, 1.0 - eps))
     p_up = float(np.clip(((1.0 - p_prev) * p_curr).sum() / denom_lo, eps, 1.0 - eps))
-    return {'p_stay': p_stay, 'p_up': p_up, 'n_pairs': n_pairs}
+    # [2026-07 タスク3追記(c)] ベース率pi = ペア集合のp_prev平均(ソフトカウントと同じ
+    # 集合で定義)。store_profileの店舗の癖(据え/上げ/下げ)保存で使う(データ分析_skill.md参照)。
+    pi = float(np.clip(p_prev.mean(), eps, 1.0 - eps))
+    return {'p_stay': p_stay, 'p_up': p_up, 'n_pairs': n_pairs, 'pi': pi}
 
 
 def predict_transition_next_day(p_today: float, matrix: dict) -> float:
@@ -858,6 +861,36 @@ def predict_transition_with_blend(
 
     long_pred = predict_transition_next_day(p_today, matrix_long) if matrix_long else None
     short_pred = predict_transition_next_day(p_today, matrix_short) if matrix_short else None
+
+    if long_pred is None and short_pred is None:
+        return {'長期スコア': None, '短期スコア': None, 'ブレンド値': None, '使用alpha': None}
+    if long_pred is None:
+        return {'長期スコア': None, '短期スコア': short_pred, 'ブレンド値': short_pred, '使用alpha': 1.0}
+    if short_pred is None:
+        return {'長期スコア': long_pred, '短期スコア': None, 'ブレンド値': long_pred, '使用alpha': 0.0}
+
+    blended = alpha * short_pred + (1.0 - alpha) * long_pred
+    return {'長期スコア': long_pred, '短期スコア': short_pred, 'ブレンド値': blended, '使用alpha': alpha}
+
+
+def predict_sueki_with_blend(
+    r_long: float | None,
+    r_short: float | None,
+    deviation: float,
+    alpha: float = None,
+) -> dict:
+    """
+    [2026-07 タスク3] S_据え置きの翌日投影 = r̄_t ×(当日high_probの台基準からの偏差)を
+    長期版(全履歴のr̄_t)・短期版(直近SHORT_WINDOW_DEFAULT日窓のr̄_t)でブレンドする。
+    r_long/r_shortはsueki_daily_rの最終日値(NaNなら計算不可としてNoneで渡す)。
+    predict_next_day_with_blend/predict_transition_with_blendと同じブレンド規約
+    (短期不可=alpha実質0)。deviationは長期/短期で共通(同一日の値のため)。
+    """
+    if alpha is None:
+        alpha = FIXED_ALPHA
+
+    long_pred = r_long * deviation if r_long is not None else None
+    short_pred = r_short * deviation if r_short is not None else None
 
     if long_pred is None and short_pred is None:
         return {'長期スコア': None, '短期スコア': None, 'ブレンド値': None, '使用alpha': None}
@@ -947,11 +980,49 @@ def score_rotation(
     return scores
 
 
-def score_sueki(df: pd.DataFrame) -> pd.Series:
+# [2026-07 タスク3] 据え置き日次判定の暫定パラメータ(実データで調整前提)。
+SUEKI_WINDOW = 14           # 日次r_tを計算する直近K日窓
+SUEKI_EWMA_SPAN = 7         # r_t平滑化のEWMA span
+SUEKI_MIN_PAIRS = 8         # 14日窓(最大13ペア)内の最低有効ペア数。10だと窓の約8割充足が
+                             # 必要でNaNが増えすぎるため緩和(実測: 足切り8→NaN率20.5%/足切り10→30.7%)
+SUEKI_DAILY_THRESHOLD = 0.2  # 平滑後r̄_tがこの値以上の日を「据え置き該当日」とみなす
+
+
+def sueki_daily_r(hp: pd.Series) -> np.ndarray:
     """
-    S_据え置き: Stage3スコアのlag-1自己相関(0〜1)。
-    正の自己相関 = 前日と同傾向の高設定が続いている(据え置き)。
-    履歴10日未満の台は NaN(検出不可扱い)。
+    S_据え置き(日次版)の生の平滑化lag-1自己相関r̄_tを日ごとに計算する。
+    台ごとの直近SUEKI_WINDOW日窓でlag-1自己相関を計算し(窓内の有効ペアが
+    SUEKI_MIN_PAIRS未満の日はNaN)、EWMA(span=SUEKI_EWMA_SPAN)で平滑化する。
+
+    符号変換(score_sueki_dailyの閾値判定)前の生の値。_run_sueki_predictions
+    (run_store_profile.py)の翌日投影の乗数としても共用する(両者で二重実装しないため)。
+    """
+    x = hp.reset_index(drop=True).astype(float)
+    n = len(x)
+    if n < 2:
+        return np.full(n, np.nan)
+
+    x1 = x.iloc[:-1].reset_index(drop=True)
+    x2 = x.iloc[1:].reset_index(drop=True)
+    # 窓幅(K-1ペア)のrolling.corrはpairwise-complete(NaNペアはmin_periods判定から除外)
+    pair_r = x1.rolling(window=SUEKI_WINDOW - 1, min_periods=SUEKI_MIN_PAIRS).corr(x2)
+
+    r_raw = np.full(n, np.nan)
+    r_raw[1:] = pair_r.values  # ペアpは日p+1に対応
+
+    r_smoothed = pd.Series(r_raw).ewm(span=SUEKI_EWMA_SPAN, min_periods=1).mean()
+    return r_smoothed.values
+
+
+def score_sueki_daily(df: pd.DataFrame) -> pd.Series:
+    """
+    S_据え置き(日次版): 平滑化lag-1自己相関r̄_tがSUEKI_DAILY_THRESHOLD以上の日を
+    該当日(正スコア=+r̄_t)、それ未満の日を切断(負スコア)とする、S_鉄板台と同じ
+    符号規約([-1,1]・負=非該当日)のスコア。履歴不足でr̄_tが計算できない日はNaN。
+
+    [2026-07 タスク3] 旧score_sueki(台単位で全期間1定数)からの差し替え。店舗の
+    「据え置き癖」指標としての役割はestimate_transition_matrixのpi/p_stay由来の
+    値に譲る(データ分析_skill.md参照)。
     """
     scores = pd.Series(np.nan, index=df.index)
     for (hole, machine, unit), grp in df.groupby(['ホール名', '機種名', '台番号'], sort=False):
@@ -959,19 +1030,21 @@ def score_sueki(df: pd.DataFrame) -> pd.Series:
         hp = grp_sorted['high_prob'].copy()
         if 'is_invalid' in grp_sorted.columns:
             hp[grp_sorted['is_invalid'].fillna(True).values] = np.nan
-        x = hp.values.astype(float)
-        x1, x2 = x[:-1], x[1:]
-        valid = ~(np.isnan(x1) | np.isnan(x2))
-        if int(valid.sum()) < 10:
-            continue
-        v1, v2 = x1[valid], x2[valid]
-        if np.std(v1) == 0 or np.std(v2) == 0:
-            continue
-        try:
-            r, _ = stats.pearsonr(v1, v2)
-        except Exception:
-            continue
-        scores.loc[grp_sorted.index] = float(max(0.0, r))
+
+        r_bar = sueki_daily_r(hp)
+        # 負側はr̄_t=0で-1に飽和する暫定式。店舗が日次ほぼ無記憶(r̄≈0)の実態では大半の日が
+        # -1近傍になり店舗平均s_suekiが大きく負に沈むが、prediction_accuracyの成績を見てから
+        # 調整する方針で現状維持と決定(2026-07-08。調整候補: NEGATIVE_SCALE乗算での緩和)
+        signed = np.where(
+            np.isnan(r_bar),
+            np.nan,
+            np.where(
+                r_bar >= SUEKI_DAILY_THRESHOLD,
+                r_bar,
+                -np.minimum(1.0, (SUEKI_DAILY_THRESHOLD - r_bar) / SUEKI_DAILY_THRESHOLD),
+            ),
+        )
+        scores.loc[grp_sorted.index] = signed
     return scores
 
 
@@ -989,7 +1062,7 @@ def compute_depth_scores(df: pd.DataFrame, teppan_details: list | None = None) -
         rotation[mask] = score_rotation(out, machine).reindex(out.index[mask])
     out['S_鉄板台'] = teppan
     out['S_ローテ'] = rotation
-    out['S_据え置き'] = score_sueki(out)
+    out['S_据え置き'] = score_sueki_daily(out)
     return out
 
 
@@ -1027,7 +1100,7 @@ def compute_short_term_score(
             rotation.update(s)
         short_scores = rotation
     elif score_col == 'S_据え置き':
-        short_scores = score_sueki(short_df)
+        short_scores = score_sueki_daily(short_df)
     else:
         return result
 

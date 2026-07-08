@@ -38,18 +38,32 @@ _WEEKDAY_LABELS = ['月', '火', '水', '木', '金', '土', '日']
 # 7タブの暫定閾値(実データ運用しながら調整する前提。fase2/今後の実装予定.md参照)
 _RELIABILITY_GATE = 0.4     # ローテ/新台増台/移動台/据え置きタブの店舗単位信頼度ゲート
 _BREADTH_SCORE_GATE = 0.3   # 新台増台/移動台タブの台単位スコアしきい値
-_SUEKI_SCORE_GATE = 0.5     # 据え置きタブの台単位スコアしきい値
+# [2026-07 タスク3] S_据え置きが「全期間1定数(0〜1)」から「当日断面の符号付き値([-1,1]、
+# 該当日は+r̄_t≧patterns.SUEKI_DAILY_THRESHOLD(暫定0.2))」に変わったため、0.5では
+# ほぼ該当日を拾えなくなる。該当日は必ずSUEKI_DAILY_THRESHOLD以上になる仕様なので、
+# 実質「該当日のみ」を意味する0.0超に暫定変更(実データで調整前提)。
+_SUEKI_SCORE_GATE = 0.0     # 据え置きタブの台単位スコアしきい値
+
+# 予測鮮度の猶予日数(暫定)。run_store_profile.pyの実行間隔が空いた店舗(fase4異常停止時など)の
+# 古い予測が最新予測と混在しないよう、個別台/機種タブ(prediction_log由来)にのみ適用する。
+_PREDICTION_STALE_GRACE_DAYS = 2
 
 
 # ── データ読み込み ────────────────────────────────────────────────
 
 
-def _load_latest_predictions(analysis_db: str) -> pd.DataFrame:
+def _load_latest_predictions(analysis_db: str) -> tuple[pd.DataFrame, dict]:
     """
     prediction_log から (ホール名, 機種名, 台番号) ごとの最新行(実行日時が最大)を返す。
     prediction_logはappend-onlyのため、同じ台について複数回分の予測が積み上がる。
     表示するのは直近の run_store_profile.py 実行で計算された最新予測のみ。
+
+    fase4の実行間隔が空いた店舗(異常停止時など)の古い予測が最新予測と混在しないよう、
+    グローバル最新対象日(ロード済み行の対象日最大値。_load_target_dateと同じ定義)から
+    _PREDICTION_STALE_GRACE_DAYS日より古い行は除外する(タスク1)。
+    戻り値の2つ目は空表示判定に使う付随情報(global_latest_date/excluded_holes/all_holes)。
     """
+    empty_info = {'global_latest_date': None, 'excluded_holes': set(), 'all_holes': set()}
     try:
         con = sqlite3.connect(analysis_db)
         try:
@@ -57,20 +71,36 @@ def _load_latest_predictions(analysis_db: str) -> pd.DataFrame:
                 "SELECT name FROM sqlite_master WHERE type='table'", con
             )['name'].tolist()
             if 'prediction_log' not in tables:
-                return pd.DataFrame()
+                return pd.DataFrame(), empty_info
             df = pd.read_sql_query(
                 "SELECT * FROM prediction_log WHERE 予測種別 = 'S_鉄板台'", con
             )
         finally:
             con.close()
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(), empty_info
 
     if df.empty:
-        return df
+        return df, empty_info
+
+    df['対象日_dt'] = pd.to_datetime(df['対象日'])
+    global_latest_dt = df['対象日_dt'].max()
 
     latest_idx = df.groupby(['ホール名', '機種名', '台番号'])['実行日時'].idxmax()
-    return df.loc[latest_idx].reset_index(drop=True)
+    latest = df.loc[latest_idx].reset_index(drop=True)
+    latest['経過日数'] = (global_latest_dt - latest['対象日_dt']).dt.days
+
+    all_holes = set(latest['ホール名'])
+    fresh = latest[latest['経過日数'] <= _PREDICTION_STALE_GRACE_DAYS].reset_index(drop=True)
+    fresh = fresh.drop(columns=['対象日_dt'])
+    excluded_holes = all_holes - set(fresh['ホール名'])
+
+    info = {
+        'global_latest_date': global_latest_dt.strftime('%Y-%m-%d'),
+        'excluded_holes': excluded_holes,
+        'all_holes': all_holes,
+    }
+    return fresh, info
 
 
 def _load_prediction_accuracy(analysis_db: str) -> pd.DataFrame:
@@ -308,10 +338,12 @@ def _tab_individual(
         return None
     df = df.copy()
     df['台'] = df['機種名'] + ' ' + df['台番号'].astype(int).astype(str) + '番台'
+    df['鮮度'] = df['経過日数'].apply(lambda d: '' if pd.isna(d) or int(d) == 0 else f'{int(d)}日前')
     df['的中率'] = df.apply(
         lambda r: _accuracy_text(acc_lookup.get((r['ホール名'], r['予測種別']))), axis=1
     )
-    cols = (['ホール名'] if hole is None else []) + ['台', 'ブレンド値', '対象日', '的中率']
+    # 詳細はタスク2の根拠文生成に使う(表には出さず_render_prediction_tabsで剥がして表示する)
+    cols = (['ホール名'] if hole is None else []) + ['台', 'ブレンド値', '対象日', '鮮度', '的中率', '詳細']
     return df[cols].reset_index(drop=True)
 
 
@@ -326,16 +358,18 @@ def _tab_machine(
     if df.empty:
         return None
     grp = df.groupby(['ホール名', '機種名'], as_index=False).agg(
-        平均ブレンド値=('ブレンド値', 'mean'), 台数=('台番号', 'count')
+        平均ブレンド値=('ブレンド値', 'mean'), 台数=('台番号', 'count'),
+        経過日数=('経過日数', 'max'),  # 機種内で最も古い台の経過日数を代表値にする(グループ全体の鮮度注記用)
     )
     grp = grp.sort_values('平均ブレンド値', ascending=False).head(top_n)
     if grp.empty:
         return None
     grp = grp.copy()
+    grp['鮮度'] = grp['経過日数'].apply(lambda d: '' if pd.isna(d) or int(d) == 0 else f'{int(d)}日前')
     grp['的中率'] = grp['ホール名'].map(
         lambda h: _accuracy_text(acc_lookup.get((h, 'S_鉄板台')))
     )
-    cols = (['ホール名'] if hole is None else []) + ['機種名', '平均ブレンド値', '台数', '的中率']
+    cols = (['ホール名'] if hole is None else []) + ['機種名', '平均ブレンド値', '台数', '鮮度', '的中率']
     return grp[cols].reset_index(drop=True)
 
 
@@ -400,8 +434,11 @@ def _tab_sueki(
 ) -> pd.DataFrame | None:
     """
     据えタブ: S_据え置きが閾値超かつ店舗の's_sueki'信頼度が閾値以上の台を上位N件。
-    元プランの「周期条件を満たす場合のみ」は、score_sueki(lag-1自己相関)に離散的な
-    周期検出が存在しないため不採用(スコア閾値のみで判定。今後の実装予定.md参照)。
+
+    [2026-07 タスク3] S_据え置きはpatterns.score_sueki_daily(日次判定)に差し替え済み。
+    直近K日窓の平滑化lag-1自己相関r̄_tがSUEKI_DAILY_THRESHOLD以上の日のみ正値(該当日)を
+    持つため、閾値超フィルタ(_SUEKI_SCORE_GATE)は実質「最新日が据え置き該当日の台」を
+    抽出する形になる(スコア閾値のみで判定。データ分析_skill.md参照)。
     """
     if 'S_据え置き' not in snapshot.columns:
         return None
@@ -422,6 +459,21 @@ def _tab_sueki(
     return df[cols].reset_index(drop=True)
 
 
+def _all_stale(hole: str | None, stale_info: dict | None) -> bool:
+    """
+    個別台/機種タブが空になった原因が「予測が古い(猶予落ち)」かどうかを判定する(タスク1の3点目)。
+    店舗指定時はその店舗の予測が全て猶予落ちしたか、全店舗横断時は該当店舗が1つも
+    残らなかった(全店舗が猶予落ちした)かで判定する。
+    """
+    if not stale_info or not stale_info.get('global_latest_date'):
+        return False
+    excluded = stale_info.get('excluded_holes') or set()
+    if hole is not None:
+        return hole in excluded
+    all_holes = stale_info.get('all_holes') or set()
+    return bool(all_holes) and excluded == all_holes
+
+
 def _render_prediction_tabs(
     hole: str | None,
     pred_df: pd.DataFrame,
@@ -429,6 +481,8 @@ def _render_prediction_tabs(
     snapshot: pd.DataFrame,
     reliabilities: dict,
     top_n: int,
+    stale_info: dict | None = None,
+    target_date: str | None = None,
 ) -> None:
     """7タブ(個別台/機種/ローテ/新台/増台/移動台/据え)を描画する。該当なしは st.info。"""
     import streamlit as st
@@ -451,10 +505,23 @@ def _render_prediction_tabs(
             build_fn, color_col = builders[name]
             result = build_fn()
             if result is None or result.empty:
-                st.info('該当なし')
+                if name in ('個別台', '機種') and _all_stale(hole, stale_info):
+                    st.info(f"予測が古いため非表示(最終対象日: {stale_info['global_latest_date']})")
+                else:
+                    st.info('該当なし')
                 continue
-            styled = ui.style_signed(result, [color_col]).format({color_col: '{:+.3f}'})
+            # 詳細列はタスク2の根拠文生成専用(個別台タブのみ)。表には出さない
+            display_df = result.drop(columns=['詳細']) if '詳細' in result.columns else result
+            styled = ui.style_signed(display_df, [color_col]).format({color_col: '{:+.3f}'})
+            if '鮮度' in display_df.columns:
+                styled = ui.style_stale_rows(styled, display_df['鮮度'] != '')
             st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            if name == '個別台' and '詳細' in result.columns:
+                for i, row in result.reset_index(drop=True).iterrows():
+                    row_date = row.get('対象日') or target_date
+                    reason = _reason_text(row.get('詳細'), row_date)
+                    st.caption(f"{i + 1}. {row['台']} — {reason}")
 
 
 # ── Streamlit エントリポイント: 熱い台予測 ──────────────────────────
@@ -478,7 +545,7 @@ def render_hot_predictions() -> None:
 
     with st.spinner('データ読み込み中...'):
         target_date = _load_target_date(analysis_db)
-        pred_df = _load_latest_predictions(analysis_db)
+        pred_df, stale_info = _load_latest_predictions(analysis_db)
         acc_df = _load_prediction_accuracy(analysis_db)
         snapshot = _load_latest_snapshot(analysis_db)
         reliabilities = _load_store_reliabilities(analysis_db)
@@ -490,7 +557,8 @@ def render_hot_predictions() -> None:
         for _, r in acc_df.iterrows():
             acc_lookup[(r['ホール名'], r['予測種別'])] = r
 
-    pred_holes = set(pred_df['ホール名']) if 'ホール名' in pred_df.columns else set()
+    # 猶予落ちで個別台/機種タブから除外された店舗も選択肢には残す(選択時に専用メッセージを出すため)
+    pred_holes = stale_info.get('all_holes') or set()
     snap_holes = set(snapshot['ホール名']) if 'ホール名' in snapshot.columns else set()
     holes = sorted(pred_holes | snap_holes)
 
@@ -506,7 +574,8 @@ def render_hot_predictions() -> None:
         )
         if sel_hole:
             _render_prediction_tabs(
-                sel_hole, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_PER_STORE
+                sel_hole, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_PER_STORE,
+                stale_info=stale_info, target_date=target_date,
             )
         else:
             st.caption('店舗を選択すると7タブで予測を表示します。')
@@ -516,5 +585,6 @@ def render_hot_predictions() -> None:
     # ── 6-2 全店舗横断の予測 ──
     st.subheader('全店舗横断の予測')
     _render_prediction_tabs(
-        None, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_CROSS_STORE
+        None, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_CROSS_STORE,
+        stale_info=stale_info, target_date=target_date,
     )
