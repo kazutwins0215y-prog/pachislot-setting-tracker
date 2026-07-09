@@ -21,6 +21,10 @@ Stage3スコア保存 (write_stage3_scores):
     S_鉄板台がどの条件(カレンダー候補/周期)で有意だったかを分析DBへ保存
     「明日は該当日か」の判断・機能B再設計のトップページ表示に使う
 
+日次スナップショット記録 (write_score_snapshot):
+    wᵢ(サブスコア重み)学習用の教師データを店舗×使用データ最終日の粒度でappend-only蓄積
+    (記録側のみ先行実装。学習側は蓄積後の別タスク)
+
 依存: patterns.py (各サブスコア列), preprocess.py (回転数列)
 """
 import sqlite3
@@ -622,6 +626,73 @@ def write_prediction_log(db_path: str, rows: list[dict]) -> None:
                 for r in rows
             ],
         )
+        con.commit()
+    finally:
+        con.close()
+
+
+_CREATE_SCORE_SNAPSHOT_SQL = f'''
+    CREATE TABLE IF NOT EXISTS score_snapshot (
+        実行日時         TEXT NOT NULL,
+        使用データ最終日 TEXT NOT NULL,
+        ホール名         TEXT NOT NULL,
+        {', '.join(f'"{c}" REAL' for c in SUB_SCORES)},
+        狙い目度_店舗平均 REAL,
+        有効重みJSON      TEXT,
+        PRIMARY KEY (ホール名, 使用データ最終日)
+    )
+'''
+
+
+def write_score_snapshot(
+    db_path: str,
+    hole_name: str,
+    last_date: str,
+    sub_score_means: dict[str, float | None],
+    target_mean: float | None,
+    effective_weights: dict[str, float],
+) -> None:
+    """
+    [2026-07 タスク5] wᵢ(サブスコア重み)学習用の日次スナップショットをappend-only蓄積する。
+
+    粒度は(ホール名, 使用データ最終日)で1行。値は「使用データ最終日の日次断面」の
+    店舗平均(全期間平均ではない。教師=翌日の店舗実測差枚率に対応する説明変数にする
+    ため、run_for_holeがsynthesize直後・最終日の行のみで計算して渡す)。
+    合成前のサブスコア別の値と実効重み(weights×reliabilities)を両方残す
+    (狙い目度だけでは重みを変えた再現学習ができないため)。
+
+    学習側(Spearman直接最大化・店舗別ゲート等)は蓄積後の別タスクで、本関数は記録のみ。
+    タスク3で S_据え置き が符号付き日次値に変わった後の値であることに注意
+    (店舗の癖としての解釈はstore_profileの遷移列を参照)。
+
+    [重複ガード] (ホール名, 使用データ最終日)が既存であればスキップする
+    (write_prediction_logと同型。fase4のcatchup/リトライで二重記録されないための防波堤)。
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_SCORE_SNAPSHOT_SQL)
+        found = con.execute(
+            'SELECT 1 FROM score_snapshot WHERE ホール名 = ? AND 使用データ最終日 = ? LIMIT 1',
+            (hole_name, last_date),
+        ).fetchone()
+        if found:
+            print(
+                f'  [write_score_snapshot] 既存のスナップショットと重複するためスキップ: '
+                f'{hole_name} / {last_date}'
+            )
+            return
+
+        now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        cols = ['実行日時', '使用データ最終日', 'ホール名', *SUB_SCORES, '狙い目度_店舗平均', '有効重みJSON']
+        col_list = ', '.join(f'"{c}"' for c in cols)
+        placeholders = ', '.join('?' * len(cols))
+        values = (
+            now, last_date, hole_name,
+            *[sub_score_means.get(c) for c in SUB_SCORES],
+            target_mean,
+            json.dumps(effective_weights, ensure_ascii=False),
+        )
+        con.execute(f'INSERT INTO score_snapshot ({col_list}) VALUES ({placeholders})', values)
         con.commit()
     finally:
         con.close()

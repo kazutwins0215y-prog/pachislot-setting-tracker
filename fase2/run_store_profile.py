@@ -127,7 +127,7 @@ def _run_transition_predictions(
     scored: 'pd.DataFrame',
     hole_name: str,
     analysis_db: str,
-) -> tuple[int, dict | None]:
+) -> tuple[int, int, dict | None]:
     """
     [Stage7-3] 遷移モデル(据え置き/上げ/下げ)による全台翌日予測をprediction_logへ追記する。
 
@@ -138,22 +138,32 @@ def _run_transition_predictions(
     リーク禁止: 使用するのは使用データ最終日以前のhigh_probのみ(実測差枚は渡さない)。
     入力は上限キャリブレーション補正後のhigh_prob(呼び出し位置で保証)。
 
-    Returns: (記録件数, 長期版遷移行列matrix_long。ペア数不足でNoneの場合あり)。
-    matrix_longは呼び出し元がupdate_store_profileへ渡し、店舗の癖(据え/上げ/下げ)を
-    store_profileに保存する(2026-07 タスク3追記(c))。
+    [2026-07 タスク4] 無条件版(予測種別='遷移予測')に加え、前日(t-1)の実測差枚が
+    店舗内上位2割かどうかで層別した条件付き版(予測種別='遷移予測_前日差枚')を
+    並走記録する。層間差が有意な店舗のみ(pt.estimate_transition_matrix_stratifiedの
+    '有意'フラグ)。無条件版はDELETE/UPDATEなしで従来どおり全店舗記録する
+    (採否はevaluate_predictions.pyの(ホール名,予測種別)別集計で対比較する運用)。
+    条件付き版に使う「当日の実測差枚」は使用データ最終日の確定値のみ
+    (翌日の値は一切使わないためリークではない)。
+
+    Returns: (無条件版の記録件数, 条件付き版の記録件数, 長期版遷移行列matrix_long。
+    ペア数不足でNoneの場合あり)。matrix_longは呼び出し元がupdate_store_profileへ渡し、
+    店舗の癖(据え/上げ/下げ)をstore_profileに保存する(2026-07 タスク3追記(c))。
     """
     matrix_long = pt.estimate_transition_matrix(scored, hole_name)
 
     all_dates = sorted(scored['日付'].dropna().unique())
     if not all_dates or matrix_long is None:
-        return 0, matrix_long  # ペア数不足(新規店舗など)は予測不可として記録しない
+        return 0, 0, matrix_long  # ペア数不足(新規店舗など)は予測不可として記録しない
     max_date = all_dates[-1]
     next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
 
     if len(all_dates) >= pt.SHORT_WINDOW_DEFAULT:
         cutoff = all_dates[-pt.SHORT_WINDOW_DEFAULT]
-        matrix_short = pt.estimate_transition_matrix(scored[scored['日付'] >= cutoff], hole_name)
+        short_df = scored[scored['日付'] >= cutoff]
+        matrix_short = pt.estimate_transition_matrix(short_df, hole_name)
     else:
+        short_df = scored.iloc[0:0]
         matrix_short = None
 
     last_day = scored[(scored['日付'] == max_date) & (scored['ホール名'] == hole_name)]
@@ -183,9 +193,56 @@ def _run_transition_predictions(
             '使用alpha': result['使用alpha'],
             '詳細': {**detail_common, '当日high_prob': p_today},
         })
-
     sc.write_prediction_log(analysis_db, rows)
-    return len(rows), matrix_long
+
+    # [2026-07 タスク4] 前日差枚条件付き版(並走ログ)。層間差が有意な店舗のみ追加記録。
+    strat_rows = []
+    strat_long = pt.estimate_transition_matrix_stratified(scored, hole_name)
+    if strat_long is not None and strat_long['有意']:
+        strat_short = (
+            pt.estimate_transition_matrix_stratified(short_df, hole_name)
+            if not short_df.empty else None
+        )
+        threshold_today = pt.stratify_threshold_by_date(scored, hole_name).get(max_date)
+        if threshold_today is not None:
+            for _, r in last_day.iterrows():
+                diff_today = r.get('差枚')
+                if diff_today is None or pd.isna(diff_today):
+                    continue  # 当日の実測差枚が無い台は条件判定不可のため対象外
+                p_today = float(r['high_prob'])
+                is_top_today = float(diff_today) >= threshold_today
+                layer_key = '上位層' if is_top_today else '下位層'
+                m_long = strat_long[layer_key]
+                m_short = strat_short[layer_key] if strat_short is not None else None
+
+                result = pt.predict_transition_with_blend(p_today, m_long, m_short)
+                if result['ブレンド値'] is None:
+                    continue
+                strat_rows.append({
+                    '実行日時': now,
+                    '使用データ最終日': str(max_date),
+                    '対象日': next_date.strftime('%Y-%m-%d'),
+                    'ホール名': hole_name,
+                    '機種名': r['機種名'],
+                    '台番号': int(r['台番号']),
+                    '予測種別': '遷移予測_前日差枚',
+                    '長期スコア': result['長期スコア'],
+                    '短期スコア': result['短期スコア'],
+                    'ブレンド値': result['ブレンド値'],
+                    '使用alpha': result['使用alpha'],
+                    '詳細': {
+                        '層': layer_key,
+                        '分位閾値': strat_long['分位閾値'],
+                        '検定p値': strat_long['検定p値'],
+                        '当日high_prob': p_today,
+                        '当日差枚': float(diff_today),
+                        '長期遷移': {'上位層': strat_long['上位層'], '下位層': strat_long['下位層']},
+                        '短期遷移': strat_short,
+                    },
+                })
+    sc.write_prediction_log(analysis_db, strat_rows)
+
+    return len(rows), len(strat_rows), matrix_long
 
 
 def _run_sueki_predictions(
@@ -319,7 +376,9 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
 
     # [Stage7-3] 遷移モデルによる全台翌日予測。上限キャリブレーション補正後の
     # high_probを入力にするため、compute_uplimitの後に呼ぶ
-    n_transition, matrix_long = _run_transition_predictions(scored, hole_name, analysis_db)
+    n_transition, n_transition_strat, matrix_long = _run_transition_predictions(
+        scored, hole_name, analysis_db
+    )
 
     weights = pp.load_weights(str(pp.WEIGHTS_PATH)) if pp.WEIGHTS_PATH.exists() else {}
     reliabilities = {
@@ -328,6 +387,27 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         if col in scored.columns
     }
     synthesized = sc.synthesize(scored, weights, reliabilities=reliabilities)
+
+    # [2026-07 タスク5] wᵢ学習用の日次スナップショットを記録(学習側は蓄積後の別タスク)。
+    # 使用データ最終日の断面のみの店舗平均を残す(全期間平均ではない教師データ用の粒度)
+    snapshot_dates = sorted(synthesized['日付'].dropna().unique())
+    if snapshot_dates:
+        snapshot_last_date = snapshot_dates[-1]
+        last_day_rows = synthesized[synthesized['日付'] == snapshot_last_date]
+        sub_score_means = {
+            col: (None if pd.isna(last_day_rows[col].mean()) else float(last_day_rows[col].mean()))
+            for col in sc.SUB_SCORES if col in last_day_rows.columns
+        }
+        target_mean_raw = last_day_rows['狙い目度'].mean()
+        target_mean = None if pd.isna(target_mean_raw) else float(target_mean_raw)
+        effective_weights = {
+            col: float(weights.get(col, 1.0)) * float(reliabilities.get(col, 1.0))
+            for col in sc.SUB_SCORES if col in scored.columns
+        }
+        sc.write_score_snapshot(
+            analysis_db, hole_name, str(snapshot_last_date),
+            sub_score_means, target_mean, effective_weights,
+        )
 
     gamma_store = _existing_gamma_store(analysis_db, hole_name)
     sc.update_store_profile(
@@ -342,7 +422,8 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'  [完了] {hole_name}: stage3_scores / store_profile を更新しました'
         f'({len(synthesized):,}行、上限キャリブレーション発動'
         f'{uplimit_result["発動日数"]}/{uplimit_result["対象日数"]}日、'
-        f'遷移予測{n_transition}台、据え置き予測{n_sueki}台)。'
+        f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
+        f'据え置き予測{n_sueki}台)。'
     )
 
 
