@@ -12,7 +12,7 @@
 | 3. 配信・公開（iPhone Web閲覧） | [`fase3/`](fase3/) | Stage A実装済み・**Stage Bデプロイ完了(2026-07-07)** | Stage A: TursoDB移行は完了。GitHub Actionsでの自動実行はCloudflareにデータセンターIPをブロックされるため停止し、当面PC手動実行に戻した。Stage B: 分析用Turso(`pachislot-analysis`)を新設し`upload_analysis.py`（分析DB6テーブルを差分upsert）/ `analysis_turso.py`（接続ヘルパー）/ `bootstrap.py`+`streamlit_app.py`（Streamlit Community Cloud用エントリポイント）を実装、Streamlit Community Cloudへデプロイ済み。実データ約40万行の`--full`・差分upsertを実機検証済み。詳細は[`fase3/配信公開_skill.md`](fase3/配信公開_skill.md)参照 |
 | 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み・**タスクスケジューラ登録済み** | `run_daily.py`（朝6:30ポーリング実行＋10:30追い実行。fase1収集→`evaluate_predictions.py`→`run_store_profile.py`→`fase3/upload_analysis.py`（分析用Tursoへの差分アップロード）を直列実行し、`ホールデータ/collection_log.csv`にサイト更新検知時刻を記録）。**2026-07-07判明・対策済み**: バッテリー駆動時のモダンスタンバイ強制スリープでタスクが異常終了(0xC000013A)する事例を確認し、`SetThreadExecutionState`によるスリープ防止リクエストを実行中に有効化する対策を追加（根本対策は実行時間帯のAC電源接続。詳細は[`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md)参照） |
 
-> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え（**埋め込みレプリカ方式**: 書き込みはTursoへ委譲しつつ`ホールデータ/turso_replica.db`をローカルに維持し、fase2はこのレプリカを読む）、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜2日前。直近14日の取得失敗日は自動再試行。403発生時は全店舗中止）に変更。**GitHub Actionsでの自動実行(`schedule`)は、ana-slo.com(Cloudflare)がデータセンター系IPを即403ブロックすることが判明したため停止中**（`workflow_dispatch`の手動トリガーのみ残す）。当面はPC上で`py -3.12 メイン.py`を手動実行し、Tursoへ書き込む運用。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
+> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え（**埋め込みレプリカ方式**: 書き込みはTursoへ委譲しつつ`ホールデータ/turso_replica.db`をローカルに維持し、fase2はこのレプリカを読む）、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜前日。2026-07にfase4導入とあわせて2日前から短縮。直近14日の取得失敗日は自動再試行。403発生時は全店舗中止）に変更。**GitHub Actionsでの自動実行(`schedule`)は、ana-slo.com(Cloudflare)がデータセンター系IPを即403ブロックすることが判明したため停止中**（`workflow_dispatch`の手動トリガーのみ残す）。現在はPC上でfase4のタスクスケジューラが`py -3.12 メイン.py`を毎日自動実行し、Tursoへ書き込む運用（手動実行も引き続き可能）。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)参照
 
 ### fase2 ファイル構成
 
@@ -42,10 +42,10 @@
   - 技術詳細: [`fase2/データ分析_skill.md`](fase2/データ分析_skill.md)
   - 構成図: [`fase2/データ分析_構成図.md`](fase2/データ分析_構成図.md)
 - 「要件定義3」「配信」「公開」「fase3」→ [`fase3/`](fase3/) を参照（機能A/Bのコード自体はfase2に残し、fase3はそれをiPhoneへ届ける公開・デプロイ層を担う）
-  - 技術詳細: [`fase3/配信公開_設計.md`](fase3/配信公開_設計.md) / 実装指示書: [`fase3/実装指示書.md`](fase3/実装指示書.md)
+  - 技術詳細: [`fase3/配信公開_設計.md`](fase3/配信公開_設計.md)
   - 運用手順(デプロイ・Secrets・`--full`実行・トラブルシューティング): [`fase3/配信公開_skill.md`](fase3/配信公開_skill.md)
 - 「要件定義4」「自動実行」「fase4」→ [`fase4/`](fase4/) を参照
-  - 技術詳細: [`fase4/日次自動実行_設計.md`](fase4/日次自動実行_設計.md) / 実装指示書: [`fase4/実装指示書.md`](fase4/実装指示書.md)
+  - 技術詳細: [`fase4/日次自動実行_設計.md`](fase4/日次自動実行_設計.md)
   - 運用手順(タスクスケジューラ登録・トラブルシューティング): [`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md)
 
 ## データ保存先

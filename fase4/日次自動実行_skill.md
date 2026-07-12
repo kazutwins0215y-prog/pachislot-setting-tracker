@@ -3,7 +3,7 @@
 fase1収集→fase2評価(`evaluate_predictions.py`)→fase2分析・予測(`run_store_profile.py`)→
 fase3分析用Tursoアップロード(`upload_analysis.py`)を毎朝無人で直列実行する
 `fase4/run_daily.py`の運用手順。設計・仕様は
-[`日次自動実行_設計.md`](日次自動実行_設計.md)・[`実装指示書.md`](実装指示書.md)参照。
+[`日次自動実行_設計.md`](日次自動実行_設計.md)参照。
 アップロードステップの詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照。
 
 ## 前提
