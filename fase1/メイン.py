@@ -24,6 +24,9 @@ MIN_SLEEP     = 10   # 最低待機時間（秒）
 BATCH_SIZE    = 20   # この件数ごとに長めの休憩を挟む
 BATCH_BREAK   = 60 * 5  # バッチ休憩時間（秒）
 
+LONG_BREAK_AT      = 100     # 試験的: この件数を処理し終えた直後に1回だけ長め休憩を挟む(効果があれば恒久化予定)
+LONG_BREAK_SECONDS = 60 * 20  # 長め休憩の時間（秒）
+
 INITIAL_BACKFILL_DAYS = int(os.environ.get('INITIAL_BACKFILL_DAYS', 90))  # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか（環境変数で一時的に上書き可能）
 COLLECT_UNTIL_DAYS_AGO = 1   # 何日前までを収集対象にするか（サイトは前日分を23:00〜翌10:00頃にページ一括更新するため中間状態の取り込みリスクなし。未更新日はRETRY_LOOKBACK_DAYSのギャップ再試行が翌日以降拾う）
 RETRY_LOOKBACK_DAYS = 14     # 取得失敗等で空いた未処理日(ギャップ)を何日前まで再試行するか
@@ -102,7 +105,13 @@ def process_store(con, hole_name: str):
                 except Exception as rollback_err:
                     logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
             if i < len(remaining) - 1:
-                if (i + 1) % BATCH_SIZE == 0:
+                if (i + 1) == LONG_BREAK_AT:
+                    logger.info(f'{i + 1}件完了。試験的に{LONG_BREAK_SECONDS}秒の長め休憩に入ります')
+                    session.close()
+                    time.sleep(LONG_BREAK_SECONDS)
+                    session = create_session()
+                    logger.info('セッションを再生成しました')
+                elif (i + 1) % BATCH_SIZE == 0:
                     logger.info(f'{i + 1}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
                     session.close()
                     time.sleep(BATCH_BREAK)

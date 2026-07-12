@@ -6,7 +6,8 @@ app_a.py — 店内比較・可視化ツール (Streamlit)
 表示ビュー:
   [店舗単位] 月ごとの合計差枚数の平均、任意月の日次差枚数推移
   [台番号]   台番号別の日次トレンド折れ線(機種名サジェスト・台番号末尾絞り込み付き)
-  [機種名]   機種名別の日次トレンド折れ線(台番号末尾での色分けにも対応)
+  [機種名]   機種名別の日次トレンド折れ線(台番号末尾での色分けにも対応)。
+             Y軸「設定投入率」は機種×日のΣhigh_prob÷n×6(zスコアが閾値未満の点はグレー表示)
 
 絞り込み(データ範囲・日付絞り込み・機種名/台番号選択)は各ビュー本文内で行う
 (旧サイドバーフィルタは廃止)。
@@ -27,6 +28,7 @@ import plotly.express as px
 import streamlit as st
 
 import data_source as ds
+import patterns as pt
 import ui_theme as ui
 
 _WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
@@ -119,6 +121,30 @@ def load_data(hole_name: str) -> pd.DataFrame:
         st.warning(warn_msg)
     st.caption(info_msg)
     return df
+
+
+@st.cache_data(show_spinner=False)
+def _load_judgment_cached(hole_name: str) -> pd.DataFrame:
+    """
+    機種×日の全台系/高配分判定(patterns.score_zentaikei_judgment)を計算してキャッシュする。
+    機種名比較ビューの「設定投入率」軸(zゲート・ツールチップ)専用のオンザフライ計算
+    (machine_judgment_logへの保存はrun_store_profile.py側の責務で、こちらは表示専用の
+    独立計算。DB未反映でも軸が使えるように、読み込み済みslot_data/high_probから直接計算する)。
+    """
+    df, _, _ = _load_data_cached(hole_name)
+    if df.empty or 'high_prob' not in df.columns or '機種名' not in df.columns:
+        return pd.DataFrame()
+
+    import preprocess as pp
+
+    df = df.copy()
+    if 'is_invalid' not in df.columns:
+        df['is_invalid'] = False
+    df['is_invalid'] = df['is_invalid'].fillna(True).astype(bool)
+    df['S_全台系'] = pt.score_zentaiki(df, ['機種名'])
+
+    prior = pp.load_channel_weights()['prior_high_ratio']
+    return pt.score_zentaikei_judgment(df, prior)
 
 
 # ── ビュー: 店舗単位 ─────────────────────────────────────────────────
@@ -287,6 +313,60 @@ def _apply_score_yaxis(fig) -> None:
         tickvals=[0, 1, 2, 3, 4, 5, 6],
         ticktext=['0', '1', '2', '3', '4', '5', '6'],
     )
+
+
+_ZENTAIKEI_BASELINE = 0.9  # 普段どおり(π=0.15)の投入率×6の定位置(基準線)
+
+
+def _render_zentaikei_axis(
+    plot_df: pd.DataFrame,
+    judgment_df: pd.DataFrame,
+    sel: list[str],
+    period: str,
+) -> None:
+    """
+    「設定投入率」軸: 機種×日の投入率(Σhigh_prob÷n)を6倍した値(0〜6)を描画する。
+    0=投入なし・3=半分(1/2全台系)・6=全台。zスコアが判定閾値未満の点は
+    グレー・小マーカーで示す(少台数機種のまぐれ上振れ対策。旧案`clip(3+z,0,6)`から
+    2026-07-09ユーザー指定でこの表示式に差し替え済み)。
+    """
+    allowed_dates = set(plot_df['日付'].dt.date.dropna())
+    merged = judgment_df[judgment_df['機種名'].isin(sel)].copy()
+    merged['日付'] = pd.to_datetime(merged['日付'], errors='coerce')
+    merged = merged[merged['日付'].dt.date.isin(allowed_dates)]
+    merged = merged.dropna(subset=['日付', '投入率']).sort_values('日付')
+    if merged.empty:
+        st.info('選択した機種・期間の判定データがありません。')
+        return
+
+    merged['表示値'] = (merged['投入率'] * 6).round(2)
+    merged['有意'] = merged['zスコア'].fillna(-999) >= pt.JUDGMENT_Z_THRESHOLD
+
+    fig = px.line(
+        merged, x='日付', y='表示値', color='機種名', markers=True,
+        custom_data=['zスコア', '期待高設定台数', '台数', '判定ラベル'],
+    )
+    fig.update_traces(
+        hovertemplate=(
+            '%{x|%Y/%m/%d} %{fullData.name}<br>設定投入率: %{y}'
+            '<br>z: %{customdata[0]:.2f} / 期待高設定台数: %{customdata[1]:.1f}'
+            '/ 台数: %{customdata[2]}<br>判定: %{customdata[3]}<extra></extra>'
+        )
+    )
+    # zが閾値未満の点はグレー・小サイズにする(トレースはmachineごとに1本、markerは点ごとに配列指定)
+    for trace in fig.data:
+        sub = merged[merged['機種名'] == trace.name]
+        trace.marker.update(
+            color=[ui.ACCENT if v else 'rgba(160,160,160,0.6)' for v in sub['有意']],
+            size=[10 if v else 6 for v in sub['有意']],
+        )
+
+    fig.add_hline(y=_ZENTAIKEI_BASELINE, line_dash='dot', line_color='rgba(255,255,255,0.5)')
+    fig.update_yaxes(range=[0, 6], tickvals=[0, 1, 2, 3, 4, 5, 6])
+    _apply_xaxis_date_fmt(fig, merged, period)
+    fig.update_layout(xaxis_title='日付', yaxis_title='設定投入率(0〜6)')
+    ui.apply_mobile_layout(fig, height=380)
+    st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
 
 def _date_filter_ui(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
@@ -486,21 +566,30 @@ def view_by_slot(df: pd.DataFrame) -> None:
 
 # ── ビュー: 機種名比較 ───────────────────────────────────────────────
 
-def view_by_machine(df: pd.DataFrame) -> None:
+def view_by_machine(df: pd.DataFrame, hole_name: str) -> None:
     """機種名ごとの時系列比較（横軸: 日付固定）。"""
     st.subheader('機種名比較')
     if df.empty or '日付' not in df.columns:
         st.info('データがありません。')
         return
 
-    nums = [c for c in ['統合スコア', '差枚'] if c in df.columns and df[c].notna().any()]
+    # [2026-07-10設計確定] 機種名ビューの「統合スコア」軸は機種平均high_prob×6と数値的に
+    # 同一曲線のため、zゲート・基準線・ツールチップ付きで上位互換の「設定投入率」軸へ
+    # 置き換え済み(今後の実装予定.md 1.8節「末尾版」フェーズ4。台番号ビューは個別台の
+    # 生値のため重複がなく、統合スコア軸を維持する)
+    nums = [c for c in ['差枚'] if c in df.columns and df[c].notna().any()]
     if not nums:
-        st.info('統合スコア・差枚データがありません。')
+        st.info('差枚データがありません。')
         return
 
     if '機種名' not in df.columns:
         st.info('機種名データがありません。')
         return
+
+    # [2026-07-09設計合意] 「設定投入率」軸(機種×日のΣhigh_prob÷n×6。zゲート付き)
+    judgment_df = _load_judgment_cached(hole_name)
+    if not judgment_df.empty:
+        nums = nums + ['設定投入率']
 
     c1, c2 = st.columns(2)
     with c1:
@@ -518,6 +607,9 @@ def view_by_machine(df: pd.DataFrame) -> None:
     mach_slot_suffixes = st.multiselect('台番号末尾', ['0','1','2','3','4','5','6','7','8','9','ぞろ目'], default=[], key='mach_slot_suffix')
 
     if mach_slot_suffixes and '台番号' in plot_df.columns:
+        if y_axis == '設定投入率':
+            st.info('「設定投入率」軸は機種選択時のみ対応しています。台番号末尾の指定を解除してください。')
+            return
         # 台番号末尾選択時: 機種名選択なし・末尾ごとに色分けして描画
         _m_ints = {int(s) for s in mach_slot_suffixes if s != 'ぞろ目'}
         _m_zorrome = 'ぞろ目' in mach_slot_suffixes
@@ -547,11 +639,8 @@ def view_by_machine(df: pd.DataFrame) -> None:
         )
         fig.update_traces(marker=dict(size=8))
         fig.update_layout(xaxis_title='日付')
-        if y_axis == '統合スコア':
-            _apply_score_yaxis(fig)
-            _apply_xaxis_date_fmt(fig, agg, period)
-        else:
-            _apply_chart_style(fig, agg, y_axis, period)
+        # [2026-07-10] 機種名ビューのnumsから統合スコアを除去済みのためy_axisは常に差枚
+        _apply_chart_style(fig, agg, y_axis, period)
         ui.apply_mobile_layout(fig, height=380)
         st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
         return
@@ -564,6 +653,10 @@ def view_by_machine(df: pd.DataFrame) -> None:
         return
     plot_df = plot_df[plot_df['機種名'].isin(sel)]
 
+    if y_axis == '設定投入率':
+        _render_zentaikei_axis(plot_df, judgment_df, sel, period)
+        return
+
     plot_df = plot_df.dropna(subset=['日付', y_axis, '機種名'])
     if plot_df.empty:
         st.info('有効なデータがありません。')
@@ -575,11 +668,8 @@ def view_by_machine(df: pd.DataFrame) -> None:
     )
     fig.update_traces(marker=dict(size=8))
     fig.update_layout(xaxis_title='日付')
-    if y_axis == '統合スコア':
-        _apply_score_yaxis(fig)
-        _apply_xaxis_date_fmt(fig, agg, period)
-    else:
-        _apply_chart_style(fig, agg, y_axis, period)
+    # [2026-07-10] 機種名ビューのnumsから統合スコアを除去済み(設定投入率は上でreturn済み)
+    _apply_chart_style(fig, agg, y_axis, period)
     ui.apply_mobile_layout(fig, height=380)
     st.plotly_chart(fig, use_container_width=True, config=ui.PLOTLY_CONFIG)
 
@@ -611,7 +701,8 @@ def render(hole_name: str) -> None:
     elif view == '台番号':
         view_by_slot(df)
     else:
-        view_by_machine(df)
+        view_by_machine(df, hole_name)
 
     if st.button('キャッシュをクリア（新データ反映）', key='a_clear_cache'):
         _load_data_cached.clear()
+        _load_judgment_cached.clear()

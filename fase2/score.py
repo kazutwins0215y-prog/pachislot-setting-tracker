@@ -25,6 +25,15 @@ Stage3スコア保存 (write_stage3_scores):
     wᵢ(サブスコア重み)学習用の教師データを店舗×使用データ最終日の粒度でappend-only蓄積
     (記録側のみ先行実装。学習側は蓄積後の別タスク)
 
+機種判定ログ記録 (write_machine_judgment_log):
+    patterns.score_zentaikei_judgmentの出力(機種×日×ホールの全台系/高配分判定)を
+    append-only蓄積(全履歴バックフィル対応。今後の実装予定.md 1.8節 Phase1)
+
+末尾版レイヤー2検定結果保存 (write_group_calendar_conditions):
+    patterns.build_group_calendar_conditionsの出力(台番号末尾グループ×日付条件の
+    Mann-Whitney U検定+一致ルール2本)を分析DBへ保存(teppan_conditionsと同じ
+    店舗単位で全削除→再挿入。今後の実装予定.md 1.8節「末尾版」フェーズ2)
+
 依存: patterns.py (各サブスコア列), preprocess.py (回転数列)
 """
 import sqlite3
@@ -491,6 +500,99 @@ def write_teppan_conditions(db_path: str, hole_name: str, details: list[dict]) -
         con.close()
 
 
+_CREATE_GROUP_CALENDAR_CONDITIONS_SQL = '''
+    CREATE TABLE IF NOT EXISTS group_calendar_conditions (
+        ホール名         TEXT NOT NULL,
+        グループ種別     TEXT NOT NULL,
+        グループ         TEXT NOT NULL,
+        日付条件         TEXT NOT NULL,
+        該当日数         INTEGER,
+        p値              REAL,
+        効果量           REAL,
+        BH有意           INTEGER,
+        台数中央値       REAL,
+        使用データ最終日 TEXT NOT NULL,
+        更新日時         TEXT
+    )
+'''
+
+
+def _ensure_group_calendar_conditions_schema(con: sqlite3.Connection) -> None:
+    """
+    [2026-07 機種単位の癖分析] 台数中央値カラム(機種版のみ使用。使用側ゲート(暫定n≥3等)の
+    判断材料。末尾版の行はNULLのまま)を追加するマイグレーション。既存DBはCREATE TABLE
+    IF NOT EXISTSでは列が増えないため、teppan_conditions等と同様PRAGMA table_infoで
+    存在確認してからALTER TABLEする。
+    """
+    cols = [row[1] for row in con.execute('PRAGMA table_info(group_calendar_conditions)').fetchall()]
+    if '台数中央値' not in cols:
+        con.execute('ALTER TABLE group_calendar_conditions ADD COLUMN 台数中央値 REAL')
+
+
+def write_group_calendar_conditions(
+    db_path: str, hole_name: str, result_df: pd.DataFrame, last_date: str,
+    group_types: str | list[str] | None = None,
+) -> None:
+    """
+    [今後の実装予定.md 1.8節「末尾版」「機種単位の癖分析」] patterns.build_group_calendar_conditions
+    の出力を分析DBへ保存する。teppan_conditionsと同じ「グループ種別単位で全削除→再挿入」方式
+    (全期間の再検定のたびに最新化する。machine_judgment_logと異なりappend-onlyの
+    履歴蓄積ではない)。
+
+    有意でない組み合わせも含め全条件を保存する(2026-07-10確定設計「保存は緩く・
+    使用側でゲート」。予測時の重複統合(同一グループでmax効果量を採用)は呼び出し側の
+    predict_*_next_dayで行う)。
+
+    group_types: 削除対象のグループ種別(省略時はresult_dfのグループ種別列から推定)。
+    result_dfが空になり得る呼び出し(例: 直近窓検定でデータ不足のため0行)では、削除対象が
+    推定できず何も削除されない事故を防ぐため呼び出し側で明示的に渡すこと(2026-07修正:
+    以前は「ホール名のみ」で全グループ種別を無条件に削除していたため、例えば末尾版
+    ('台番号末尾')の書き込み後に機種版('機種')を書き込むと末尾版の既存行が消えていた)。
+    台数中央値列は末尾版など該当しない行はNULLのまま保存する(result_dfに列がなくても可)。
+    """
+    if group_types is None:
+        group_types = result_df['グループ種別'].unique().tolist() if not result_df.empty else []
+    elif isinstance(group_types, str):
+        group_types = [group_types]
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    has_size_col = '台数中央値' in result_df.columns
+    rows = [
+        (
+            hole_name, r['グループ種別'], r['グループ'], r['日付条件'],
+            None if pd.isna(r['該当日数']) else int(r['該当日数']),
+            None if pd.isna(r['p_raw']) else float(r['p_raw']),
+            None if pd.isna(r['効果量']) else float(r['効果量']),
+            int(bool(r['BH有意'])),
+            None if not has_size_col or pd.isna(r['台数中央値']) else float(r['台数中央値']),
+            last_date, now,
+        )
+        for _, r in result_df.iterrows()
+    ]
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_GROUP_CALENDAR_CONDITIONS_SQL)
+        _ensure_group_calendar_conditions_schema(con)
+        for gt in group_types:
+            con.execute(
+                'DELETE FROM group_calendar_conditions WHERE ホール名 = ? AND グループ種別 = ?',
+                (hole_name, gt),
+            )
+        if rows:
+            con.executemany(
+                '''
+                INSERT INTO group_calendar_conditions
+                    (ホール名, グループ種別, グループ, 日付条件, 該当日数, p値, 効果量, BH有意, 台数中央値, 使用データ最終日, 更新日時)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                rows,
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
 _CREATE_PATTERN_HISTORY_SQL = '''
     CREATE TABLE IF NOT EXISTS pattern_history (
         ホール名 TEXT NOT NULL,
@@ -627,6 +729,77 @@ def write_prediction_log(db_path: str, rows: list[dict]) -> None:
             ],
         )
         con.commit()
+    finally:
+        con.close()
+
+
+_CREATE_MACHINE_JUDGMENT_LOG_SQL = '''
+    CREATE TABLE IF NOT EXISTS machine_judgment_log (
+        実行日時       TEXT NOT NULL,
+        ホール名       TEXT NOT NULL,
+        日付           TEXT NOT NULL,
+        機種名         TEXT NOT NULL,
+        台数           INTEGER,
+        期待高設定台数 REAL,
+        zスコア        REAL,
+        p値            REAL,
+        投入率         REAL,
+        S_全台系       REAL,
+        判定ラベル     TEXT,
+        PRIMARY KEY (ホール名, 日付, 機種名)
+    )
+'''
+
+
+def write_machine_judgment_log(db_path: str, judgment_df: pd.DataFrame) -> int:
+    """
+    [2026-07-09設計合意] patterns.score_zentaikei_judgmentの出力(機種×日×ホール粒度)を
+    machine_judgment_logへappend-only記録する(今後の実装予定.md 1.8節 Phase1)。
+
+    prediction_log/score_snapshotと異なり、呼び出し側(run_store_profile.py)は
+    毎回「収集済み全履歴」分をまとめて渡す想定(全台系イベントは月数回と稀なため
+    記録を早く始める価値がある。この判定はリークの心配がない当日完結の計算)。
+    そのため重複ガードは事前の存在チェックではなく、PRIMARY KEY (ホール名, 日付, 機種名)
+    に対する INSERT OR IGNORE で行単位に行う(初回=全履歴バックフィル、以降=新規日のみ
+    実質追記となり、fase4の日次再実行でも二重記録されない)。
+
+    Returns: 新規に挿入された行数(参考値。INSERT OR IGNOREのため厳密なcursor.rowcountは
+    SQLite側の仕様上取れないため、事前の件数差分で算出する)。
+    """
+    if judgment_df.empty:
+        return 0
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_MACHINE_JUDGMENT_LOG_SQL)
+        before = con.execute('SELECT COUNT(*) FROM machine_judgment_log').fetchone()[0]
+
+        now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        rows = [
+            (
+                now, r['ホール名'], str(r['日付']), r['機種名'],
+                int(r['台数']) if pd.notna(r['台数']) else None,
+                None if pd.isna(r['期待高設定台数']) else float(r['期待高設定台数']),
+                None if pd.isna(r['zスコア']) else float(r['zスコア']),
+                None if pd.isna(r['p値']) else float(r['p値']),
+                None if pd.isna(r['投入率']) else float(r['投入率']),
+                None if pd.isna(r['S_全台系']) else float(r['S_全台系']),
+                r['判定ラベル'],
+            )
+            for _, r in judgment_df.iterrows()
+        ]
+        con.executemany(
+            '''
+            INSERT OR IGNORE INTO machine_judgment_log
+                (実行日時, ホール名, 日付, 機種名, 台数, 期待高設定台数, zスコア, p値, 投入率, S_全台系, 判定ラベル)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
+        con.commit()
+
+        after = con.execute('SELECT COUNT(*) FROM machine_judgment_log').fetchone()[0]
+        return after - before
     finally:
         con.close()
 

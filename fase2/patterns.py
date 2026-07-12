@@ -5,6 +5,11 @@ patterns.py — イベント検出・パターンスコア・αブレンド
     K=0前日比較で移動/撤去/増台イベントを検出
 幅型パターン (score_zentaiki / score_shintai / score_idoudai):
     S_全台系 / S_新台増台 / S_移動台 — 1日分データで検出可能
+機種強さ軸・全台系/高配分の日次判定 (score_zentaikei_judgment):
+    機種×日×ホールでz・投入率・S_全台系から3値ラベル(全台系/高配分/普段どおり)を判定
+機種単位の癖分析 (machine_group / group_constant_test / predict_machine_group_next_day):
+    グループ=機種で末尾版の検出器(group_calendar_test/match_rule_test)を再利用し、
+    看板機種(恒常検定)+機種カレンダー癖を恒常窓/直近90日窓の2窓で検定
 深さ型パターン (score_teppandai / score_rotation / score_sueki_daily):
     S_鉄板台(ACF→PDM→Lomb-Scargle / カレンダー検定) / S_ローテ / S_据え置き(日次判定)
 αブレンド (blend / walk_forward_alpha / learn_all_alphas):
@@ -267,6 +272,83 @@ def compute_breadth_scores(
     return out
 
 
+# ── 機種強さ軸・全台系/高配分の日次判定 [2026-07-09設計合意] ──────────
+
+JUDGMENT_Z_THRESHOLD = 2.0             # zスコアの有意性閾値(統計理論値)
+JUDGMENT_ZENTAIKEI_S_THRESHOLD = 0.5   # S_全台系の全台系判定閾値(仮置き。Phase2で調整)
+
+JUDGMENT_LABEL_ZENTAIKEI = '全台系'
+JUDGMENT_LABEL_KOUHAIBUN = '高配分'
+JUDGMENT_LABEL_NORMAL = '普段どおり'
+
+
+def score_zentaikei_judgment(
+    df: pd.DataFrame,
+    prior: float,
+    z_threshold: float = JUDGMENT_Z_THRESHOLD,
+    s_threshold: float = JUDGMENT_ZENTAIKEI_S_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    機種×日×ホールでzスコア・投入率・S_全台系を算出し、3値の判定ラベル
+    (全台系/高配分/普段どおり)を付与する(今後の実装予定.md 1.8節)。
+
+    z = (Σhigh_prob - n×prior) / √(n×prior×(1-prior))。期待より上振れしているかの
+    片側検定として扱い、同日×同ホール内の全機種でbenjamini_hochbergによるFDR補正を
+    重ねる(1日に全機種同時判定する分の誤検出増を抑えるため)。z_threshold以上かつ
+    FDR有意の場合のみ「異常」とし、S_全台系(揃いの確認)で全台系/高配分に振り分ける。
+    S_全台系が算出不能(機種内有効台数<2、score_zentaiki参照)の場合は揃い判定不能として
+    高配分側に倒す(2026-07-09ユーザー合意: 3値のシンプルさを優先)。
+
+    dfはcompute_breadth_scores適用後(S_全台系列を持つ)を想定。
+    投入率は生の比率(Σhigh_prob÷n、0〜1)で返す。表示側(機能A)の×6は呼び出し元の責務
+    (3節の正解発表ラベルの投入率=k/nと直接比較できる粒度で保存するため)。
+
+    Returns:
+        DataFrame: ホール名, 日付, 機種名, 台数, 期待高設定台数, zスコア, p値, 投入率,
+        S_全台系, 判定ラベル (機種×日×ホール粒度、1行1組)
+    """
+    if 'is_invalid' in df.columns:
+        valid = df[~df['is_invalid'].fillna(True)]
+    else:
+        valid = df
+
+    cols = [
+        'ホール名', '日付', '機種名', '台数', '期待高設定台数',
+        'zスコア', 'p値', '投入率', 'S_全台系', '判定ラベル',
+    ]
+    group_key = ['ホール名', '日付', '機種名']
+    agg_df = (
+        valid.dropna(subset=['high_prob'])
+        .groupby(group_key)
+        .agg(台数=('high_prob', 'count'), 期待高設定台数=('high_prob', 'sum'), S_全台系=('S_全台系', 'first'))
+        .reset_index()
+    )
+    if agg_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    n = agg_df['台数'].astype(float)
+    sigma = np.sqrt(n * prior * (1.0 - prior))
+    agg_df['zスコア'] = np.where(sigma > 0, (agg_df['期待高設定台数'] - n * prior) / sigma, np.nan)
+    agg_df['投入率'] = agg_df['期待高設定台数'] / n
+    # 片側検定(上振れのみ): z=NaNの行(sigma=0、n=0で通常発生しない)はp値もNaN
+    agg_df['p値'] = agg_df['zスコア'].apply(lambda z: float(stats.norm.sf(z)) if pd.notna(z) else np.nan)
+    agg_df['判定ラベル'] = JUDGMENT_LABEL_NORMAL
+
+    for _, sub in agg_df.groupby(['ホール名', '日付']):
+        p_values = sub['p値'].fillna(1.0).tolist()
+        fdr_flags = benjamini_hochberg(p_values)
+        for row_idx, is_fdr_sig in zip(sub.index, fdr_flags):
+            z = agg_df.at[row_idx, 'zスコア']
+            if pd.isna(z) or z < z_threshold or not is_fdr_sig:
+                continue
+            s = agg_df.at[row_idx, 'S_全台系']
+            agg_df.at[row_idx, '判定ラベル'] = (
+                JUDGMENT_LABEL_ZENTAIKEI if pd.notna(s) and s >= s_threshold else JUDGMENT_LABEL_KOUHAIBUN
+            )
+
+    return agg_df[cols]
+
+
 # ── 深さ型パターン ────────────────────────────────────────────────
 
 def acf_screen(series: pd.Series, max_lag: int = ACF_MAX_LAG) -> list[int]:
@@ -357,8 +439,14 @@ _WEEKDAY_NAMES = ['月', '火', '水', '木', '金', '土', '日']
 
 def calendar_candidates(dt: pd.DatetimeIndex) -> dict[str, np.ndarray]:
     """
-    既知カレンダー17候補(曜日7 + 日付末尾10 + ゾロ目1)の日付マスクを返す。
-    calendar_test(検定)と score_teppandai(該当日スコア付与)で共用する。
+    既知カレンダー49候補(曜日7 + 日付末尾10 + ゾロ目1 + 毎月X日31)の日付マスクを返す。
+    calendar_test(鉄板台検定)と末尾版レイヤー2(group_calendar_conditions)で共用する。
+
+    [2026-07-10 今後の実装予定.md 1.8節「末尾版」] 毎月X日31候補を追加(旧18候補から拡張。
+    18候補時代の設計メモに残っていた「17候補」表記は数え間違い)。これにより鉄板台の
+    カレンダー検定結果も従来と変わり得る(仮説数増によるBH検出力の微減はユーザー許容済み)。
+    毎月X日は月1回しか該当しないため、月末寄りの日(29〜31日)ほど該当日数が少なく
+    検定不能(候補/対照いずれかが最低日数未満)になりやすい点に注意。
     """
     candidates: dict[str, np.ndarray] = {}
     for i, name in enumerate(_WEEKDAY_NAMES):
@@ -366,7 +454,501 @@ def calendar_candidates(dt: pd.DatetimeIndex) -> dict[str, np.ndarray]:
     for d in range(10):
         candidates[f'末尾_{d}'] = (dt.day % 10 == d)
     candidates['ゾロ目'] = np.isin(dt.day, [11, 22])
+    for d in range(1, 32):
+        candidates[f'毎月_{d}日'] = (dt.day == d)
     return candidates
+
+
+# ── 末尾版: グループ定義(今後の実装予定.md 1.8節「次回分(末尾版)」) ─────────
+
+def tail_digit_group(units: pd.Series) -> pd.Series:
+    """
+    台番号Series → グループ名Series('グループ末尾_0'〜'9' または 'グループゾロ目')。
+    ゾロ目 = 全桁が同一の台番号(11,22,…,99,111,222,…)。ゾロ目該当台が存在しない
+    店舗ではこのグループが自然に出現せず、呼び出し側(group_calendar_conditions系)で
+    自動スキップされる(グループ一覧はunique()から作るため)。
+
+    グループ定義は関数として切り出してあり、「グループ=機種」等への差し替え
+    (今後の実装予定.md 1.8節「機種単位の癖分析」)は本関数と同じ返り値の形
+    (行→グループ名のSeries)を作る別関数を用意すれば、末尾版レイヤー2の検出ロジックは
+    そのまま再利用できる設計。ユニークな台番号ごとに1回だけ判定してmapする
+    (全行を都度str変換しない)。
+    """
+    unique_units = units.dropna().astype(int).unique()
+
+    def _label(u: int) -> str:
+        s = str(u)
+        if len(s) >= 2 and len(set(s)) == 1:
+            return 'グループゾロ目'
+        return f'グループ末尾_{u % 10}'
+
+    mapping = {u: _label(u) for u in unique_units}
+    return units.astype('Int64').map(mapping)
+
+
+GROUP_CALENDAR_MIN_DAYS = 5  # 候補日・対照日ともにこの日数未満の組み合わせは検定対象外
+
+
+# ── 機種単位の癖分析(今後の実装予定.md 1.8節「機種単位の癖分析」) ──────────
+
+MACHINE_GROUP_MIN_UNITS = 2   # 日次有効台数の中央値がこれ未満の機種は検定対象外
+RECENT_TEST_WINDOW_DAYS = 90  # 看板機種/機種カレンダーの「直近窓」検定用の日数(暫定値)。
+                               # αブレンド投影用のSHORT_WINDOW_DEFAULT(=30)とは別物
+                               # (こちらは検定窓、あちらは予測投影窓)
+
+
+def group_size_medians(df: pd.DataFrame) -> pd.Series:
+    """
+    機種ごとの日次有効台数の中央値(machine_groupのゲート判定・
+    group_calendar_conditions.台数中央値列の保存に使う)。is_invalid列があれば除外する。
+    """
+    sub = df
+    if 'is_invalid' in df.columns:
+        sub = df.loc[~df['is_invalid'].fillna(True)]
+    daily_counts = (
+        sub.dropna(subset=['機種名', '台番号', '日付'])
+        .groupby(['機種名', '日付'])['台番号'].nunique()
+    )
+    return daily_counts.groupby('機種名').median()
+
+
+def machine_group(df: pd.DataFrame, min_units: int = MACHINE_GROUP_MIN_UNITS) -> pd.Series:
+    """
+    行 → 機種名 のグループSeries(tail_digit_groupと同じ「行→グループ名」の形式にすることで、
+    group_calendar_test/build_group_calendar_conditionsを検出器を変えずに再利用する)。
+    グループ名は機種名そのまま(末尾版のような接頭辞は付けない)。
+
+    日次有効台数の中央値がmin_units未満の機種はNaN(検定対象外。2〜3台構成のローテは
+    機種集計の恩恵がなく1.2節の台粒度ローテに任せる、という2026-07-10ユーザー合意。
+    「検出は緩く保存・使用側でゲート」の思想でn≥2は検定側の最小ゲート、表示/予測側の
+    追加ゲート(暫定n≥3等)は台数中央値列を見て別途判断する)。
+    """
+    medians = group_size_medians(df)
+    valid_machines = set(medians[medians >= min_units].index)
+
+    machine = df['機種名']
+    return machine.where(machine.isin(valid_machines))
+
+
+def group_constant_test(
+    df: pd.DataFrame,
+    hole_name: str,
+    group_series: pd.Series,
+    min_days: int = GROUP_CALENDAR_MIN_DAYS,
+) -> pd.DataFrame:
+    """
+    看板機種検定(今後の実装予定.md 1.8節「機種単位の癖分析」)。「そのグループの投入率が、
+    同日の他グループ平均より恒常的に高いか」を対応ペアのWilcoxon符号順位検定(片側greater)+
+    rank-biserial相関で判定する。日付条件='恒常'固定の1行として返し、
+    build_group_calendar_conditionsがgroup_calendar_test/match_rule_testと同じ
+    仮説群に混ぜてBH補正する。
+
+    店舗全体の平均投入率が定数オフセットとして乗る問題(フェーズ1で判明したStouffer破綻と
+    同型)を、group_calendar_testの「候補日vs対照日」ではなく「自グループ vs 同日の
+    他グループ平均」の対応ペア化で回避する(match_rule_testと同じ思想)。
+
+    グループ内有効台数が少ないグループはgroup_series側で既に除外されている前提
+    (machine_group参照)。対応ペア数がmin_days未満のグループは検定対象外(p_raw/効果量NaN)。
+    """
+    empty = pd.DataFrame(columns=['グループ', '日付条件', '該当日数', '対照日数', 'p_raw', '効果量'])
+
+    mask = df['ホール名'] == hole_name
+    if 'is_invalid' in df.columns:
+        mask &= ~df['is_invalid'].fillna(True)
+    sub = df.loc[mask].dropna(subset=['high_prob', '日付']).copy()
+    if sub.empty:
+        return empty
+
+    sub['_グループ'] = group_series.reindex(sub.index)
+    sub = sub.dropna(subset=['_グループ'])
+    if sub.empty:
+        return empty
+
+    daily = sub.groupby(['_グループ', '日付'])['high_prob'].agg(n='count', sum_hp='sum').reset_index()
+    daily['投入率'] = daily['sum_hp'] / daily['n']
+
+    groups = sorted(daily['_グループ'].unique())
+    records = []
+    for g in groups:
+        g_rate = daily.loc[daily['_グループ'] == g].set_index('日付')['投入率']
+        other = daily.loc[daily['_グループ'] != g]
+        if other.empty:
+            records.append({
+                'グループ': g, '日付条件': '恒常', '該当日数': 0, '対照日数': np.nan,
+                'p_raw': np.nan, '効果量': np.nan,
+            })
+            continue
+        other_mean = other.groupby('日付')['投入率'].mean()
+
+        common_dates = g_rate.index.intersection(other_mean.index)
+        diffs = (g_rate.loc[common_dates] - other_mean.loc[common_dates]).to_numpy(dtype=float)
+        k = len(diffs)
+
+        if k < min_days:
+            records.append({
+                'グループ': g, '日付条件': '恒常', '該当日数': k, '対照日数': np.nan,
+                'p_raw': np.nan, '効果量': np.nan,
+            })
+            continue
+
+        if np.all(diffs == 0.0):
+            records.append({
+                'グループ': g, '日付条件': '恒常', '該当日数': k, '対照日数': np.nan,
+                'p_raw': 1.0, '効果量': 0.0,
+            })
+            continue
+
+        _, p = stats.wilcoxon(diffs, alternative='greater')
+        rbc = _wilcoxon_rank_biserial(diffs)
+        records.append({
+            'グループ': g, '日付条件': '恒常', '該当日数': k, '対照日数': np.nan,
+            'p_raw': float(p), '効果量': rbc,
+        })
+
+    return pd.DataFrame(records)
+
+
+def group_calendar_test(
+    df: pd.DataFrame,
+    hole_name: str,
+    group_series: pd.Series,
+    min_days: int = GROUP_CALENDAR_MIN_DAYS,
+) -> pd.DataFrame:
+    """
+    グループ×日付条件のMann-Whitney U相対検定(今後の実装予定.md 1.8節「末尾版」レイヤー2の
+    「固定グループ×固定日付条件」パート)。BH補正は掛けない生のp値・効果量を返す
+    (一致ルール2本(match_rule_test)と合わせて1つの仮説群としてBH補正するため、
+    それは呼び出し側のbuild_group_calendar_conditionsが行う)。
+
+    [2026-07-10フェーズ1検証で確定] 当初案のStouffer統合z(z=(Σp−nπ)/√(nπ(1−π))を
+    Σz÷√kで統合)は、店舗全体の平均high_probがπより系統的に高い(sigmoid飽和の右裾。
+    詳細はデータ分析_skill.md参照)ため全仮説が有意化して閾値として破綻することが
+    実データ(マルハン新宿東宝・エスパス歌舞伎町)で判明した。既存calendar_test(鉄板台の
+    カレンダー検定)と同じ「候補日 vs 対照日」のMann-Whitney U片側検定(greater)+
+    rank-biserial効果量に変更することで、店舗オフセットが自動的に相殺される(A案)。
+
+    group_series: dfと同じindexを持つ、行→グループ名のSeries
+    (例: tail_digit_group(df['台番号']))。グループ定義を外部注入にすることで
+    「グループ=機種」等への差し替え(今後の実装予定.md 1.8節「機種単位の癖分析」)でも
+    本関数をそのまま再利用できる。
+
+    グループ×日で投入率(Σhigh_prob÷n、is_invalid除外)を集計し、
+    calendar_candidates(49候補)の日付条件ごとに候補日/対照日へ二分してMann-Whitney U
+    片側検定(greater)+rank-biserial相関(effect_size)を計算する。
+    候補日・対照日のいずれかがmin_days未満の組み合わせは検定対象外(p_raw/効果量はNaN。
+    品質ガード兼・仮説数の自動削減)。
+
+    Returns:
+        DataFrame(グループ, 日付条件, 該当日数, 対照日数, p_raw, 効果量)
+        (使用データ最終日・ホール名は呼び出し側で付与する)
+    """
+    empty = pd.DataFrame(columns=['グループ', '日付条件', '該当日数', '対照日数', 'p_raw', '効果量'])
+
+    mask = df['ホール名'] == hole_name
+    if 'is_invalid' in df.columns:
+        mask &= ~df['is_invalid'].fillna(True)
+    sub = df.loc[mask].dropna(subset=['high_prob', '日付']).copy()
+    if sub.empty:
+        return empty
+
+    sub['_グループ'] = group_series.reindex(sub.index)
+    sub = sub.dropna(subset=['_グループ'])
+    if sub.empty:
+        return empty
+
+    daily = sub.groupby(['_グループ', '日付'])['high_prob'].agg(n='count', sum_hp='sum').reset_index()
+    daily['投入率'] = daily['sum_hp'] / daily['n']
+
+    all_dates = sorted(sub['日付'].dropna().unique())
+    dt_idx = pd.to_datetime(all_dates, errors='coerce')
+    conditions = calendar_candidates(dt_idx)
+    date_pos = {d: i for i, d in enumerate(all_dates)}
+
+    groups = sorted(daily['_グループ'].unique())
+    records = []
+    for g in groups:
+        g_rate = daily.loc[daily['_グループ'] == g].set_index('日付')['投入率']
+        for cname, mask_arr in conditions.items():
+            cand_dates = [d for d in g_rate.index if mask_arr[date_pos[d]]]
+            ctrl_dates = [d for d in g_rate.index if not mask_arr[date_pos[d]]]
+            k_cand, k_ctrl = len(cand_dates), len(ctrl_dates)
+
+            if k_cand < min_days or k_ctrl < min_days:
+                records.append({
+                    'グループ': g, '日付条件': cname, '該当日数': k_cand, '対照日数': k_ctrl,
+                    'p_raw': np.nan, '効果量': np.nan,
+                })
+                continue
+
+            x = g_rate.loc[cand_dates].to_numpy(dtype=float)
+            y = g_rate.loc[ctrl_dates].to_numpy(dtype=float)
+            _, p = stats.mannwhitneyu(x, y, alternative='greater')
+            u2, _ = stats.mannwhitneyu(x, y, alternative='two-sided')
+            rbc = float(2.0 * u2 / (len(x) * len(y)) - 1.0)
+            records.append({
+                'グループ': g, '日付条件': cname, '該当日数': k_cand, '対照日数': k_ctrl,
+                'p_raw': float(p), '効果量': rbc,
+            })
+
+    return pd.DataFrame(records)
+
+
+def _wilcoxon_rank_biserial(diffs: np.ndarray) -> float:
+    """
+    対応ありWilcoxon符号順位検定のrank-biserial相関(-1〜1)。
+    r = (正の差のランク和 − 負の差のランク和) / (両者の合計)。match_rule_testで使う
+    (calendar_test/group_calendar_testのrank-biserial相関と同じ「符号付き効果量」の
+    物差しに揃えるため、scipy.stats.wilcoxonの内部統計量には依存せず自前で計算する)。
+    差が0のペアはランク付けから除外する(scipyのzero_method='wilcox'相当)。
+    """
+    nonzero = diffs[diffs != 0]
+    if len(nonzero) == 0:
+        return 0.0
+    ranks = stats.rankdata(np.abs(nonzero))
+    w_pos = float(ranks[nonzero > 0].sum())
+    w_neg = float(ranks[nonzero < 0].sum())
+    total = w_pos + w_neg
+    return (w_pos - w_neg) / total if total > 0 else 0.0
+
+
+MATCH_RULE_DIGIT2 = '下2桁一致'
+MATCH_RULE_TAIL = '末尾一致'
+
+
+def match_rule_test(
+    df: pd.DataFrame,
+    hole_name: str,
+    rule: str,
+    min_days: int = GROUP_CALENDAR_MIN_DAYS,
+) -> dict:
+    """
+    一致ルール検定(今後の実装予定.md 1.8節「末尾版」レイヤー2の一致ルール2本)。BH補正は
+    掛けない生のp値・効果量を返す(group_calendar_testと合わせてbuild_group_calendar_conditions
+    が1つの仮説群としてBH補正する)。
+
+    固定グループ×固定日付条件では表現できない動的な対応関係(日によって「一致する台」が
+    変わる)を、日ごとの「一致する台 vs 一致しない台」の投入率差を対応ペアとして蓄積し、
+    Wilcoxon符号順位検定(片側greater)で検定する(1ホール×1ルール=1仮説)。
+
+    rule=MATCH_RULE_DIGIT2('下2桁一致'): 日付の日(1〜31) == 台番号下2桁(unit%100)の台が
+        一致グループ(例: 12日に末尾12番台が高配分)
+    rule=MATCH_RULE_TAIL('末尾一致'): 日付の日の末尾(day%10) == 台番号末尾(unit%10)の台が
+        一致グループ(全末尾統合版。毎日該当日がある)
+
+    一致グループ・非一致グループのどちらかが0台の日はその日をペアから除外する。
+    有効なペア数がmin_days未満の場合は検定不可(p_raw/効果量はNaN)。
+
+    Returns:
+        {'該当日数', 'p_raw', '効果量'}
+    """
+    mask = df['ホール名'] == hole_name
+    if 'is_invalid' in df.columns:
+        mask &= ~df['is_invalid'].fillna(True)
+    sub = df.loc[mask].dropna(subset=['high_prob', '日付', '台番号']).copy()
+    empty = {'該当日数': 0, 'p_raw': np.nan, '効果量': np.nan}
+    if sub.empty:
+        return empty
+
+    units = sub['台番号'].astype(int)
+    dt = pd.to_datetime(sub['日付'], errors='coerce')
+    if rule == MATCH_RULE_DIGIT2:
+        is_match = (units % 100) == dt.dt.day
+    elif rule == MATCH_RULE_TAIL:
+        is_match = (units % 10) == (dt.dt.day % 10)
+    else:
+        raise ValueError(f'不明なrule: {rule}')
+    sub = sub.assign(_一致=is_match.to_numpy())
+
+    diffs = []
+    for _, day_grp in sub.groupby('日付'):
+        matched = day_grp.loc[day_grp['_一致'], 'high_prob']
+        unmatched = day_grp.loc[~day_grp['_一致'], 'high_prob']
+        if matched.empty or unmatched.empty:
+            continue
+        diffs.append(float(matched.mean()) - float(unmatched.mean()))
+
+    k = len(diffs)
+    if k < min_days:
+        return {'該当日数': k, 'p_raw': np.nan, '効果量': np.nan}
+
+    diffs_arr = np.array(diffs, dtype=float)
+    if np.all(diffs_arr == 0.0):
+        return {'該当日数': k, 'p_raw': 1.0, '効果量': 0.0}
+    _, p = stats.wilcoxon(diffs_arr, alternative='greater')
+    rbc = _wilcoxon_rank_biserial(diffs_arr)
+    return {'該当日数': k, 'p_raw': float(p), '効果量': rbc}
+
+
+def build_group_calendar_conditions(
+    df: pd.DataFrame,
+    hole_name: str,
+    group_series: pd.Series,
+    group_type: str = '台番号末尾',
+    min_days: int = GROUP_CALENDAR_MIN_DAYS,
+    include_match_rules: bool = True,
+    include_constant: bool = False,
+) -> pd.DataFrame:
+    """
+    group_calendar_test(固定グループ×固定日付条件)・match_rule_test(一致ルール2本)・
+    group_constant_test(看板/恒常検定)を合わせて1つの仮説群としてBH補正し、
+    group_calendar_conditionsテーブル保存用の最終結果を返す(今後の実装予定.md 1.8節
+    「末尾版」レイヤー2、および「機種単位の癖分析」の統合エントリポイント)。
+
+    「毎月6日⊂日付末尾6⊂一致ルール」のように条件は入れ子になるが、重複統合
+    (同一グループへの該当条件のうちmax効果量を採用)はここでは行わない。設計上
+    「保存は全条件を残し、予測時にmax(効果量)を採用」と決まっているため
+    (フェーズ3=S_末尾並走記録の実装時に行う)。
+
+    group_type: 保存先テーブルの「グループ種別」列の値(既定'台番号末尾'。
+    「グループ=機種」等への拡張時は呼び出し側でこの値を差し替える)。
+    一致ルールの行はグループ列='一致ルール'固定(動的グループのため個別グループ名を
+    持たない)。
+
+    include_match_rules: 一致ルール2本を含めるか(末尾版=True、機種版は意味を持たないため
+    呼び出し側でFalseにする)。
+    include_constant: group_constant_test(看板機種検定)を含めるか(末尾版=False既定、
+    機種版=Trueで呼び出し側が指定する)。
+
+    Returns:
+        DataFrame(グループ種別, グループ, 日付条件, 該当日数, 対照日数, p_raw, 効果量, BH有意)
+        (ホール名・使用データ最終日は呼び出し側で付与する)
+    """
+    frames = []
+
+    grid = group_calendar_test(df, hole_name, group_series, min_days=min_days)
+    grid.insert(0, 'グループ種別', group_type)
+    frames.append(grid)
+
+    if include_match_rules:
+        match_records = []
+        for rule in (MATCH_RULE_DIGIT2, MATCH_RULE_TAIL):
+            r = match_rule_test(df, hole_name, rule, min_days=min_days)
+            match_records.append({
+                'グループ種別': group_type, 'グループ': '一致ルール', '日付条件': rule,
+                '該当日数': r['該当日数'], '対照日数': np.nan,
+                'p_raw': r['p_raw'], '効果量': r['効果量'],
+            })
+        frames.append(pd.DataFrame(match_records))
+
+    if include_constant:
+        constant_df = group_constant_test(df, hole_name, group_series, min_days=min_days)
+        constant_df.insert(0, 'グループ種別', group_type)
+        frames.append(constant_df)
+
+    result = pd.concat(frames, ignore_index=True)
+    testable = result['p_raw'].notna()
+    flags = benjamini_hochberg(result.loc[testable, 'p_raw'].tolist())
+    result['BH有意'] = False
+    result.loc[testable, 'BH有意'] = [
+        bool(f) and eff >= EFFECT_SIZE_THRESHOLD
+        for f, eff in zip(flags, result.loc[testable, '効果量'])
+    ]
+    return result
+
+
+def predict_tail_group_next_day(
+    unit: int,
+    next_date,
+    significant_conditions: pd.DataFrame,
+) -> dict | None:
+    """
+    [今後の実装予定.md 1.8節「末尾版」フェーズ3] S_末尾の翌観測日予測。
+
+    台番号unitが属する末尾グループ(固定グループ×固定日付条件)、および一致ルール
+    (下2桁一致/末尾一致、unit依存の動的判定)の両方について、next_dateが該当する
+    有意条件を集め、**重複統合(同一グループへの該当条件のうちmax効果量を採用、
+    加算しない=二重計上回避)** を適用する(2026-07-10確定設計)。
+
+    significant_conditions: build_group_calendar_conditionsの出力のうちBH有意=Trueの
+    行(この店舗・この使用データ最終日分。呼び出し側でフィルタして渡す)。
+
+    Returns:
+        {'値': float(該当した有意条件のmax効果量), '該当条件': [{'グループ','日付条件','効果量'}, ...]}
+        該当する有意条件が1つもない場合はNone(予測不可)。
+    """
+    if significant_conditions.empty:
+        return None
+
+    s = str(int(unit))
+    if len(s) >= 2 and len(set(s)) == 1:
+        unit_group = 'グループゾロ目'
+    else:
+        unit_group = f'グループ末尾_{int(unit) % 10}'
+
+    dt = pd.Timestamp(next_date)
+    candidates = calendar_candidates(pd.DatetimeIndex([dt]))
+
+    matched: list[dict] = []
+
+    grp_rows = significant_conditions[significant_conditions['グループ'] == unit_group]
+    for _, row in grp_rows.iterrows():
+        cname = row['日付条件']
+        mask_arr = candidates.get(cname)
+        if mask_arr is not None and bool(mask_arr[0]):
+            matched.append({'グループ': unit_group, '日付条件': cname, '効果量': float(row['効果量'])})
+
+    match_rows = significant_conditions[significant_conditions['グループ'] == '一致ルール']
+    for _, row in match_rows.iterrows():
+        rule = row['日付条件']
+        is_hit = (
+            (rule == MATCH_RULE_DIGIT2 and (int(unit) % 100) == dt.day)
+            or (rule == MATCH_RULE_TAIL and (int(unit) % 10) == (dt.day % 10))
+        )
+        if is_hit:
+            matched.append({'グループ': '一致ルール', '日付条件': rule, '効果量': float(row['効果量'])})
+
+    if not matched:
+        return None
+    best = max(matched, key=lambda m: m['効果量'])
+    return {'値': best['効果量'], '該当条件': matched}
+
+
+def predict_machine_group_next_day(
+    machine_name: str,
+    next_date,
+    significant_conditions: pd.DataFrame,
+) -> dict | None:
+    """
+    [今後の実装予定.md 1.8節「機種単位の癖分析」] S_機種/S_機種_直近の翌観測日予測。
+    predict_tail_group_next_dayの機種版(一致ルールに相当する動的グループがないため
+    その分岐は持たない)。
+
+    machine_nameが該当する有意条件('恒常'固定行は常に該当、カレンダー条件はnext_dateが
+    該当する場合のみ)を集め、**重複統合(同一グループへの該当条件のうちmax効果量を採用、
+    加算しない=二重計上回避)** を適用する(末尾版と同じ2026-07-10確定設計)。
+
+    significant_conditions: build_group_calendar_conditions(include_constant=True)の
+    出力のうちBH有意=Trueの行(この店舗・この検定窓・この使用データ最終日分。
+    呼び出し側でフィルタして渡す)。
+
+    Returns:
+        {'値': float(該当した有意条件のmax効果量), '該当条件': [{'グループ','日付条件','効果量'}, ...]}
+        該当する有意条件が1つもない場合はNone(予測不可)。
+    """
+    if significant_conditions.empty:
+        return None
+
+    grp_rows = significant_conditions[significant_conditions['グループ'] == machine_name]
+    if grp_rows.empty:
+        return None
+
+    dt = pd.Timestamp(next_date)
+    candidates = calendar_candidates(pd.DatetimeIndex([dt]))
+
+    matched: list[dict] = []
+    for _, row in grp_rows.iterrows():
+        cname = row['日付条件']
+        if cname == '恒常':
+            matched.append({'グループ': machine_name, '日付条件': cname, '効果量': float(row['効果量'])})
+            continue
+        mask_arr = candidates.get(cname)
+        if mask_arr is not None and bool(mask_arr[0]):
+            matched.append({'グループ': machine_name, '日付条件': cname, '効果量': float(row['効果量'])})
+
+    if not matched:
+        return None
+    best = max(matched, key=lambda m: m['効果量'])
+    return {'値': best['効果量'], '該当条件': matched}
 
 
 def calendar_test(
@@ -375,7 +957,7 @@ def calendar_test(
     check_missing_bias_fn,
 ) -> dict:
     """
-    既知カレンダー17候補(曜日7 + 日付末尾10 + ゾロ目1)の検定。
+    既知カレンダー49候補(曜日7 + 日付末尾10 + ゾロ目1 + 毎月X日31。calendar_candidates参照)の検定。
     一方向検定(並べ替え or Mann-Whitney U) + FDR補正 + 効果量ゲート。
     check_missing_bias_fn: preprocess.check_missing_bias を渡す。
 

@@ -327,6 +327,231 @@ def _run_sueki_predictions(
     return len(rows)
 
 
+def _run_zentaikei_judgment(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> int:
+    """
+    [2026-07-09設計合意] 機種×日の全台系/高配分の日次判定(patterns.score_zentaikei_judgment)を
+    machine_judgment_logへ記録する(今後の実装予定.md 1.8節 Phase1)。
+
+    prediction_log系の翌日予測(直近1日のみ記録)と異なり、収集済み全履歴分をまとめて
+    渡す(全台系イベントは月数回と稀なため記録を早く始める価値がある。当日完結の
+    記述統計でリークの心配がないため過去分の再計算も問題ない。重複は
+    write_machine_judgment_log側のPRIMARY KEYで行単位に吸収される)。
+    πはStage3のβ₀と同じprior_high_ratio(load_channel_weights経由)を使う。
+    上限キャリブレーション補正後のhigh_prob(scored)を入力にするため、
+    compute_uplimitの後に呼ぶ(機能Aの表示値と揃えるため)。
+    """
+    prior = pp.load_channel_weights()['prior_high_ratio']
+    judgment_df = pt.score_zentaikei_judgment(scored, prior)
+    return sc.write_machine_judgment_log(analysis_db, judgment_df)
+
+
+def _run_group_calendar_conditions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> 'pd.DataFrame':
+    """
+    [今後の実装予定.md 1.8節「末尾版」フェーズ2] 台番号末尾グループのカレンダー構造検定
+    (patterns.build_group_calendar_conditions)をgroup_calendar_conditionsへ保存する。
+
+    machine_judgment_log(append-only)と異なり、teppan_conditionsと同じ「店舗単位で
+    全削除→再挿入」方式(収集済み全履歴を毎回再検定するため、過去分の履歴を残す必要が
+    ない)。上限キャリブレーション補正後のhigh_probを使うため、compute_uplimitの後
+    (write_stage3_scoresと同じ位置)に呼ぶ。
+
+    Returns: build_group_calendar_conditionsの生の結果DataFrame(空ならempty)。
+    フェーズ3(_run_tail_group_predictions)が同じ結果を再利用するため、
+    保存だけでなく呼び出し元へ返す。
+    """
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return pd.DataFrame()
+    max_date = all_dates[-1]
+
+    group_series = pt.tail_digit_group(scored['台番号'])
+    result = pt.build_group_calendar_conditions(scored, hole_name, group_series)
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result, str(max_date), group_types='台番号末尾',
+    )
+    return result
+
+
+def _run_machine_group_conditions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> dict:
+    """
+    [今後の実装予定.md 1.8節「機種単位の癖分析」] グループ=機種で末尾版と同じ検出器
+    (patterns.build_group_calendar_conditions)を看板機種検定(include_constant=True)込みで
+    実行し、恒常窓(全期間)・直近窓(RECENT_TEST_WINDOW_DAYS日)の2本をgroup_calendar_conditions
+    へ保存する(グループ種別'機種'/'機種_直近'。2026-07-10ユーザー合意の案A=2窓検定並走)。
+
+    一致ルールは機種には意味がないため含めない(include_match_rules=False)。
+    machine_judgment_log(append-only)と異なり、末尾版と同じ「グループ種別単位で
+    全削除→再挿入」方式。上限キャリブレーション補正後のhigh_probを使うため、
+    _run_group_calendar_conditionsと同じ位置(compute_uplimitの後)で呼ぶ。
+
+    Returns: {'機種': DataFrame, '機種_直近': DataFrame}(フェーズ3の予測記録が再利用する)
+    """
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return {'機種': pd.DataFrame(), '機種_直近': pd.DataFrame()}
+    max_date = all_dates[-1]
+
+    group_series_full = pt.machine_group(scored)
+    result_full = pt.build_group_calendar_conditions(
+        scored, hole_name, group_series_full, group_type='機種',
+        include_match_rules=False, include_constant=True,
+    )
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result_full, str(max_date), group_types='機種',
+    )
+
+    recent_start = pd.to_datetime(max_date) - pd.Timedelta(days=int(pt.RECENT_TEST_WINDOW_DAYS - 1))
+    recent_mask = pd.to_datetime(scored['日付']) >= recent_start
+    scored_recent = scored.loc[recent_mask]
+    group_series_recent = pt.machine_group(scored_recent)
+    result_recent = pt.build_group_calendar_conditions(
+        scored_recent, hole_name, group_series_recent, group_type='機種_直近',
+        include_match_rules=False, include_constant=True,
+    )
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result_recent, str(max_date), group_types='機種_直近',
+    )
+
+    return {'機種': result_full, '機種_直近': result_recent}
+
+
+def _run_machine_group_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    group_results: dict,
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.8節「機種単位の癖分析」] S_機種/S_機種_直近の翌観測日予測を
+    prediction_logへ追記する(並走記録のみ。合成スコア(狙い目度)へは混ぜない。
+    prediction_accuracyで的中実績を確認してから合流を判断する、S_末尾と同じ運用)。
+
+    group_results(_run_machine_group_conditionsが返す、この店舗の恒常窓/直近窓それぞれの
+    全仮説)のうちBH有意=Trueの行だけを使い、使用データ最終日に在籍していた全台について
+    機種→台展開でpatterns.predict_machine_group_next_dayを計算する(台単位で書くのは
+    evaluate_predictions.pyが実測差枚と台単位で突合するため、末尾版と同じ設計)。
+
+    S_末尾と同様、長期/短期のブレンドは行わない(使用alpha=0.0固定)。
+    """
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return 0
+    max_date = all_dates[-1]
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+
+    hole_last_day = scored[(scored['ホール名'] == hole_name) & (scored['日付'] == max_date)]
+    if 'is_invalid' in hole_last_day.columns:
+        hole_last_day = hole_last_day[~hole_last_day['is_invalid'].fillna(True)]
+    units = hole_last_day[['機種名', '台番号']].dropna().drop_duplicates()
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = []
+    for group_type, pred_type in (('機種', 'S_機種'), ('機種_直近', 'S_機種_直近')):
+        group_result = group_results.get(group_type, pd.DataFrame())
+        if group_result.empty:
+            continue
+        sig = group_result[group_result['BH有意']]
+        if sig.empty:
+            continue
+        for _, u in units.iterrows():
+            machine, unit = u['機種名'], int(u['台番号'])
+            pred = pt.predict_machine_group_next_day(machine, next_date, sig)
+            if pred is None:
+                continue
+            rows.append({
+                '実行日時': now,
+                '使用データ最終日': str(max_date),
+                '対象日': next_date.strftime('%Y-%m-%d'),
+                'ホール名': hole_name,
+                '機種名': machine,
+                '台番号': unit,
+                '予測種別': pred_type,
+                '長期スコア': pred['値'],
+                '短期スコア': None,
+                'ブレンド値': pred['値'],
+                '使用alpha': 0.0,
+                '詳細': {'該当条件': pred['該当条件']},
+            })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
+def _run_tail_group_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    group_result: 'pd.DataFrame',
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.8節「末尾版」フェーズ3] S_末尾の翌観測日予測をprediction_logへ
+    追記する(並走記録のみ。合成スコア(狙い目度)へは混ぜない。prediction_accuracyで
+    的中実績を確認してから合流を判断する、遷移予測と同じ運用)。
+
+    group_result(_run_group_calendar_conditionsが返す、この店舗の全仮説)のうち
+    BH有意=Trueの行だけを使い、使用データ最終日に判定可能だった全台について
+    patterns.predict_tail_group_next_dayで翌観測日の予測値(該当する有意条件の
+    max効果量。重複統合込み)を計算する。
+
+    S_鉄板台等と異なり長期/短期のブレンドは行わない(2026-07-10確定設計「検出窓は
+    全期間で開始」。短期窓での再検定は今回スコープ外のため使用alpha=0.0固定、
+    長期スコア=ブレンド値として記録する)。
+    """
+    if group_result.empty:
+        return 0
+    sig = group_result[group_result['BH有意']]
+    if sig.empty:
+        return 0
+
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return 0
+    max_date = all_dates[-1]
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+
+    hole_last_day = scored[(scored['ホール名'] == hole_name) & (scored['日付'] == max_date)]
+    if 'is_invalid' in hole_last_day.columns:
+        hole_last_day = hole_last_day[~hole_last_day['is_invalid'].fillna(True)]
+    units = hole_last_day[['機種名', '台番号']].dropna().drop_duplicates()
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = []
+    for _, u in units.iterrows():
+        machine, unit = u['機種名'], int(u['台番号'])
+        pred = pt.predict_tail_group_next_day(unit, next_date, sig)
+        if pred is None:
+            continue
+        rows.append({
+            '実行日時': now,
+            '使用データ最終日': str(max_date),
+            '対象日': next_date.strftime('%Y-%m-%d'),
+            'ホール名': hole_name,
+            '機種名': machine,
+            '台番号': unit,
+            '予測種別': 'S_末尾',
+            '長期スコア': pred['値'],
+            '短期スコア': None,
+            'ブレンド値': pred['値'],
+            '使用alpha': 0.0,
+            '詳細': {'該当条件': pred['該当条件']},
+        })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
 def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str | None = None) -> None:
     """指定店舗のslot_dataから stage3_scores / store_profile を再計算して書き込む。"""
     replica_db = replica_db or str(ds.REPLICA_DB_PATH)
@@ -373,6 +598,26 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     # Stage3出力を保存(機能Aの初期表示高速化・機能Bの「熱い台」が読む)。
     # 上限キャリブレーション補正後の値を保存するため、補正が終わったここで書き込む
     sc.write_stage3_scores(analysis_db, hole_name, scored)
+
+    # [2026-07-09設計合意] 機種×日の全台系/高配分判定をmachine_judgment_logへ記録
+    # (上限キャリブレーション補正後のhigh_probを使うため、write_stage3_scoresと同じ位置)
+    n_judgment = _run_zentaikei_judgment(scored, hole_name, analysis_db)
+
+    # [今後の実装予定.md 1.8節「末尾版」フェーズ2] 台番号末尾グループのカレンダー構造検定を保存
+    group_calendar_result = _run_group_calendar_conditions(scored, hole_name, analysis_db)
+    n_group_calendar = int(group_calendar_result['BH有意'].sum()) if not group_calendar_result.empty else 0
+    # [今後の実装予定.md 1.8節「末尾版」フェーズ3] S_末尾の翌観測日予測をprediction_logへ追記
+    n_tail_pred = _run_tail_group_predictions(scored, hole_name, group_calendar_result, analysis_db)
+
+    # [今後の実装予定.md 1.8節「機種単位の癖分析」] 看板機種+機種カレンダー癖を
+    # 恒常窓/直近90日窓の2窓で検定・保存し、S_機種/S_機種_直近の翌観測日予測を追記
+    machine_group_results = _run_machine_group_conditions(scored, hole_name, analysis_db)
+    n_machine_calendar = sum(
+        int(r['BH有意'].sum()) for r in machine_group_results.values() if not r.empty
+    )
+    n_machine_pred = _run_machine_group_predictions(
+        scored, hole_name, machine_group_results, analysis_db
+    )
 
     # [Stage7-3] 遷移モデルによる全台翌日予測。上限キャリブレーション補正後の
     # high_probを入力にするため、compute_uplimitの後に呼ぶ
@@ -423,7 +668,9 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'({len(synthesized):,}行、上限キャリブレーション発動'
         f'{uplimit_result["発動日数"]}/{uplimit_result["対象日数"]}日、'
         f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
-        f'据え置き予測{n_sueki}台)。'
+        f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件、'
+        f'末尾版有意{n_group_calendar}件・予測{n_tail_pred}台、'
+        f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台)。'
     )
 
 
