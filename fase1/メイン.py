@@ -73,37 +73,44 @@ def process_store(con, hole_name: str):
 
     if not remaining:
         logger.info(f'{hole_name}: 対象期間のデータはすべてDB済みです')
-        return
+        return con
 
     logger.info(f'{hole_name}: {len(remaining)} 日分を取得します')
 
     session = create_session()
     try:
         for i, day in enumerate(remaining):
-            url = build_url(hole_name, day)
             t_start = time.monotonic()
             try:
-                data_list, data_column_list, data_row_list, missing_machines = get_info(session, url, day)
-                if data_list:
-                    write_db(con, data_list, data_column_list, data_row_list, hole_name, day)
-                for machine_name, reason in missing_machines:
-                    write_missing(con, hole_name, day, machine_name, reason)
-                    logger.warning(f'{day} 欠損記録: 機種={machine_name!r} 理由={reason}')
-                    if machine_name:
-                        write_null_record(con, hole_name, day, machine_name)
+                _fetch_and_write(con, session, hole_name, day)
             except AccessForbiddenError:
                 # 403はIP単位のブロックのため、この店舗だけでなく全店舗の処理を中止する
                 # (残り店舗への無駄なリクエストで被ブロック実績を積まない)
                 raise
             except Exception as e:
-                logger.error(f'{hole_name}: {day} の処理に失敗: {e}')
-                # 書き込み失敗でトランザクションが開きっぱなしのまま残ると、次の日の
-                # 書き込みが「connection has reached an invalid state, started with Txn」で
-                # 巻き添え失敗するため、ここで後始末してから次の日へ進む
-                try:
-                    con.rollback()
-                except Exception as rollback_err:
-                    logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
+                if _is_stream_error(e):
+                    # ストリーム失効は同じconnectionでは以降ずっと再現するため、
+                    # 再接続してこの日を再試行する(次の日へ進んでも直らない)
+                    logger.warning(f'{hole_name}: {day} でDBストリームが失効しました。再接続して再試行します: {e}')
+                    con.close()
+                    con = get_connection()
+                    try:
+                        _fetch_and_write(con, session, hole_name, day)
+                    except Exception as e2:
+                        logger.error(f'{hole_name}: {day} の再試行にも失敗: {e2}')
+                        try:
+                            con.rollback()
+                        except Exception as rollback_err:
+                            logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
+                else:
+                    logger.error(f'{hole_name}: {day} の処理に失敗: {e}')
+                    # 書き込み失敗でトランザクションが開きっぱなしのまま残ると、次の日の
+                    # 書き込みが「connection has reached an invalid state, started with Txn」で
+                    # 巻き添え失敗するため、ここで後始末してから次の日へ進む
+                    try:
+                        con.rollback()
+                    except Exception as rollback_err:
+                        logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
             if i < len(remaining) - 1:
                 if (i + 1) == LONG_BREAK_AT:
                     logger.info(f'{i + 1}件完了。試験的に{LONG_BREAK_SECONDS}秒の長め休憩に入ります')
@@ -125,6 +132,26 @@ def process_store(con, hole_name: str):
     finally:
         session.close()
 
+    return con
+
+
+def _is_stream_error(e: Exception) -> bool:
+    """埋め込みレプリカ接続のHranaストリームがサーバー側で失効した場合のエラー。
+    数時間の長時間接続で発生し、同じconnectionでは以降ずっと同じ失敗を繰り返すため再接続が必要。"""
+    return 'stream not found' in str(e)
+
+
+def _fetch_and_write(con, session, hole_name: str, day: str):
+    url = build_url(hole_name, day)
+    data_list, data_column_list, data_row_list, missing_machines = get_info(session, url, day)
+    if data_list:
+        write_db(con, data_list, data_column_list, data_row_list, hole_name, day)
+    for machine_name, reason in missing_machines:
+        write_missing(con, hole_name, day, machine_name, reason)
+        logger.warning(f'{day} 欠損記録: 機種={machine_name!r} 理由={reason}')
+        if machine_name:
+            write_null_record(con, hole_name, day, machine_name)
+
 
 EXIT_CODE_FORBIDDEN = 43  # 403検知時の専用終了コード(fase4/run_daily.pyが判別に使う)
 
@@ -137,7 +164,7 @@ def main():
         setup_db(con)
         try:
             for hole_name in stores:
-                process_store(con, hole_name)
+                con = process_store(con, hole_name)
         except AccessForbiddenError as e:
             logger.error(f'アクセス拒否(403)のため全店舗の処理を中止します: {e}')
             forbidden = True

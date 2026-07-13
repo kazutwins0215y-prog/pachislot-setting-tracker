@@ -1,3 +1,6 @@
+import truststore
+truststore.inject_into_ssl()  # certifiではなくWindows証明書ストアを使う(Norton等のHTTPSスキャンによる証明書差し替え対策)
+
 import requests
 import urllib3
 from bs4 import BeautifulSoup
@@ -53,12 +56,13 @@ def build_url(slug: str, date: str) -> str:
 def fetch_page(session: requests.Session, url: str) -> requests.Response:
     for attempt in range(MAX_RETRIES):
         try:
-            response = session.get(url, timeout=30)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.SSLError:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            response = session.get(url, verify=False, timeout=30)
+            try:
+                response = session.get(url, timeout=30)
+            except requests.exceptions.SSLError:
+                # SSL検証失敗時のフォールバック。raise_for_statusは下の共通経路で
+                # 実行する(ここで呼ぶと403→AccessForbiddenError変換を素通りするため)
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                response = session.get(url, verify=False, timeout=30)
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
