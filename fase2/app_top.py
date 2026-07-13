@@ -5,9 +5,11 @@ app_top.py — 機能B再設計 Phase4 + 2026-07 UIリニューアル: トップ
   用途: 家を出る前に「今どの店が狙い目か」「明日どの台が狙い目か」を一目で確認する
   内容:
     1. render_recommend_stores(): MM/DD(曜)のおすすめ店舗
-       (当日・符号付き合成スコアのプラス上位3+マイナス下位3、表形式・色分け)
+       (「設定予測の的中が期待できる店舗」ランキング(案cハイブリッド、2026-07-13決定事項)の
+        上位3+下位3、表形式・色分け。稼働の低さはランキング外の添え列)
     2. render_hot_predictions(): MM/DD(曜)の熱い台予測
-       (店舗ごと/全店舗横断、個別台・機種・ローテ・新台・増台・移動台・据えの7タブ)
+       (店舗ごと/全店舗横断、個別台・機種・ローテ・新台・増台・移動台・据えの7タブ。
+        各タブのスコアは符号付きパーセンタイル(2026-07-13決定事項「案b」)に統一表示)
 
 的中率・信頼度が低くても候補を非表示にはしない(機能B再設計1節の決定通り。
 最終判断は人間が行う前提)。的中率はPhase3のprediction_accuracyを読むだけで、
@@ -221,10 +223,22 @@ def _date_label(date_str: str | None) -> str:
 # ── Streamlit エントリポイント ────────────────────────────────────
 
 
+def _load_kadou_lookup(profiles: pd.DataFrame) -> dict[str, float]:
+    """store_profileからS_稼働低さ(パターン's_kadou')をホール名→スコアの辞書で返す(添え表示用)。"""
+    if profiles.empty:
+        return {}
+    kadou = profiles[profiles['パターン'] == 's_kadou'].dropna(subset=['スコア'])
+    return {r['ホール名']: float(r['スコア']) for _, r in kadou.iterrows()}
+
+
 def render_recommend_stores() -> None:
     """
     「MM/DD(曜)のおすすめ店舗」本体。app.pyのホームページから呼ばれる。
-    合成スコアのプラス上位3+マイナス下位3の計6店舗を表形式・色分けで表示する。
+
+    [今後の実装予定.md 4節「機能B理想形」項目1、2026-07-13決定事項] 「設定予測の的中が
+    期待できる店舗」ランキングに変更(旧: 当日記述型を含む7軸の単純加重平均だった合成スコア)。
+    案cハイブリッド(app_b.compute_store_recommend_score)を上位3+下位3の計6店舗で表示し、
+    S_稼働低さはランキングから外して添え列として別掲する。
     """
     import streamlit as st
 
@@ -241,30 +255,45 @@ def render_recommend_stores() -> None:
 
     with st.spinner('データ読み込み中...'):
         profiles = ab.load_all_profiles()
-        weights = ab.load_weights()
-        synth_df = ab.synthesize_scores(profiles, weights)
         target_date = _load_target_date(analysis_db)
+        kadou_lookup = _load_kadou_lookup(profiles)
+        holes = sorted(set(profiles['ホール名'])) if not profiles.empty else []
+        rows = [
+            {'ホール名': hole, **ab.compute_store_recommend_score(analysis_db, hole),
+             '稼働低さ': kadou_lookup.get(hole)}
+            for hole in holes
+        ]
+        rank_df = pd.DataFrame(rows)
 
     st.header(f'{_date_label(target_date)}のおすすめ店舗')
+    st.caption(
+        '「設定予測の的中が期待できる店舗」のランキングです(稼働の低さは参考情報として'
+        '別掲するのみで、ランキングには使いません)。実績データが十分な軸はprediction_accuracyの'
+        '相関、未蓄積の軸は有意な検出条件の数×効果量を暫定指標とします'
+        '(今後の実装予定.md 4節「機能B理想形」項目1、案cハイブリッド)。'
+    )
 
-    if synth_df.empty:
+    if rank_df.empty:
         st.warning(
             'store_profile データがありません。'
             'fase2/run_store_profile.py を先に実行してください。'
         )
         return
 
-    ranked = synth_df.dropna(subset=['合成スコア']).sort_values('合成スコア', ascending=False)
+    ranked = rank_df.dropna(subset=['おすすめ度']).sort_values('おすすめ度', ascending=False)
     if ranked.empty:
-        st.info('合成スコアを計算できる店舗がありません。')
+        st.info('おすすめ度を計算できる店舗がありません。')
         return
 
     combined = pd.concat(
         [ranked.head(_TOP_N_STORES), ranked.tail(_TOP_N_STORES)]
     ).drop_duplicates(subset=['ホール名'])
 
-    disp = combined[['ホール名', '合成スコア']].reset_index(drop=True)
-    styled = ui.style_signed(disp, ['合成スコア']).format({'合成スコア': '{:+.3f}'})
+    disp = combined[['ホール名', 'おすすめ度', '実績軸数', '有効軸数', '稼働低さ']].reset_index(drop=True)
+    styled = ui.style_signed(disp, ['おすすめ度']).format({
+        'おすすめ度': '{:+.2f}',
+        '稼働低さ': lambda v: f'{v:.2f}' if pd.notna(v) else '-',
+    })
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
@@ -319,6 +348,139 @@ def _load_store_reliabilities(analysis_db: str) -> dict[tuple[str, str], float]:
     except Exception:
         return {}
     return {(r['ホール名'], r['パターン']): r['信頼度'] for _, r in df.iterrows()}
+
+
+def _split_pos_neg(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """符号付きパーセンタイルの参照分布用に、NaN除去のうえ正/負に分割する。"""
+    finite = values[~np.isnan(values)]
+    return finite[finite > 0], finite[finite < 0]
+
+
+def _load_blend_value_reference(analysis_db: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目2] 個別台タブの符号付きパーセンタイル参照分布
+    (prediction_logの全履歴ブレンド値、予測種別='S_鉄板台')。
+    """
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            df = pd.read_sql_query(
+                "SELECT ブレンド値 AS v FROM prediction_log "
+                "WHERE 予測種別 = 'S_鉄板台' AND ブレンド値 IS NOT NULL", con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return np.array([]), np.array([])
+    return _split_pos_neg(df['v'].to_numpy(dtype=float))
+
+
+def _load_machine_avg_blend_reference(analysis_db: str) -> tuple[np.ndarray, np.ndarray]:
+    """機種タブの符号付きパーセンタイル参照分布(機種×対象日ごとの平均ブレンド値の全履歴)。"""
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            df = pd.read_sql_query(
+                "SELECT AVG(ブレンド値) AS v FROM prediction_log "
+                "WHERE 予測種別 = 'S_鉄板台' AND ブレンド値 IS NOT NULL "
+                "GROUP BY ホール名, 機種名, 対象日", con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return np.array([]), np.array([])
+    return _split_pos_neg(df['v'].to_numpy(dtype=float))
+
+
+def _load_stage3_column_reference(analysis_db: str, column: str) -> tuple[np.ndarray, np.ndarray]:
+    """ローテ/新台増台/移動台/据えタブの符号付きパーセンタイル参照分布(stage3_scores列の全履歴)。"""
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return np.array([]), np.array([])
+            cols = [row[1] for row in con.execute('PRAGMA table_info(stage3_scores)').fetchall()]
+            if column not in cols:
+                return np.array([]), np.array([])
+            df = pd.read_sql_query(
+                f'SELECT "{column}" AS v FROM stage3_scores WHERE "{column}" IS NOT NULL', con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return np.array([]), np.array([])
+    return _split_pos_neg(df['v'].to_numpy(dtype=float))
+
+
+def signed_percentile(value: float, positive_ref: np.ndarray, negative_ref: np.ndarray) -> float:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目2、2026-07-13決定事項「案b・0固定アンカー」]
+    符号は生スコアのまま、大きさは同符号の履歴分布内でのパーセンタイル順位(0〜1)に変換する。
+    0(または参照分布が空)は「信号なし」として0を返す。素の順位パーセンタイルと異なり、
+    符号を保持するため「逆効果」と「プラスだが相対的に弱い」を区別できる。
+    """
+    if value is None or pd.isna(value) or value == 0:
+        return 0.0
+    if value > 0:
+        if positive_ref is None or len(positive_ref) == 0:
+            return 0.0
+        return float((positive_ref <= value).mean())
+    if negative_ref is None or len(negative_ref) == 0:
+        return 0.0
+    return -float((negative_ref >= value).mean())
+
+
+def _apply_signed_percentile(
+    df: pd.DataFrame, raw_col: str, pos_ref: np.ndarray, neg_ref: np.ndarray, new_col: str = '予測スコア',
+) -> pd.DataFrame:
+    """生スコア列(raw_col)を符号付きパーセンタイルに変換し、7タブ共通の表示列名(new_col)へ差し替える。"""
+    out = df.copy()
+    out[new_col] = out[raw_col].apply(lambda v: signed_percentile(v, pos_ref, neg_ref))
+    if new_col != raw_col:
+        out = out.drop(columns=[raw_col])
+    return out
+
+
+def _fmt_signed_pct(v: float) -> str:
+    """符号付きパーセンタイルの表示用フォーマット(0は符号なし、それ以外は+/-付きの%)。"""
+    if pd.isna(v):
+        return ''
+    if v == 0:
+        return '0%'
+    return f'{v:+.0%}'
+
+
+def _load_latest_introduction_categories(analysis_db: str) -> dict[tuple[str, str], str]:
+    """
+    [今後の実装予定.md 1.8.3節「導入後カーブ」実装ステップ4] introduction_eventsから
+    (ホール名, 機種名)ごとの最新イベント(日付が最大、'判別不能'は除く)のカテゴリを返す。
+    新台/増台タブの振り分けに使う。
+    """
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'introduction_events' not in tables:
+                return {}
+            df = pd.read_sql_query(
+                "SELECT ホール名, 機種名, 日付, カテゴリ FROM introduction_events "
+                "WHERE カテゴリ != '判別不能'",
+                con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    latest_idx = df.groupby(['ホール名', '機種名'])['日付'].idxmax()
+    latest = df.loc[latest_idx]
+    return {(r['ホール名'], r['機種名']): r['カテゴリ'] for _, r in latest.iterrows()}
 
 
 # ── 熱い台予測: 7タブの中身 ───────────────────────────────────────
@@ -399,11 +561,19 @@ def _tab_rotation(
 def _tab_breadth_unit(
     snapshot: pd.DataFrame, reliabilities: dict, pattern_key: str,
     hole: str | None, top_n: int,
+    category_lookup: dict[tuple[str, str], str] | None = None,
+    required_category: str | None = None,
 ) -> pd.DataFrame | None:
     """
     新台/増台/移動台タブ共通: S_新台増台またはS_移動台が閾値超かつ店舗信頼度が閾値以上の台を上位N件。
-    [今後の実装予定.md 1.4節] 新台/増台タブは現状同じS_新台増台データを表示している
-    (detect_eventsが「機種の店舗初出」と「既存機種の台数追加」を区別していないため)。
+
+    [今後の実装予定.md 1.8.3節「導入後カーブ」実装ステップ4] 新台/増台タブはpattern_key=
+    's_shintai'で同じS_新台増台データを使うが、required_category('新台'/'増台')で
+    introduction_events(patterns.detect_introduction_events)の機種の最新イベント
+    カテゴリに応じて対象機種を絞り込む(旧detect_events由来のS_新台増台には復帰ノイズが
+    混入していたが、detect_introduction_eventsが除外済みのカテゴリなのでここで
+    自然にふるい落とされる。カテゴリ情報が無い機種はどちらのタブにも出ない)。
+    移動台タブ(required_category=None)は絞り込みなし(現状維持、本節のスコープ外)。
     """
     score_col, rel_key = {
         's_shintai': ('S_新台増台', 's_shintai'),
@@ -421,6 +591,16 @@ def _tab_breadth_unit(
     df = df[df['信頼度'].fillna(0) >= _RELIABILITY_GATE]
     if df.empty:
         return None
+    if required_category is not None:
+        category_lookup = category_lookup or {}
+        df = df[
+            df.apply(
+                lambda r: category_lookup.get((r['ホール名'], r['機種名'])) == required_category,
+                axis=1,
+            )
+        ]
+        if df.empty:
+            return None
     df = df.sort_values(score_col, ascending=False).head(top_n)
     df = df.copy()
     df['台'] = df['機種名'] + ' ' + df['台番号'].astype(int).astype(str) + '番台'
@@ -483,6 +663,8 @@ def _render_prediction_tabs(
     top_n: int,
     stale_info: dict | None = None,
     target_date: str | None = None,
+    introduction_categories: dict[tuple[str, str], str] | None = None,
+    score_refs: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> None:
     """7タブ(個別台/機種/ローテ/新台/増台/移動台/据え)を描画する。該当なしは st.info。"""
     import streamlit as st
@@ -493,8 +675,20 @@ def _render_prediction_tabs(
         '個別台': (lambda: _tab_individual(pred_df, acc_lookup, hole, top_n), 'ブレンド値'),
         '機種': (lambda: _tab_machine(pred_df, acc_lookup, hole, top_n), '平均ブレンド値'),
         'ローテ': (lambda: _tab_rotation(snapshot, reliabilities, hole, top_n), 'S_ローテ'),
-        '新台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_shintai', hole, top_n), 'S_新台増台'),
-        '増台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_shintai', hole, top_n), 'S_新台増台'),
+        '新台': (
+            lambda: _tab_breadth_unit(
+                snapshot, reliabilities, 's_shintai', hole, top_n,
+                category_lookup=introduction_categories, required_category='新台',
+            ),
+            'S_新台増台',
+        ),
+        '増台': (
+            lambda: _tab_breadth_unit(
+                snapshot, reliabilities, 's_shintai', hole, top_n,
+                category_lookup=introduction_categories, required_category='増台',
+            ),
+            'S_新台増台',
+        ),
         '移動台': (lambda: _tab_breadth_unit(snapshot, reliabilities, 's_idoudai', hole, top_n), 'S_移動台'),
         '据え': (lambda: _tab_sueki(snapshot, reliabilities, hole, top_n), '予測スコア'),
     }
@@ -512,7 +706,11 @@ def _render_prediction_tabs(
                 continue
             # 詳細列はタスク2の根拠文生成専用(個別台タブのみ)。表には出さない
             display_df = result.drop(columns=['詳細']) if '詳細' in result.columns else result
-            styled = ui.style_signed(display_df, [color_col]).format({color_col: '{:+.3f}'})
+            # [今後の実装予定.md 4節 項目2] 生スコアは軸ごとにスケールが異なるため、
+            # 符号付きパーセンタイル(全店舗・全期間の実績分布内での相対位置)に統一して表示する
+            pos_ref, neg_ref = (score_refs or {}).get(name, (np.array([]), np.array([])))
+            display_df = _apply_signed_percentile(display_df, color_col, pos_ref, neg_ref)
+            styled = ui.style_signed(display_df, ['予測スコア']).format({'予測スコア': _fmt_signed_pct})
             if '鮮度' in display_df.columns:
                 styled = ui.style_stale_rows(styled, display_df['鮮度'] != '')
             st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -549,8 +747,26 @@ def render_hot_predictions() -> None:
         acc_df = _load_prediction_accuracy(analysis_db)
         snapshot = _load_latest_snapshot(analysis_db)
         reliabilities = _load_store_reliabilities(analysis_db)
+        introduction_categories = _load_latest_introduction_categories(analysis_db)
+        # [今後の実装予定.md 4節「機能B理想形」項目2] 符号付きパーセンタイルの参照分布を
+        # 軸ごとに1回だけ読み込む(店舗別・全店舗横断の両方でこの同じ分布を使うことで、
+        # タブ間だけでなく店舗間でもスコアのスケールが揃う)
+        score_refs = {
+            '個別台': _load_blend_value_reference(analysis_db),
+            '機種': _load_machine_avg_blend_reference(analysis_db),
+            'ローテ': _load_stage3_column_reference(analysis_db, 'S_ローテ'),
+            '新台': _load_stage3_column_reference(analysis_db, 'S_新台増台'),
+            '増台': _load_stage3_column_reference(analysis_db, 'S_新台増台'),
+            '移動台': _load_stage3_column_reference(analysis_db, 'S_移動台'),
+            '据え': _load_stage3_column_reference(analysis_db, 'S_据え置き'),
+        }
 
     st.header(f'{_date_label(target_date)}の熱い台予測')
+    st.caption(
+        'スコアは符号付きパーセンタイルで統一表示しています'
+        '(符号は生スコアのまま、大きさは全店舗・全期間の同符号履歴内での相対位置。'
+        '0=シグナルなし)。'
+    )
 
     acc_lookup: dict[tuple, pd.Series] = {}
     if not acc_df.empty:
@@ -576,6 +792,7 @@ def render_hot_predictions() -> None:
             _render_prediction_tabs(
                 sel_hole, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_PER_STORE,
                 stale_info=stale_info, target_date=target_date,
+                introduction_categories=introduction_categories, score_refs=score_refs,
             )
         else:
             st.caption('店舗を選択すると7タブで予測を表示します。')
@@ -587,4 +804,5 @@ def render_hot_predictions() -> None:
     _render_prediction_tabs(
         None, pred_df, acc_lookup, snapshot, reliabilities, _TOP_N_CROSS_STORE,
         stale_info=stale_info, target_date=target_date,
+        introduction_categories=introduction_categories, score_refs=score_refs,
     )

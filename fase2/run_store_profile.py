@@ -489,6 +489,120 @@ def _run_machine_group_predictions(
     return len(rows)
 
 
+def _run_introduction_conditions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> tuple['pd.DataFrame', 'pd.DataFrame']:
+    """
+    [今後の実装予定.md 1.8.3節「導入後カーブ」] 機種レベルイベント(新台/増台/減台/
+    再導入/純移動)を検出し、導入後カーブの検定結果をgroup_calendar_conditionsへ
+    保存する(グループ種別'導入後')。teppan_conditions/末尾版/機種版と同じ
+    「店舗単位で全削除→再挿入」方式。上限キャリブレーション補正後のhigh_probを
+    使うため、compute_uplimitの後(write_stage3_scoresと同じ位置)で呼ぶ。
+
+    Returns: (検定結果DataFrame, イベント検出結果DataFrame)
+    フェーズ3(_run_introduction_predictions)が両方を再利用するため呼び出し元へ返す。
+    """
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return pd.DataFrame(), pd.DataFrame()
+    max_date = all_dates[-1]
+
+    events = pt.detect_introduction_events(scored, hole_name)
+    sc.write_introduction_events(analysis_db, hole_name, events)
+    result = pt.introduction_curve_test(scored, hole_name, events)
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result, str(max_date), group_types='導入後',
+    )
+    return result, events
+
+
+def _run_introduction_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    condition_result: 'pd.DataFrame',
+    events: 'pd.DataFrame',
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.8.3節「導入後カーブ」] S_導入後の翌観測日予測を
+    prediction_logへ追記する(並走記録のみ。合成スコアへは混ぜない。
+    prediction_accuracyで的中実績を確認してから合流を判断する、
+    S_末尾/S_機種と同じ運用)。
+
+    機種ごとに最新のイベント(判別不能を除く5カテゴリのうち日付が最も新しいもの。
+    introduction_curve_testのウィンドウ打ち切りと同じ「次のイベントで前のイベントの
+    影響を打ち切る」考え方に合わせ、最新イベントのみを予測に使う)を特定し、
+    翌観測日までの経過日数(暦日)が14日未満ならS_導入後を予測する。
+    純移動はイベント時に実際に移動した台のみ、それ以外4カテゴリは使用データ最終日
+    時点でその機種に在籍する全台へ同じ予測値を書く(introduction_curve_testの
+    検定対象が台単位/機種単位のどちらかに合わせた粒度)。
+    """
+    if condition_result.empty or events.empty:
+        return 0
+    sig = condition_result[condition_result['BH有意']]
+    if sig.empty:
+        return 0
+
+    non_censored = events[events['カテゴリ'] != '判別不能']
+    if non_censored.empty:
+        return 0
+
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return 0
+    max_date = all_dates[-1]
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+
+    latest_events = non_censored.loc[non_censored.groupby('機種名')['日付'].idxmax()]
+
+    hole_last_day = scored[(scored['ホール名'] == hole_name) & (scored['日付'] == max_date)]
+    if 'is_invalid' in hole_last_day.columns:
+        hole_last_day = hole_last_day[~hole_last_day['is_invalid'].fillna(True)]
+    units_by_machine = (
+        hole_last_day[['機種名', '台番号']].dropna().drop_duplicates()
+        .groupby('機種名')['台番号'].apply(lambda s: sorted(int(u) for u in s))
+    )
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = []
+    for _, ev in latest_events.iterrows():
+        machine = ev['機種名']
+        category = ev['カテゴリ']
+        elapsed = (next_date - pd.Timestamp(ev['日付'])).days
+        pred = pt.predict_introduction_next_day(category, elapsed, sig)
+        if pred is None:
+            continue
+
+        if category == '純移動':
+            target_units = ev['移動台番号リスト']
+            if not isinstance(target_units, (list, np.ndarray)) or len(target_units) == 0:
+                continue
+            target_units = [int(u) for u in target_units]
+        else:
+            target_units = units_by_machine.get(machine, [])
+
+        for unit in target_units:
+            rows.append({
+                '実行日時': now,
+                '使用データ最終日': str(max_date),
+                '対象日': next_date.strftime('%Y-%m-%d'),
+                'ホール名': hole_name,
+                '機種名': machine,
+                '台番号': unit,
+                '予測種別': 'S_導入後',
+                '長期スコア': pred['値'],
+                '短期スコア': None,
+                'ブレンド値': pred['値'],
+                '使用alpha': 0.0,
+                '詳細': {'該当条件': pred['該当条件']},
+            })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
 def _run_tail_group_predictions(
     scored: 'pd.DataFrame',
     hole_name: str,
@@ -619,6 +733,18 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         scored, hole_name, machine_group_results, analysis_db
     )
 
+    # [今後の実装予定.md 1.8.3節「導入後カーブ」] 機種レベルイベント(新台/増台/減台/
+    # 再導入/純移動)を検出し、導入後カーブを検定・保存。S_導入後の翌観測日予測を追記
+    introduction_result, introduction_events = _run_introduction_conditions(
+        scored, hole_name, analysis_db
+    )
+    n_introduction_sig = (
+        int(introduction_result['BH有意'].sum()) if not introduction_result.empty else 0
+    )
+    n_introduction_pred = _run_introduction_predictions(
+        scored, hole_name, introduction_result, introduction_events, analysis_db
+    )
+
     # [Stage7-3] 遷移モデルによる全台翌日予測。上限キャリブレーション補正後の
     # high_probを入力にするため、compute_uplimitの後に呼ぶ
     n_transition, n_transition_strat, matrix_long = _run_transition_predictions(
@@ -670,7 +796,8 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
         f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件、'
         f'末尾版有意{n_group_calendar}件・予測{n_tail_pred}台、'
-        f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台)。'
+        f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台、'
+        f'導入後有意{n_introduction_sig}件・予測{n_introduction_pred}台)。'
     )
 
 

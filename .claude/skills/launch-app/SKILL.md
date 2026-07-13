@@ -1,6 +1,6 @@
 ---
 name: launch-app
-description: Use when the user asks to start, launch, run, or open 機能A / 機能B / the Streamlit app ("機能Aを起動", "機能Bを開いて", "アプリを起動して", "ダッシュボードを見たい" など). Covers the command to launch the integrated Streamlit entry point (home page + per-store pages).
+description: Use when the user asks to start, launch, run, or open 機能A / 機能B / the Streamlit app / the ground truth entry form ("機能Aを起動", "機能Bを開いて", "アプリを起動して", "ダッシュボードを見たい", "正解発表フォームを開いて", "ground_truth入力" など). Covers the command to launch the integrated Streamlit entry point (home page + per-store pages) and the separate local-only ground truth entry app.
 ---
 
 # 機能A/B起動 skill
@@ -31,3 +31,24 @@ streamlit run fase2/app.py
   最新化したい場合は先に`fase2/run_store_profile.py`を実行する
   （[`add-new-store`](../add-new-store/SKILL.md) skill参照）。
 - `streamlit`未インストールの場合は`pip install streamlit`が必要（fase1の`requirements.txt`には含まれない）。
+
+## 正解発表(ground truth)の入力フォーム
+
+店舗の設定発表を手入力する場合は別アプリ（`app.py`には統合されないローカル専用ツール）。
+**`app.py`(判別ツール)と同時起動するとポート8501が競合するため、必ず別ポート(8502)を明示指定する**:
+
+```bash
+streamlit run fase2/ground_truth_entry.py --server.port 8502
+```
+
+日付→ホール→機種名→台番号の順でレプリカ`slot_data`から候補を絞り込みながら
+`ホールデータ/ground_truth.db`へ記録する。詳細は
+[`fase2/今後の実装予定.md`](../../../fase2/今後の実装予定.md)3節参照。
+
+## 2アプリ同時起動時のポート運用
+
+`app.py`(判別ツール)と`ground_truth_entry.py`(正解発表フォーム)を両方起動する場合、
+**`app.py`は既定ポート8501、`ground_truth_entry.py`は`--server.port 8502`固定**とし、
+`ground_truth_entry.py`側は起動コマンドに常にこのオプションを付ける
+（省略するとStreamlitが空いている方のポートを自動選択し、どちらが8501になるか
+実行順に依存して毎回変わってしまうため）。

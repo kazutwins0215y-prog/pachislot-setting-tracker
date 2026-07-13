@@ -593,6 +593,65 @@ def write_group_calendar_conditions(
         con.close()
 
 
+_CREATE_INTRODUCTION_EVENTS_SQL = '''
+    CREATE TABLE IF NOT EXISTS introduction_events (
+        ホール名       TEXT NOT NULL,
+        日付           TEXT NOT NULL,
+        機種名         TEXT NOT NULL,
+        カテゴリ       TEXT NOT NULL,
+        台数変化       INTEGER,
+        移動フラグ     INTEGER,
+        台番号リスト   TEXT,
+        移動台番号リスト TEXT,
+        不在日数       INTEGER,
+        更新日時       TEXT
+    )
+'''
+
+
+def write_introduction_events(db_path: str, hole_name: str, events_df: pd.DataFrame) -> None:
+    """
+    [今後の実装予定.md 1.8.3節「導入後カーブ」] patterns.detect_introduction_eventsの
+    出力(機種レベルイベント登記簿)を分析DBへ保存する。teppan_conditionsと同じ
+    「店舗単位で全削除→再挿入」方式(全履歴を毎回再検出するため過去分を残す必要がない)。
+
+    app_top.pyの新台/増台タブ分離(機種の最新イベントカテゴリで振り分ける)が読む他、
+    今後のデバッグ・分析用に全カテゴリ(新台/増台/減台/再導入/純移動/判別不能)を保存する
+    (台番号リスト/移動台番号リストはJSON文字列化。SQLiteに配列型が無いため)。
+    """
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = [
+        (
+            hole_name, str(r['日付']), r['機種名'], r['カテゴリ'],
+            None if pd.isna(r['台数変化']) else int(r['台数変化']),
+            int(bool(r['移動フラグ'])),
+            json.dumps([int(u) for u in r['台番号リスト']], ensure_ascii=False),
+            json.dumps([int(u) for u in r['移動台番号リスト']], ensure_ascii=False),
+            None if pd.isna(r['不在日数']) else int(r['不在日数']),
+            now,
+        )
+        for _, r in events_df.iterrows()
+    ]
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_INTRODUCTION_EVENTS_SQL)
+        con.execute('DELETE FROM introduction_events WHERE ホール名 = ?', (hole_name,))
+        if rows:
+            con.executemany(
+                '''
+                INSERT INTO introduction_events
+                    (ホール名, 日付, 機種名, カテゴリ, 台数変化, 移動フラグ,
+                     台番号リスト, 移動台番号リスト, 不在日数, 更新日時)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                rows,
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
 _CREATE_PATTERN_HISTORY_SQL = '''
     CREATE TABLE IF NOT EXISTS pattern_history (
         ホール名 TEXT NOT NULL,

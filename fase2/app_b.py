@@ -3,7 +3,9 @@ app_b.py — 振り返り分析ダッシュボード + 狙い目メモ
 
 【機能B-詳細: 店舗特徴(個別店舗詳細)】
   用途: 蓄積データからのパターン検出結果・店舗プロファイルをじっくり見る
-  内容: 各サブスコアの値と内訳 / 信頼度 / γ_store / 検知期間履歴 / カレンダーヒートマップ
+  内容: γ_store / 癖の有効性マトリクス(2026-07-13追加) / 検知期間履歴 / カレンダーヒートマップ
+    (サブスコア内訳の縦棒グラフは2026-07-13に削除。癖の有効性マトリクスが実データ
+     (prediction_accuracy等)に基づくより正確な代替のため)
     render_store_detail(profiles, 店名) … app.pyの店舗トップページ「店舗特徴」に表示
     (2026-07 UIリニューアルで店舗横断比較render_overviewは削除。
      店舗横断のおすすめ表示はapp_top.render_recommend_stores()に統合済み)
@@ -275,6 +277,175 @@ def _detect_pattern_periods(
     return pd.DataFrame(rows) if rows else empty
 
 
+def _group_consecutive_date_runs(dates: list) -> list[tuple[int, int]]:
+    """日付(datetime、昇順ソート済み)のリストから、1日刻みで連続している
+    区間の(開始インデックス, 終了インデックス+1)を返す。"""
+    if not dates:
+        return []
+    runs = []
+    start = 0
+    for i in range(1, len(dates) + 1):
+        if i == len(dates) or (dates[i] - dates[i - 1]).days > 1:
+            runs.append((start, i))
+            start = i
+    return runs
+
+
+def _load_stage3_pattern_periods(
+    db_path: str, hole_name: str, pattern_col: str, threshold: float = _PERIOD_SCORE_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 4節 項目4] stage3_scores(台×日粒度)から、指定サブスコア列が
+    thresholdを上回っている(機種名,台番号)ごとの連続区間を検出する。
+    pattern_history(店舗全体平均のみ)と異なり機種名・台番号つきで検知期間を表示できる。
+    S_鉄板台・S_移動台・S_据え置きに使う(pattern_colはstage3_scoresの列名と一致させること)。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return pd.DataFrame()
+            cols = [row[1] for row in con.execute('PRAGMA table_info(stage3_scores)').fetchall()]
+            if pattern_col not in cols:
+                return pd.DataFrame()
+            df = pd.read_sql_query(
+                f'''
+                SELECT 日付, 機種名, 台番号, "{pattern_col}" AS score
+                FROM stage3_scores
+                WHERE ホール名 = ?
+                  AND (is_invalid IS NULL OR is_invalid != 1)
+                  AND "{pattern_col}" IS NOT NULL
+                ''',
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df[df['score'] > threshold].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df['日付_dt'] = pd.to_datetime(df['日付'], errors='coerce')
+    df = df.dropna(subset=['日付_dt'])
+
+    rows = []
+    for (machine, unit), grp in df.groupby(['機種名', '台番号']):
+        grp = grp.sort_values('日付_dt')
+        dates = grp['日付_dt'].tolist()
+        scores = grp['score'].tolist()
+        for s, e in _group_consecutive_date_runs(dates):
+            rows.append({
+                '機種名': machine, '台番号': int(unit),
+                '開始': dates[s], '終了': dates[e - 1],
+                '平均スコア': float(np.mean(scores[s:e])),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def _load_zentaikei_periods(db_path: str, hole_name: str) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 4節 項目4] machine_judgment_log(機種×日×ホール粒度、
+    全台系/高配分/普段どおりの判定+台数)から、「普段どおり」以外が連続している
+    機種名ごとの区間を検出する。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'machine_judgment_log' not in tables:
+                return pd.DataFrame()
+            df = pd.read_sql_query(
+                '''
+                SELECT 日付, 機種名, 台数, 期待高設定台数, 判定ラベル
+                FROM machine_judgment_log
+                WHERE ホール名 = ? AND 判定ラベル != '普段どおり'
+                ''',
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+    df['日付_dt'] = pd.to_datetime(df['日付'], errors='coerce')
+    df = df.dropna(subset=['日付_dt'])
+
+    rows = []
+    for machine, grp in df.groupby('機種名'):
+        grp = grp.sort_values('日付_dt')
+        dates = grp['日付_dt'].tolist()
+        labels = grp['判定ラベル'].tolist()
+        counts = grp['台数'].tolist()
+        expects = grp['期待高設定台数'].tolist()
+        for s, e in _group_consecutive_date_runs(dates):
+            rows.append({
+                '機種名': machine,
+                '開始': dates[s], '終了': dates[e - 1],
+                '判定ラベル': '/'.join(sorted(set(labels[s:e]))),
+                '台数': int(round(np.mean(counts[s:e]))),
+                '期待高設定台数_平均': float(np.mean(expects[s:e])),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def _load_introduction_events(
+    db_path: str, hole_name: str, categories: tuple[str, ...],
+) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 4節 項目4] introduction_events(機種レベルイベント登記簿)から
+    指定カテゴリ(新台/増台等)の該当行を新しい順に返す。1日1イベントの単発ログのため
+    連続区間へのグルーピングはしない(S_全台系・stage3系と異なりイベント自体が離散)。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'introduction_events' not in tables:
+                return pd.DataFrame()
+            placeholders = ', '.join('?' * len(categories))
+            df = pd.read_sql_query(
+                f'''
+                SELECT 日付, 機種名, カテゴリ, 台数変化, 台番号リスト
+                FROM introduction_events
+                WHERE ホール名 = ? AND カテゴリ IN ({placeholders})
+                ORDER BY 日付 DESC
+                ''',
+                con, params=(hole_name, *categories),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+    return df
+
+
+def _format_unit_list(json_str: str | None, max_show: int = 15) -> str:
+    """台番号リスト(JSON文字列)を「12・13・14番」形式のテキストに整形する。多すぎる場合は省略。"""
+    if not json_str:
+        return ''
+    units = json.loads(json_str)
+    if len(units) > max_show:
+        shown = '・'.join(f'{u}番' for u in units[:max_show])
+        return f'{shown} 他{len(units) - max_show}台'
+    return '・'.join(f'{u}番' for u in units)
+
+
 def _load_daily_stage3_avg(db_path: str, hole_name: str) -> pd.Series:
     """stage3_scoresからhigh_probの日次平均(is_invalid除外)を返す(日付→平均値)。"""
     try:
@@ -327,6 +498,325 @@ def _month_grid(score_by_day: dict[str, float], year: int, month: int) -> tuple[
     return z, text
 
 
+# ── Phase 5(今後の実装予定.md 4節 項目5): カレンダーヒートマップ ──────────
+
+
+def _load_daily_actual_diff(hole_name: str) -> pd.Series:
+    """レプリカ(turso_replica.db)のslot_dataから日次平均差枚(店舗全体平均)を返す(日付→平均差枚)。"""
+    if not ds.REPLICA_DB_PATH.exists():
+        return pd.Series(dtype=float)
+    try:
+        con = ds.connect_replica()
+        try:
+            df = pd.read_sql_query(
+                'SELECT 日付, 差枚 FROM slot_data WHERE ホール名 = ? AND 差枚 IS NOT NULL',
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.Series(dtype=float)
+    if df.empty:
+        return pd.Series(dtype=float)
+    return df.groupby('日付')['差枚'].mean()
+
+
+def _store_relative_scores(daily: pd.Series) -> dict[str, float]:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目5] 日次系列を、店舗自身の中央値を基準にした
+    符号付きパーセンタイル(-1〜1)へ変換する(app_top.signed_percentileと同じ考え方だが、
+    0固定ではなくその店の中央値を基準にする。差枚・設定配分は店舗間でスケールが大きく
+    異なるため、絶対値ではなく「この店にとって強い/弱い日か」を表現する)。
+    """
+    if daily.empty:
+        return {}
+    median = float(daily.median())
+    above = (daily[daily > median] - median).to_numpy()
+    below = (median - daily[daily < median]).to_numpy()  # 正の「下振れ幅」
+    out: dict[str, float] = {}
+    for date, value in daily.items():
+        if pd.isna(value) or value == median:
+            out[date] = 0.0
+        elif value > median:
+            out[date] = float((above <= (value - median)).mean()) if len(above) else 0.0
+        else:
+            out[date] = -float((below <= (median - value)).mean()) if len(below) else 0.0
+    return out
+
+
+def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目5] 未来投影に使えるカレンダー型の有意条件を
+    1つのDataFrame(日付条件, 効果量)にまとめて返す。曜日・毎月X日等はgroup_calendar_conditions
+    (台番号末尾/機種/機種_直近、BH有意のみ)、周期パターンのうちカレンダー経路のもの(曜日等)は
+    teppan_conditionsから集める。一致ルール(台番号依存で店舗単位に集約できない)・
+    据え置き/遷移/導入後(未来日で該当が確定しない)は対象外(決定事項の制約)。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            frames: list[pd.DataFrame] = []
+            if 'group_calendar_conditions' in tables:
+                df = pd.read_sql_query(
+                    "SELECT グループ, 日付条件, 効果量 FROM group_calendar_conditions "
+                    "WHERE ホール名 = ? AND BH有意 = 1 "
+                    "AND グループ種別 IN ('台番号末尾', '機種', '機種_直近')",
+                    con, params=(hole_name,),
+                )
+                frames.append(df[df['グループ'] != '一致ルール'][['日付条件', '効果量']])
+            if 'teppan_conditions' in tables:
+                df2 = pd.read_sql_query(
+                    "SELECT 条件 AS 日付条件, 効果量 FROM teppan_conditions "
+                    "WHERE ホール名 = ? AND 経路 = 'カレンダー'",
+                    con, params=(hole_name,),
+                )
+                frames.append(df2)
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame(columns=['日付条件', '効果量'])
+    if not frames:
+        return pd.DataFrame(columns=['日付条件', '効果量'])
+    return pd.concat(frames, ignore_index=True).dropna(subset=['効果量'])
+
+
+def _project_future_calendar_scores(conditions: pd.DataFrame, dates: list) -> dict[str, float]:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目5] カレンダー型の有意条件を将来日付へ照合し、
+    該当した条件の効果量平均を日付→スコアの辞書で返す(該当条件が無い日は辞書に含めない=空欄)。
+    「恒常」行(機種版の看板機種検定)は日付によらず常に該当する。
+    """
+    if conditions.empty or not dates:
+        return {}
+    import patterns as pt
+
+    dt_index = pd.DatetimeIndex(dates)
+    candidates = pt.calendar_candidates(dt_index)
+    constant_effects = conditions.loc[conditions['日付条件'] == '恒常', '効果量'].tolist()
+
+    out: dict[str, float] = {}
+    for i, dt in enumerate(dt_index):
+        matched = list(constant_effects)
+        for cname, mask in candidates.items():
+            if not bool(mask[i]):
+                continue
+            matched.extend(conditions.loc[conditions['日付条件'] == cname, '効果量'].tolist())
+        if matched:
+            out[dt.strftime('%Y-%m-%d')] = float(np.mean(matched))
+    return out
+
+
+# ── Phase 3(今後の実装予定.md 4節 項目3): 癖の有効性マトリクス ──────────
+
+_HABIT_MIN_SAMPLES = 30      # evaluate_predictions.MIN_SAMPLESと合わせる(実績ベース判定の最低サンプル数)
+_HABIT_EFFECTIVE_THRESHOLD = 0.1   # spearman相関がこれを超えたら「有効」(2026-07-13決定事項の店舗依存閾値と整合)
+
+# 軸定義: 表示名 → prediction_accuracyの予測種別・group_calendar_conditionsのグループ種別・
+# teppan_conditions利用有無(2026-07-13決定事項「機能B理想形」項目3のデータ源マッピング)
+_HABIT_AXES: list[dict] = [
+    {'軸': 'S_鉄板台',   'pred_types': ['S_鉄板台'],                'group_types': None,                 'use_teppan': True},
+    {'軸': '遷移予測',   'pred_types': ['遷移予測', '遷移予測_前日差枚'], 'group_types': None,                 'use_teppan': False},
+    {'軸': 'S_据え置き', 'pred_types': ['S_据え置き'],              'group_types': None,                 'use_teppan': False},
+    {'軸': 'S_末尾',     'pred_types': ['S_末尾'],                  'group_types': ['台番号末尾'],         'use_teppan': False},
+    {'軸': 'S_機種',     'pred_types': ['S_機種', 'S_機種_直近'],    'group_types': ['機種', '機種_直近'],  'use_teppan': False},
+    {'軸': 'S_導入後',   'pred_types': ['S_導入後'],                'group_types': ['導入後'],            'use_teppan': False},
+]
+# 翌日予測を出さない当日記述型パターン(prediction_accuracyに乗らない。2026-07-13決定事項「評価不能」)
+_HABIT_DESCRIPTIVE_ONLY = ['S_全台系', 'S_新台増台', 'S_移動台', 'S_ローテ', 'S_稼働低さ']
+
+
+def _load_prediction_accuracy(db_path: str, hole_name: str) -> pd.DataFrame:
+    """prediction_accuracy(evaluate_predictions.py集計済み)をホール単位で読み込む。"""
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'prediction_accuracy' not in tables:
+                return pd.DataFrame()
+            return pd.read_sql_query(
+                'SELECT * FROM prediction_accuracy WHERE ホール名 = ?', con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_condition_significance(db_path: str, hole_name: str) -> pd.DataFrame:
+    """group_calendar_conditionsをグループ種別単位で集計(検定数・BH有意数・有意条件内の最大効果量)する。"""
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'group_calendar_conditions' not in tables:
+                return pd.DataFrame()
+            return pd.read_sql_query(
+                '''
+                SELECT グループ種別, COUNT(*) AS 検定数,
+                       SUM(BH有意) AS 有意数,
+                       MAX(CASE WHEN BH有意 = 1 THEN 効果量 END) AS 最大効果量
+                FROM group_calendar_conditions
+                WHERE ホール名 = ?
+                GROUP BY グループ種別
+                ''',
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_teppan_condition_count(db_path: str, hole_name: str) -> tuple[int, float | None]:
+    """
+    teppan_conditions(検出済み条件のみを保存。有意性は検出時点で確定済みのためBH有意列は無い)の
+    件数と最大効果量を返す。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'teppan_conditions' not in tables:
+                return 0, None
+            row = con.execute(
+                'SELECT COUNT(*), MAX(効果量) FROM teppan_conditions WHERE ホール名 = ?', (hole_name,),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return 0, None
+    if row is None or row[0] is None:
+        return 0, None
+    return int(row[0]), (float(row[1]) if row[1] is not None else None)
+
+
+def build_habit_matrix(db_path: str, hole_name: str) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目3] 「ある癖(軸)がこの店舗で翌日予測に有効か」を
+    軸ごとに判定し、ステータス(有効/弱い/検証中/データ不足/無効/対象外)と指標値を
+    まとめたDataFrameを返す(2026-07-13決定事項「案cハイブリッド」に準拠)。
+
+    判定順序:
+    1. prediction_accuracyにサンプル数≥_HABIT_MIN_SAMPLESの実績があれば実績ベース
+       (spearman相関の符号・大きさで有効/弱い/無効を判定。1軸に複数予測種別が
+       ある場合はサンプル数で加重平均する)
+    2. 実績が無い/不足の場合はgroup_calendar_conditions・teppan_conditionsの
+       BH有意な検出条件の有無を暫定指標として「検証中」/「データ不足」に振り分ける
+    3. 翌日予測を出さない当日記述型パターンは「対象外」固定
+
+    Returns:
+        DataFrame: 軸, ステータス, 指標, 値, 件数
+    """
+    acc = _load_prediction_accuracy(db_path, hole_name)
+    cond = _load_condition_significance(db_path, hole_name)
+    teppan_n, teppan_effect = _load_teppan_condition_count(db_path, hole_name)
+
+    rows = []
+    for axis in _HABIT_AXES:
+        label = axis['軸']
+        acc_sub = acc[acc['予測種別'].isin(axis['pred_types'])] if not acc.empty else pd.DataFrame()
+        if not acc_sub.empty:
+            acc_sub = acc_sub[acc_sub['サンプル数'].fillna(0) >= _HABIT_MIN_SAMPLES]
+
+        if not acc_sub.empty and acc_sub['spearman相関'].notna().any():
+            valid = acc_sub.dropna(subset=['spearman相関'])
+            weight_sum = valid['サンプル数'].sum()
+            spearman = (
+                float((valid['spearman相関'] * valid['サンプル数']).sum() / weight_sum)
+                if weight_sum > 0 else np.nan
+            )
+            n_total = int(valid['サンプル数'].sum())
+            if pd.isna(spearman):
+                status = 'データ不足'
+            elif spearman > _HABIT_EFFECTIVE_THRESHOLD:
+                status = '有効'
+            elif spearman > 0:
+                status = '弱い'
+            else:
+                status = '無効'
+            rows.append({'軸': label, 'ステータス': status, '指標': 'spearman相関', '値': spearman, '件数': n_total})
+            continue
+
+        # 実績不足 → 有意条件ベースへフォールバック
+        if axis['use_teppan']:
+            sig_n, effect = teppan_n, teppan_effect
+        elif axis['group_types'] and not cond.empty:
+            sub = cond[cond['グループ種別'].isin(axis['group_types'])]
+            sig_n = int(sub['有意数'].fillna(0).sum())
+            effect = float(sub['最大効果量'].max()) if sub['最大効果量'].notna().any() else None
+        else:
+            sig_n, effect = 0, None
+
+        if sig_n > 0:
+            rows.append({'軸': label, 'ステータス': '検証中', '指標': '有意条件の最大効果量', '値': effect, '件数': sig_n})
+        else:
+            rows.append({'軸': label, 'ステータス': 'データ不足', '指標': '-', '値': np.nan, '件数': 0})
+
+    for label in _HABIT_DESCRIPTIVE_ONLY:
+        rows.append({'軸': label, 'ステータス': '対象外(当日記述型)', '指標': '-', '値': np.nan, '件数': None})
+
+    return pd.DataFrame(rows)
+
+
+_HABIT_CONDITION_COUNT_CAP = 10  # 検証中軸の「有意条件数」の飽和上限(暫定値、実データで調整)
+
+
+def compute_store_recommend_score(db_path: str, hole_name: str) -> dict:
+    """
+    [今後の実装予定.md 4節「機能B理想形」項目1、2026-07-13決定事項「案cハイブリッド」]
+    店舗の「設定予測の的中が期待できる度合い」をスコア化する。build_habit_matrixの
+    軸別ステータスを再利用し、軸ごとの寄与を次のルールで合算する:
+      - 実績ベース(有効/弱い/無効): spearman相関をそのまま加算(符号付き、-1〜1相当)
+      - 検証中(有意条件ベース): min(有意条件数, _HABIT_CONDITION_COUNT_CAP) × 最大効果量を加算
+        (teppan_conditionsの件数は機種×台番号×条件の組合せ数であり、
+        group_calendar_conditionsのFDR補正済み件数と桁が異なるため飽和させて揃える。
+        実データ検証で無キャップ版が三ノ輪unoのS_鉄板台(件数48)だけでスコアが
+        50超に張り付く事故を確認済み)
+      - データ不足・対象外(当日記述型): 寄与0(スキップ)
+    S_稼働低さは決定事項により本スコアに含めない(呼び出し側でstore_profileから
+    別途「添えスコア」として取得すること)。
+
+    Returns: {'おすすめ度': float, '有効軸数': int, '実績軸数': int}
+    """
+    habit_df = build_habit_matrix(db_path, hole_name)
+    contrib = 0.0
+    n_axes = 0
+    n_accuracy_based = 0
+    for _, row in habit_df.iterrows():
+        status = row['ステータス']
+        if status in ('対象外(当日記述型)', 'データ不足'):
+            continue
+        n_axes += 1
+        if status in ('有効', '弱い', '無効'):
+            contrib += float(row['値'])
+            n_accuracy_based += 1
+        elif status == '検証中':
+            effect, count = row['値'], row['件数']
+            if pd.notna(effect) and pd.notna(count):
+                contrib += float(effect) * min(float(count), _HABIT_CONDITION_COUNT_CAP)
+
+    return {'おすすめ度': contrib, '有効軸数': n_axes, '実績軸数': n_accuracy_based}
+
+
+def _style_habit_status(df: pd.DataFrame, status_col: str, color_map: dict[str, str], default_color: str):
+    """ステータス列を色分けするStyler(style_signedと同じhasattr分岐でpandasバージョン差異に対応)。"""
+    def _color(v):
+        return f'color: {color_map.get(v, default_color)}'
+
+    styler = df.style
+    style_fn = styler.map if hasattr(styler, 'map') else styler.applymap
+    return style_fn(_color, subset=[status_col])
+
+
 # ── 公開関数 ──────────────────────────────────────────────────────
 
 
@@ -337,11 +827,10 @@ def load_store_profiles(db_path: str) -> pd.DataFrame:
 
 def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
     """
-    機能B-個別店舗詳細: サブスコア内訳・γ_store・検知期間履歴・カレンダーヒートマップ。
+    機能B-個別店舗詳細: γ_store・癖の有効性マトリクス・検知期間履歴・カレンダーヒートマップ。
     app.pyの店舗トップページから店舗固定で呼ばれる。
     """
     import streamlit as st
-    import plotly.express as px
     import plotly.graph_objects as go
 
     import ui_theme as ui
@@ -353,27 +842,6 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
             'fase2/run_store_profile.py を先に実行してください。'
         )
         return
-
-    hole_grp['表示名'] = hole_grp['パターン'].map(_PATTERN_LABELS)
-
-    st.subheader(f'{sel_hole} — サブスコア詳細')
-
-    valid = hole_grp.dropna(subset=['スコア']).copy()
-    valid['表示名'] = valid['パターン'].map(_PATTERN_LABELS)
-    if not valid.empty:
-        valid['表示名_折返し'] = valid['表示名'].map(lambda s: ui.wrap_label(s, 6))
-        fig_bar = px.bar(
-            valid,
-            x='表示名_折返し', y='スコア',
-            color='信頼度', color_continuous_scale=ui.SEQ_BLUE,
-            range_y=[-1, 1],
-            labels={'表示名_折返し': ''},
-        )
-        ui.apply_mobile_layout(fig_bar, height=320)
-        fig_bar.update_xaxes(tickangle=0)
-        st.plotly_chart(fig_bar, use_container_width=True, config=ui.PLOTLY_CONFIG)
-    else:
-        st.info('サブスコアデータがありません。')
 
     # γ_store
     if 'gamma_store' in hole_grp.columns:
@@ -397,12 +865,37 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
 
     st.divider()
 
+    # ── 4. 癖の有効性マトリクス ──
+    st.subheader(f'{sel_hole} — 癖の有効性')
+    st.caption(
+        '各軸(癖)がこの店舗で翌日予測に有効かを表示します。'
+        'prediction_accuracy(実測との答え合わせ)が十分に蓄積した軸は実績ベース、'
+        '未蓄積の軸は有意条件の検出有無を暫定指標とします'
+        '(今後の実装予定.md 4節「機能B理想形」項目3、案cハイブリッド)。'
+    )
+
+    habit_df = build_habit_matrix(str(ds.ANALYSIS_DB_PATH), sel_hole)
+    status_colors = {
+        '有効': ui.POS_COLOR, '弱い': ui.ACCENT, '検証中': ui.TEXT_SUB,
+        'データ不足': ui.TEXT_SUB, '無効': ui.NEG_COLOR, '対象外(当日記述型)': ui.TEXT_SUB,
+    }
+    disp_habit = habit_df.copy()
+    disp_habit['値'] = disp_habit['値'].map(lambda x: f'{x:.3f}' if pd.notna(x) else '-')
+    disp_habit['件数'] = disp_habit['件数'].map(lambda x: '-' if x is None or pd.isna(x) else str(int(x)))
+    habit_styler = _style_habit_status(
+        disp_habit[['軸', 'ステータス', '指標', '値', '件数']],
+        'ステータス', status_colors, ui.TEXT,
+    )
+    st.dataframe(habit_styler, use_container_width=True, hide_index=True)
+
+    st.divider()
+
     # ── 5. 検知期間履歴 ──
     st.subheader(f'{sel_hole} — 検知期間履歴')
     st.caption(
-        'pattern_history(run_store_profile.py実行ごとの記録)から'
-        '「スコアが0を上回っている」連続区間を検出期間として近似表示します'
-        '(統計検定の再実行はしません)。'
+        '各サブスコアが検出された機種名・台番号つきの期間を表示します'
+        '(全台系はmachine_judgment_log、新台/増台はintroduction_events、'
+        '鉄板台/移動台/据え置きはstage3_scoresを使用。稼働低さは店舗全体の指標のため機種名なし)。'
     )
 
     hist_all = _load_pattern_history(str(ds.ANALYSIS_DB_PATH))
@@ -411,103 +904,138 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
         if not hist_all.empty else pd.DataFrame()
     )
 
-    periods = _detect_pattern_periods(hist_hole)
-    if periods.empty:
-        st.info(
-            '検出期間履歴がまだありません。run_store_profile.pyを複数回実行すると蓄積されます'
-            '(fase4の日次自動実行が実装されるまでは手動実行の頻度に応じた粒度になります)。'
-        )
-    else:
-        pattern_tabs = [p for p in _PATTERN_LABELS.values() if p in periods['パターン'].unique()]
-        tabs = st.tabs(pattern_tabs)
-        for tab, pattern_name in zip(tabs, pattern_tabs):
-            with tab:
-                disp_periods = (
-                    periods[periods['パターン'] == pattern_name]
-                    .sort_values('終了', ascending=False)
-                    .copy()
+    db_path_str = str(ds.ANALYSIS_DB_PATH)
+    tab_names = list(_PATTERN_LABELS.values())
+    period_tabs = st.tabs(tab_names)
+
+    for tab, pattern_name in zip(period_tabs, tab_names):
+        with tab:
+            if pattern_name == 'S_全台系':
+                periods = _load_zentaikei_periods(db_path_str, sel_hole)
+                if periods.empty:
+                    st.info('検出期間履歴がまだありません。')
+                else:
+                    disp = periods.sort_values('終了', ascending=False).copy()
+                    disp['開始'] = disp['開始'].dt.strftime('%m/%d')
+                    disp['終了'] = disp['終了'].dt.strftime('%m/%d')
+                    disp['期待高設定台数_平均'] = disp['期待高設定台数_平均'].map(lambda x: f'{x:.1f}')
+                    st.dataframe(
+                        disp[['開始', '終了', '機種名', '判定ラベル', '台数', '期待高設定台数_平均']],
+                        use_container_width=True, hide_index=True,
+                    )
+
+            elif pattern_name == 'S_ローテ':
+                st.info(
+                    '検出ロジックを再設計中のため未実装です'
+                    '(今後の実装予定.md 1.2節「S_ローテの非該当日判定・翌日予測拡張」参照。'
+                    '正解発表データでの実証を経てから着手予定)。'
                 )
-                disp_periods['開始'] = pd.to_datetime(disp_periods['開始']).dt.strftime('%m/%d')
-                disp_periods['終了'] = pd.to_datetime(disp_periods['終了']).dt.strftime('%m/%d')
-                disp_periods['平均スコア'] = disp_periods['平均スコア'].map(lambda x: f'{x:.3f}')
-                st.dataframe(
-                    disp_periods[['開始', '終了', '平均スコア']],
-                    use_container_width=True, hide_index=True,
-                )
+
+            elif pattern_name == 'S_新台増台':
+                events = _load_introduction_events(db_path_str, sel_hole, ('新台', '増台'))
+                if events.empty:
+                    st.info('検出期間履歴がまだありません。')
+                else:
+                    disp = events.copy()
+                    disp['台番号'] = disp['台番号リスト'].map(_format_unit_list)
+                    disp['日付'] = pd.to_datetime(disp['日付']).dt.strftime('%m/%d')
+                    st.dataframe(
+                        disp[['日付', '機種名', 'カテゴリ', '台数変化', '台番号']],
+                        use_container_width=True, hide_index=True,
+                    )
+
+            elif pattern_name == 'S_稼働低さ':
+                kadou_hist = hist_hole[hist_hole['パターン'] == 's_kadou'] if not hist_hole.empty else pd.DataFrame()
+                periods = _detect_pattern_periods(kadou_hist)
+                if periods.empty:
+                    st.info('検出期間履歴がまだありません。')
+                else:
+                    disp = periods.sort_values('終了', ascending=False).copy()
+                    disp['開始'] = pd.to_datetime(disp['開始']).dt.strftime('%m/%d')
+                    disp['終了'] = pd.to_datetime(disp['終了']).dt.strftime('%m/%d')
+                    disp['平均スコア'] = disp['平均スコア'].map(lambda x: f'{x:.3f}')
+                    st.dataframe(
+                        disp[['開始', '終了', '平均スコア']],
+                        use_container_width=True, hide_index=True,
+                    )
+
+            else:
+                # S_鉄板台 / S_移動台 / S_据え置き は stage3_scores の列名と表示名が一致
+                periods = _load_stage3_pattern_periods(db_path_str, sel_hole, pattern_name)
+                if periods.empty:
+                    st.info('検出期間履歴がまだありません。')
+                else:
+                    disp = periods.sort_values('終了', ascending=False).copy()
+                    disp['開始'] = disp['開始'].dt.strftime('%m/%d')
+                    disp['終了'] = disp['終了'].dt.strftime('%m/%d')
+                    disp['平均スコア'] = disp['平均スコア'].map(lambda x: f'{x:.3f}')
+                    st.dataframe(
+                        disp[['開始', '終了', '機種名', '台番号', '平均スコア']],
+                        use_container_width=True, hide_index=True,
+                    )
 
     st.divider()
 
-    # ── 6. 当月カレンダーヒートマップ ──
-    st.subheader(f'{sel_hole} — カレンダーヒートマップ（店舗内の絶対評価）')
-    st.caption('他店との比較ではなく、この店舗の中で相対的に強い日/弱い日を示します。')
+    # ── 6. カレンダーヒートマップ ──
+    st.subheader(f'{sel_hole} — カレンダーヒートマップ')
+    st.caption(
+        '店舗内相対評価(-1〜1、この店舗自身の中央値を基準にした符号付きパーセンタイル)で'
+        '差枚・設定配分を表示します。データ取得済み日は実績、それ以降の日はカレンダー型の'
+        '検出パターン(曜日・毎月X日・機種の看板パターン等)からの予測です'
+        '(今後の実装予定.md 4節「機能B理想形」項目5)。'
+    )
 
-    daily_avg = _load_daily_stage3_avg(str(ds.ANALYSIS_DB_PATH), sel_hole)
+    daily_avg = _load_daily_stage3_avg(str(ds.ANALYSIS_DB_PATH), sel_hole)     # 設定配分(実績)
+    daily_diff = _load_daily_actual_diff(sel_hole)                            # 差枚(実績)
+    rel_avg = _store_relative_scores(daily_avg)
+    rel_diff = _store_relative_scores(daily_diff)
+    last_actual_date = max(daily_avg.index) if not daily_avg.empty else None
 
-    hist_hole_dated = pd.DataFrame()
-    if not hist_hole.empty:
-        hist_hole_dated = hist_hole.copy()
-        hist_hole_dated['日付'] = pd.to_datetime(hist_hole_dated['実行日時']).dt.strftime('%Y-%m-%d')
-
+    this_month = pd.Timestamp.now().strftime('%Y-%m')
     available_months = sorted(
-        {d[:7] for d in daily_avg.index}
-        | ({d for d in hist_hole_dated['日付'].str[:7]} if not hist_hole_dated.empty else set()),
+        {d[:7] for d in rel_avg} | {d[:7] for d in rel_diff} | {this_month},
         reverse=True,
     )
 
-    if not available_months:
+    metric_options = ['設定配分', '差枚']
+    c1, c2 = st.columns(2)
+    with c1:
+        sel_month = st.selectbox('表示月', available_months, index=0, key='calendar_month')
+    with c2:
+        sel_metric = st.selectbox('表示項目', metric_options, index=0, key='calendar_metric')
+
+    year, month = int(sel_month[:4]), int(sel_month[5:7])
+    rel_map = rel_avg if sel_metric == '設定配分' else rel_diff
+
+    import calendar as _calmod
+    n_days = _calmod.monthrange(year, month)[1]
+    month_dates = [pd.Timestamp(year, month, d) for d in range(1, n_days + 1)]
+    future_dates = [
+        d for d in month_dates
+        if last_actual_date is None or d.strftime('%Y-%m-%d') > last_actual_date
+    ]
+    conditions = _load_future_calendar_conditions(str(ds.ANALYSIS_DB_PATH), sel_hole)
+    projected = _project_future_calendar_scores(conditions, future_dates)
+
+    combined_map = {**rel_map, **projected}
+
+    if not combined_map:
         st.info('カレンダー表示用のデータがありません。')
     else:
-        available_patterns: list[str] = []
-        pattern_daily = pd.Series(dtype=float)
-        if not hist_hole_dated.empty:
-            pattern_daily = hist_hole_dated.groupby(['パターン', '日付'])['スコア'].mean()
-            available_patterns = [
-                p for p in _PATTERN_LABELS.keys() if p in hist_hole_dated['パターン'].unique()
-            ]
-        metric_options = ['統合スコア日次平均'] + [_PATTERN_LABELS.get(p, p) for p in available_patterns]
-
-        c1, c2 = st.columns(2)
-        with c1:
-            sel_month = st.selectbox('表示月', available_months, index=0, key='calendar_month')
-        with c2:
-            sel_metric = st.selectbox('表示項目', metric_options, index=0, key='calendar_metric')
-
-        year, month = int(sel_month[:4]), int(sel_month[5:7])
-
-        if sel_metric == '統合スコア日次平均':
-            if daily_avg.empty:
-                st.caption('stage3_scoresデータがありません。')
-            else:
-                z, text = _month_grid(daily_avg.to_dict(), year, month)
-                fig_cal = go.Figure(data=go.Heatmap(
-                    z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
-                    text=text, texttemplate='%{text}', textfont=dict(size=11, color=ui.TEXT),
-                    colorscale=ui.SEQ_WARM, zmin=0.0, zmax=1.0,
-                    hoverongaps=False,
-                ))
-                ui.apply_mobile_layout(fig_cal, height=280)
-                fig_cal.update_yaxes(autorange='reversed')
-                st.plotly_chart(fig_cal, use_container_width=True, config=ui.PLOTLY_CONFIG)
-        else:
-            pattern_key = next(
-                (p for p in available_patterns if _PATTERN_LABELS.get(p, p) == sel_metric), None
-            )
-            if pattern_key is None:
-                st.caption('pattern_historyデータがありません(パターン別の内訳は表示できません)。')
-            else:
-                score_map = pattern_daily.loc[pattern_key].to_dict()
-                z2, text2 = _month_grid(score_map, year, month)
-                # DIVERGINGは中間点が白のため、白文字(ui.TEXT)だと0付近のセルで読めなくなる。
-                # 濃色文字はcard_bg〜赤/青の全域で3:1以上のコントラストを確保できるためこちらを使う。
-                fig_pat = go.Figure(data=go.Heatmap(
-                    z=z2, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z2.shape[0])],
-                    text=text2, texttemplate='%{text}', textfont=dict(size=11, color=ui.CARD_BG),
-                    colorscale=ui.DIVERGING, zmid=0.0, zmin=-1.0, zmax=1.0,
-                    hoverongaps=False,
-                ))
-                ui.apply_mobile_layout(fig_pat, height=280)
-                fig_pat.update_yaxes(autorange='reversed')
-                st.plotly_chart(fig_pat, use_container_width=True, config=ui.PLOTLY_CONFIG)
+        z, text = _month_grid(combined_map, year, month)
+        # DIVERGINGは中間点が白のため、白文字(ui.TEXT)だと0付近のセルで読めなくなる。
+        # 濃色文字はcard_bg〜赤/青の全域で3:1以上のコントラストを確保できるためこちらを使う。
+        fig_cal = go.Figure(data=go.Heatmap(
+            z=z, x=_WEEKDAY_LABELS, y=[f'第{i + 1}週' for i in range(z.shape[0])],
+            text=text, texttemplate='%{text}', textfont=dict(size=11, color=ui.CARD_BG),
+            colorscale=ui.DIVERGING, zmid=0.0, zmin=-1.0, zmax=1.0,
+            hoverongaps=False,
+        ))
+        ui.apply_mobile_layout(fig_cal, height=280)
+        fig_cal.update_yaxes(autorange='reversed')
+        st.plotly_chart(fig_cal, use_container_width=True, config=ui.PLOTLY_CONFIG)
+        if any(d.strftime('%Y-%m-%d') in projected for d in future_dates):
+            st.caption(f'{last_actual_date}以前は実績、それ以降はカレンダー型パターンからの予測です。')
 
 
 def memo_simple(profiles: pd.DataFrame) -> str:
