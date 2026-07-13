@@ -49,6 +49,7 @@ metadata:
 | ⑨ レプリカ同期 | 実行終了時に`sync()`でローカルレプリカ（`ホールデータ/turso_replica.db`）を最新化。fase2はこれを読む | `db.sync_replica` |
 
 - **403（`AccessForbiddenError`）発生時は全店舗の処理を即中止する**。CloudflareのブロックはIP単位のため、残り店舗への試行は無駄なリクエストで被ブロック実績を積むだけになる（2026-07変更。以前は該当店舗のみスキップ）
+- **Tursoストリーム失効（`stream not found`）時は再接続して同じ日を再試行する**（2026-07-14追加。詳細は「メイン.py」節参照）
 
 ---
 
@@ -71,29 +72,44 @@ metadata:
 - スラッグを `quote(safe='')` でエンコードしてURLを生成
 - `.lower()` は**使わない**（hexが小文字になり実サイトのURL形式と不一致になるため）
 
+### SSL証明書検証とtruststore（2026-07-14追加）
+
+`scraper.py`冒頭で`truststore.inject_into_ssl()`を実行し、Pythonの証明書検証を
+certifi（requests同梱の証明書リスト）ではなく**OSの証明書ストア**（Windowsなら証明書マネージャ）で行う。
+
+- **経緯**: ユーザーPCのNorton Antivirus（Web/Mail Shield）がHTTPSスキャンのため全サイトの証明書を
+  Norton発行のものに差し替えており、certifiベースの検証が常に`SSLCertVerificationError`で失敗
+  →毎リクエストが`verify=False`（検証無効）フォールバックで動いていた。NortonのルートCAは
+  Windows証明書ストアには登録済みのため、truststoreの導入で正常に検証が通るようになった
+- truststoreはPyPA公式（pipが内部使用）。Windowsストアが無い環境（GitHub Actions等のLinux）でも
+  OSのストアを参照するだけで挙動は変わらない。Python 3.10+が必要（本プロジェクトは3.12固定なので問題なし）
+
 ### `fetch_page(session, url)`
 - MAX_RETRIES=3、指数バックオフ（RETRY_BASE_WAIT=60秒）でリトライ
 - 429/503/504 のみリトライ対象
 - **403 は `AccessForbiddenError` を送出**（リトライしない）
-- SSLError時は `verify=False` にフォールバック（urllib3警告を抑制）
+- SSLError時は `verify=False` にフォールバック（urllib3警告を抑制）。truststore導入後は通常発動しない
 
-> **【保留中の懸念点】SSLError フォールバックが 1 リクエスト限り**
-> 現在の実装では `session.get(url, verify=False)` はその1回のリクエストにしか効かない。
-> SSLエラーが出るサイトでは毎リクエストごとにSSLErrorが発生し、リクエスト数が実質2倍になる。
-> また、フォールバック先でConnectionErrorが起きた場合はリトライなしで例外が上位に伝播する。
+> **【2026-07-14修正済み】SSLフォールバック経路が403判定を素通りしていたバグ**
+> 旧実装はSSLErrorのexceptブロック内で`raise_for_status()`を呼んでいたため、そこで発生した
+> `HTTPError`は同じtryの`except HTTPError`節（403→`AccessForbiddenError`変換・429リトライ）に
+> 捕捉されず生のまま上位へ漏れていた。Norton環境では毎リクエストがこのフォールバック経路を
+> 通っていたため、**403が出ても「全店舗即中止」が働かず、有楽町unoバックフィル時に403のまま
+> 全日を空回りする事故が発生**（2026-07-14）。現在はtryを二重にし、`raise_for_status()`を
+> 通常経路・フォールバック経路共通の位置で実行する構造に修正済み。
 >
-> **修正方法（未適用）:**
 > ```python
-> except requests.exceptions.SSLError:
->     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
->     session.verify = False  # セッション全体に効かせる
->     response = session.get(url, timeout=30)
->     response.raise_for_status()
+> try:
+>     try:
+>         response = session.get(url, timeout=30)
+>     except requests.exceptions.SSLError:
+>         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+>         response = session.get(url, verify=False, timeout=30)
+>     response.raise_for_status()  # ← どちらの経路でもここを通る
 >     return response
+> except requests.exceptions.HTTPError as e:
+>     ...  # 403→AccessForbiddenError / 429等リトライ
 > ```
->
-> **現状の判断:** 対象サイト（ana-slo.com）はHTTPS正常のため、このコードパスは実質的に死にコード。
-> 別サイトへの転用時に備えるなら修正する。現状は修正保留。
 
 ### `get_info(session, url, hole_date)`
 - `id=re.compile('^section')` で機種セクションを列挙
@@ -236,7 +252,7 @@ def main():
         setup_db(con)
         try:
             for hole_name in stores:
-                process_store(con, hole_name)
+                con = process_store(con, hole_name)  # ストリーム失効で再接続した場合、新しいconが返る
         except AccessForbiddenError as e:
             logger.error(f'アクセス拒否(403)のため全店舗の処理を中止します: {e}')
             forbidden = True
@@ -293,6 +309,20 @@ time.sleep(sleep_time)
 - ページが重く時間がかかった → sleep を短縮
 - ページが軽く速く終わった → sleep を長く取る
 - elapsed が TARGET_CYCLE を超えても MIN_SLEEP は保証
+
+### Tursoストリーム失効時の自動再接続（2026-07-14追加）
+
+Turso埋め込みレプリカ接続を数時間使い続けると、サーバー側がHranaストリームを打ち切り、
+以降の書き込みが `Hrana: api error: status=404 Not Found, body={"error":"stream not found: ...}` で
+失敗するようになる。**同じconnectionでは二度と回復しない**ため、旧実装（その日をスキップして続行）では
+以降の全日が同じエラーで空回りしていた（有楽町unoの200日バックフィルで163日目・約2.5〜3時間経過時点で
+発生し、37日分が欠損した実績あり）。
+
+対策として`process_store`内でこのエラーを`_is_stream_error`（メッセージに`stream not found`を含むか）で
+検知し、`con.close()`→`get_connection()`で再接続してから**同じ日を即座に再試行**する。
+再接続後の`con`は`process_store`の戻り値として`main()`へ返し、次店舗のループへ引き継ぐ
+（このため`process_store`は必ず`con`を返す設計になった）。
+取得・書き込み処理は`_fetch_and_write(con, session, hole_name, day)`に切り出し、初回と再試行で共用する。
 
 ### 403アクセス拒否時の中断
 
@@ -370,7 +400,18 @@ finally:
 
 - 要件定義 → `要件定義.md`
 - 構成図 → `fase1/データ収集_構成図.md`
-- 依存パッケージ → `fase1/requirements.txt`（requests / beautifulsoup4 / libsql）
+- 依存パッケージ → `fase1/requirements.txt`（requests / beautifulsoup4 / libsql / python-dotenv / truststore）
 - 対象店舗一覧 → `fase1/stores.json`
 - GitHub Actions定義 → `.github/workflows/scrape.yml`
 - 移行用ワンショットスクリプト → `fase1/merge_stores_for_turso.py`（既存ローカルSQLiteをTurso Upload DB用に統合。恒久パイプラインには含まれない）
+
+---
+
+## 旧CLAUDE.md記載の実装詳細（2026-07-14移設・原文のまま保存）
+
+> CLAUDE.mdの省エネ化(2026-07-14)で移設。本文と重複する記述を含むが、
+> 情報消失防止のため原文で保存する。矛盾がある場合は本文(各節)側が正。
+
+**フェーズ表の注記(fase1)**:
+
+> ※ fase1は2026-07にTurso(libSQL)対応・非対話化済み。`db.py`はsqlite3→Turso/libsqlクライアントに書き換え（**埋め込みレプリカ方式**: 書き込みはTursoへ委譲しつつ`ホールデータ/turso_replica.db`をローカルに維持し、fase2はこのレプリカを読む）、`メイン.py`は`input()`を廃止し`stores.json`+自動日付算出（前回取得済み最終日の翌日〜前日。2026-07にfase4導入とあわせて2日前から短縮。直近14日の取得失敗日は自動再試行。403発生時は全店舗中止）に変更。**GitHub Actionsでの自動実行(`schedule`)は、ana-slo.com(Cloudflare)がデータセンター系IPを即403ブロックすることが判明したため停止中**（`workflow_dispatch`の手動トリガーのみ残す）。現在はPC上でfase4のタスクスケジューラが`py -3.12 メイン.py`を毎日自動実行し、Tursoへ書き込む運用（手動実行も引き続き可能）。**2026-07-14追加**: ①Tursoストリーム失効(`stream not found`。長時間接続で発生し同じconnectionでは回復しない)を検知したら再接続して同日を再試行する自動回復を`メイン.py`に実装、②`scraper.py`に`truststore`を導入しSSL検証をWindows証明書ストアで実施(Norton AntivirusのHTTPSスキャンによる証明書差し替えでcertifi検証が常に失敗し`verify=False`で動いていた問題の根本対応)、③SSLフォールバック経路で403→`AccessForbiddenError`変換が素通りするバグを修正。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。詳細は[`fase1/データ収集_skill.md`](データ収集_skill.md)参照

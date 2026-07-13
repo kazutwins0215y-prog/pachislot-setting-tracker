@@ -185,7 +185,8 @@ def _accuracy_text(acc_row: pd.Series | None) -> str:
     if pd.notna(precision):
         bits.append(f'Precision@N {float(precision):.0%}')
     if pd.notna(lift):
-        bits.append(f'リフト{float(lift):.2f}倍')
+        # [2026-07-14 応急処置] リフトは差枚差ベース(上位N台平均−店舗平均、単位:枚)に変更済み
+        bits.append(f'リフト{float(lift):+.0f}枚')
     return ' / '.join(bits)
 
 

@@ -2158,16 +2158,16 @@ def score_sueki_daily(df: pd.DataFrame) -> pd.Series:
             hp[grp_sorted['is_invalid'].fillna(True).values] = np.nan
 
         r_bar = sueki_daily_r(hp)
-        # 負側はr̄_t=0で-1に飽和する暫定式。店舗が日次ほぼ無記憶(r̄≈0)の実態では大半の日が
-        # -1近傍になり店舗平均s_suekiが大きく負に沈むが、prediction_accuracyの成績を見てから
-        # 調整する方針で現状維持と決定(2026-07-08。調整候補: NEGATIVE_SCALE乗算での緩和)
+        # [2026-07-14 応急処置] prediction_accuracy実測(全10店でspearman≈0・負飽和が
+        # 全行の約6割)を受け、負側にNEGATIVE_SCALEを乗じて緩和(2026-07-08合意済みの調整候補
+        # を実施)。r̄_t=0の無記憶状態での飽和値は-1→-0.5になる
         signed = np.where(
             np.isnan(r_bar),
             np.nan,
             np.where(
                 r_bar >= SUEKI_DAILY_THRESHOLD,
                 r_bar,
-                -np.minimum(1.0, (SUEKI_DAILY_THRESHOLD - r_bar) / SUEKI_DAILY_THRESHOLD),
+                -NEGATIVE_SCALE * np.minimum(1.0, (SUEKI_DAILY_THRESHOLD - r_bar) / SUEKI_DAILY_THRESHOLD),
             ),
         )
         scores.loc[grp_sorted.index] = signed

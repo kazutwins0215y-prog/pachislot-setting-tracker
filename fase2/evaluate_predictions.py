@@ -72,7 +72,13 @@ def _load_actuals(replica_db: str, holes: list[str], min_date: str, max_date: st
 
 
 def _precision_and_lift(day_grp: pd.DataFrame, top_n: int) -> tuple[float | None, float | None]:
-    """1日分(1店舗×1対象日)の予測上位N台 vs 実測上位N台の重複率とリフトを返す。"""
+    """
+    1日分(1店舗×1対象日)の予測上位N台 vs 実測上位N台の重複率とリフトを返す。
+
+    [2026-07-14 応急処置] リフトは比率(上位N台平均÷店舗平均)だと店舗平均差枚が0近傍の日に
+    ±数百倍へ発散し平均が壊れるため(実測: -442〜+1369)、差枚差ベース
+    (上位N台平均差枚 − 店舗平均差枚。単位: 枚)に変更。正なら予測上位台が店平均より優位。
+    """
     if len(day_grp) < 2:
         return None, None
     n_top = min(top_n, len(day_grp))
@@ -82,7 +88,7 @@ def _precision_and_lift(day_grp: pd.DataFrame, top_n: int) -> tuple[float | None
 
     store_avg = day_grp['差枚'].mean()
     pred_top_avg = day_grp.loc[pred_top_idx, '差枚'].mean()
-    lift = (pred_top_avg / store_avg) if store_avg not in (0, None) and not pd.isna(store_avg) else None
+    lift = None if pd.isna(store_avg) or pd.isna(pred_top_avg) else float(pred_top_avg - store_avg)
     return precision, lift
 
 
