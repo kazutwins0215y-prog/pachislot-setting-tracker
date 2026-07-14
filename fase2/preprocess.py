@@ -32,6 +32,7 @@ SPECS_PATH = Path(__file__).parent / 'machine_setting_specs.json'
 WEIGHTS_PATH = Path(__file__).parent / 'weights.json'
 BIN_CURVES_PATH = Path(__file__).parent / 'kaiten_bin_curves.json'
 CHANNEL_WEIGHTS_PATH = Path(__file__).parent / 'stage3_channel_weights.json'
+MACHINE_BIAS_DELTA_PATH = Path(__file__).parent / 'machine_bias_delta.json'
 
 INVALID_THRESHOLD = 5           # 期待発生回数の下限
 MISSING_BIAS_THRESHOLD = 0.12   # 判定不能率差の初期閾値(12pt)
@@ -93,6 +94,19 @@ def load_channel_weights() -> dict:
         loaded = json.loads(CHANNEL_WEIGHTS_PATH.read_text(encoding='utf-8'))
         return {**defaults, **loaded}
     return defaults
+
+
+def load_machine_bias_delta() -> dict[str, float]:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案B」] multi_store.pyが全店舗横断で
+    学習した機種ごとのlog_odds系統オフセットδ(機種名→delta)を読み込む。
+    未学習(ファイル未作成)の場合は空dict(= 較正なし・全機種delta=0扱い)を返す。
+    並走評価専用(S_機種_較正)でのみ使用し、本流のlog_odds/high_probには使わない。
+    """
+    if MACHINE_BIAS_DELTA_PATH.exists():
+        raw = json.loads(MACHINE_BIAS_DELTA_PATH.read_text(encoding='utf-8'))
+        return {k: float(v['delta']) for k, v in raw.items()}
+    return {}
 
 
 # ── Stage 0: 正規化 ──────────────────────────────────────────────
@@ -388,17 +402,35 @@ def compute_logLR_kaiten_column(
     return out
 
 
+def _split_setting_keys(settings: dict) -> tuple[list, list]:
+    """
+    スペック表の設定キーを高設定側/低設定側に分割する。設定は機種によらず1〜6の
+    共通尺度(2なし・3なし等の欠番あり)のため、設定4以上=高設定・設定3以下=低設定の
+    固定境界で分ける。旧実装の「上位半分/下位半分」折半は欠番パターンによって境界が
+    ズレていた(沖ドキ系(1,2,3,5,6)は設定3が高設定側に混入して基準が甘く、
+    ピンクパンサーSP(1,4,5,6)は設定4が低設定側に混入して基準が過剰に厳しくなる。
+    2026-07-14修正、対象6機種)。片側が空になる変則ラダーのみ従来の折半へ
+    フォールバックする(現データには存在しない)。
+    """
+    keys = sorted(settings.keys(), key=lambda x: int(x))
+    n = len(keys)
+    if n < 2:
+        return [], []
+    high_keys = [k for k in keys if int(k) >= 4]
+    low_keys = [k for k in keys if int(k) <= 3]
+    if not high_keys or not low_keys:
+        high_keys, low_keys = keys[n // 2:], keys[: n // 2]
+    return high_keys, low_keys
+
+
 def _tier_a_probs(machine_specs: dict, channel: str) -> tuple[float, float] | tuple[None, None]:
     """Tier A機種の高設定平均確率(p_s)・低設定平均確率(p_baseline)を返す。"""
     settings = machine_specs.get('settings', {})
     if not settings:
         return None, None
-    keys = sorted(settings.keys(), key=lambda x: int(x))
-    n = len(keys)
-    if n < 2:
+    high_keys, low_keys = _split_setting_keys(settings)
+    if not high_keys:
         return None, None
-    high_keys = keys[n // 2:]
-    low_keys = keys[: n // 2]
     vals_high = [settings[k][channel] for k in high_keys if channel in settings[k]]
     vals_low = [settings[k][channel] for k in low_keys if channel in settings[k]]
     if not vals_high or not vals_low:
@@ -411,17 +443,15 @@ def _tier_a_probs(machine_specs: dict, channel: str) -> tuple[float, float] | tu
 def _payout_mu_high(machine_specs: dict) -> float | None:
     """
     機種別理論値差表の payout(機械割)から、高設定側代表値の理論期待差枚/Gを返す。
-    _tier_a_probs と同じ上位半分/下位半分の分割を使い、上位半分の平均payoutを
-    「高設定」の代表値として扱う。データが無ければ None。
+    _tier_a_probs と同じ設定4以上/設定3以下の分割(_split_setting_keys)を使い、
+    高設定側の平均payoutを代表値として扱う。データが無ければ None。
     """
     settings = machine_specs.get('settings', {})
     if not settings:
         return None
-    keys = sorted(settings.keys(), key=lambda x: int(x))
-    n = len(keys)
-    if n < 2:
+    high_keys, _ = _split_setting_keys(settings)
+    if not high_keys:
         return None
-    high_keys = keys[n // 2:]
     vals_high = [settings[k]['payout'] for k in high_keys if settings[k].get('payout') is not None]
     if not vals_high:
         return None

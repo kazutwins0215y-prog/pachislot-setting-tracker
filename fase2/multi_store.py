@@ -25,6 +25,11 @@ Stage 6: 検証戦略
     6-2: マクロ整合性チェック(長期機械割と事後スコア集計値の整合)
     6-3: 店舗群分割クロスバリデーション(学習店舗で重みを決め検証店舗で確認)
 
+機種バイアスδ学習 (learn_machine_bias_delta、今後の実装予定.md 1.8.5節「案B」):
+    機種ごとのlog_odds系統オフセットを全店舗横断・縮小推定つきで学習し
+    machine_bias_delta.jsonへ保存(並走評価専用。本流のhigh_prob/合成スコアには未使用。
+    run_store_profile.pyがS_機種_較正の並走予測でこのファイルを読む)
+
 依存: preprocess.py (Stage0〜4出力) + score.py (store_profile)
 
 実行方法:
@@ -315,6 +320,98 @@ def fit_hierarchical_model(
     return gamma_store_dict, weights, validation
 
 
+# ── 機種バイアスδ学習(今後の実装予定.md 1.8.5節「機種バイアス除外・案B」) ─────
+
+MACHINE_BIAS_MIN_SAMPLES = 30      # δ推定に必要な最小ペア数(店舗横断プール後)
+MACHINE_BIAS_SHRINKAGE_K = 200     # 縮小推定の強さ(nが小さい機種ほど0へ縮小。他Stage5学習と同じ思想)
+MACHINE_BIAS_DELTA_EPS = 1e-3      # logit変換時の0/1近傍クリップ幅
+
+
+def learn_machine_bias_delta(
+    all_stores_df: pd.DataFrame,
+    bin_curves: dict,
+    channel_weights: dict,
+    min_samples: int = MACHINE_BIAS_MIN_SAMPLES,
+    shrinkage_k: float = MACHINE_BIAS_SHRINKAGE_K,
+) -> dict[str, dict]:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案B(将来・根本対応)」] 機種ごとの
+    log_odds系統オフセットδを全店舗横断で学習する(並走評価専用。本流のhigh_prob・
+    合成スコア・表示には一切使わない)。
+
+    patterns.group_constant_testと同じ「自機種の日次投入率 − 同店・同日の他機種平均
+    投入率」の対応ペア差分を、確率のまま平均するのではなくlogit空間で計算してから
+    全店舗プールする(Stage3のlog_oddsへそのまま差し引ける単位に揃えるため)。
+
+    n(ペア数)が少ない機種は縮小推定(δ = raw_delta × n/(n+shrinkage_k))で0へ
+    引き寄せ、たまたま数日だけ強かった機種を過大評価しないようにする
+    (他のStage5学習と同じ「サンプル数依存の縮小」思想)。
+
+    bin_curves/channel_weights: fit_hierarchical_modelが学習しファイル保存済みの
+    値を呼び出し側が渡す(load_all_stores_scoredはbin_curves={}で止めているため、
+    ここで学習済みcurve/weightsを使ってlogLR_kaiten・log_odds・high_probを
+    改めて計算する)。
+
+    Returns:
+        {機種名: {'n': int, 'raw_delta': float, 'delta': float}}
+        (min_samples未満の機種は含まない)
+    """
+    df = all_stores_df.copy()
+    df['logLR_kaiten'] = (
+        pp.compute_logLR_kaiten_column(
+            df, bin_curves,
+            orth_a=float(channel_weights.get('orth_a', 0.0)),
+            orth_b=float(channel_weights.get('orth_b', 0.0)),
+        ) if bin_curves else 0.0
+    )
+    df = pp.compute_log_odds(
+        df,
+        w1=channel_weights.get('w1'), w2=channel_weights.get('w2'), w3=channel_weights.get('w3'),
+        prior_high_ratio=channel_weights.get('prior_high_ratio'),
+    )
+    df = df.dropna(subset=['high_prob', '機種名', '日付', 'ホール名'])
+
+    daily = df.groupby(['ホール名', '機種名', '日付'])['high_prob'].mean().rename('投入率').reset_index()
+
+    def _logit(p: np.ndarray) -> np.ndarray:
+        p = np.clip(p, MACHINE_BIAS_DELTA_EPS, 1.0 - MACHINE_BIAS_DELTA_EPS)
+        return np.log(p / (1.0 - p))
+
+    pooled_diffs: dict[str, list[float]] = {}
+    for _hole_name, hole_grp in daily.groupby('ホール名'):
+        for machine_name, m_grp in hole_grp.groupby('機種名'):
+            self_series = m_grp.set_index('日付')['投入率']
+            other = hole_grp[hole_grp['機種名'] != machine_name]
+            if other.empty:
+                continue
+            other_mean = other.groupby('日付')['投入率'].mean()
+            common = self_series.index.intersection(other_mean.index)
+            if len(common) == 0:
+                continue
+            diff = _logit(self_series.loc[common].to_numpy(dtype=float)) - \
+                _logit(other_mean.loc[common].to_numpy(dtype=float))
+            pooled_diffs.setdefault(machine_name, []).extend(diff.tolist())
+
+    results: dict[str, dict] = {}
+    for machine_name, diffs in pooled_diffs.items():
+        n = len(diffs)
+        if n < min_samples:
+            continue
+        raw_delta = float(np.mean(diffs))
+        results[machine_name] = {
+            'n': n,
+            'raw_delta': raw_delta,
+            'delta': raw_delta * (n / (n + shrinkage_k)),
+        }
+    return results
+
+
+def _save_machine_bias_delta(delta_dict: dict) -> None:
+    pp.MACHINE_BIAS_DELTA_PATH.write_text(
+        json.dumps(delta_dict, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+
+
 def update_gamma_store(gamma_store_dict: dict, analysis_db: str | Path | None = None) -> None:
     """
     分析DBの store_profile テーブルの gamma_store フィールドを更新する。
@@ -463,6 +560,14 @@ def run() -> None:
 
     update_gamma_store(gamma_store_dict)
     print('\nstore_profile.gamma_store を更新しました(既存行がある店舗のみ)。')
+
+    print('\n[1.8.5節-案B] 機種バイアスδ学習(並走評価専用)')
+    bin_curves = pp.load_bin_curves()
+    machine_bias_delta = learn_machine_bias_delta(all_df, bin_curves, weights)
+    _save_machine_bias_delta(machine_bias_delta)
+    print(f'  {len(machine_bias_delta)}機種のδを保存しました({pp.MACHINE_BIAS_DELTA_PATH.name})。')
+    for machine_name, v in sorted(machine_bias_delta.items(), key=lambda kv: -abs(kv[1]['delta']))[:5]:
+        print(f'  - {machine_name}: delta={v["delta"]:+.4f} (raw={v["raw_delta"]:+.4f}, n={v["n"]})')
 
     print('\n[Stage6] 検証')
     shared_machines = (

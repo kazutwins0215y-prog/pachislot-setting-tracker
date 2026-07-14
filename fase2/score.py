@@ -34,6 +34,11 @@ Stage3スコア保存 (write_stage3_scores):
     Mann-Whitney U検定+一致ルール2本)を分析DBへ保存(teppan_conditionsと同じ
     店舗単位で全削除→再挿入。今後の実装予定.md 1.8節「末尾版」フェーズ2)
 
+機種バイアス判定保存 (write_machine_bias_flags / read_machine_bias_list):
+    patterns.identify_machine_biasの出力(全店舗横断で「機種×恒常」がBH有意だった
+    店舗比率)を分析DBへ保存・読込(グローバル1本、全削除→再挿入。
+    今後の実装予定.md 1.8.5節「機種バイアス除外・案A」)
+
 依存: patterns.py (各サブスコア列), preprocess.py (回転数列)
 """
 import sqlite3
@@ -589,6 +594,112 @@ def write_group_calendar_conditions(
                 rows,
             )
         con.commit()
+    finally:
+        con.close()
+
+
+def read_machine_constant_conditions(db_path: str) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] 全店舗のgroup_calendar_conditionsから
+    グループ種別='機種'・日付条件='恒常'の行のみを読み込む(patterns.identify_machine_biasの
+    入力用)。バイアスは機種側の推定バイアスであり時間窓に依存しないという設計方針のため、
+    判定は恒常窓(全期間、グループ種別='機種')の結果のみで行い、機種_直近には含めない
+    (適用側で機種/機種_直近の両方の恒常行に判定結果を使う)。
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if 'group_calendar_conditions' not in tables:
+            return pd.DataFrame(columns=['ホール名', 'グループ', 'BH有意'])
+        return pd.read_sql_query(
+            "SELECT ホール名, グループ, BH有意 FROM group_calendar_conditions "
+            "WHERE グループ種別 = '機種' AND 日付条件 = '恒常'",
+            con,
+        )
+    finally:
+        con.close()
+
+
+def count_profiled_stores(db_path: str) -> int:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] 機種バイアス判定の分母に使う、
+    プロファイル済みの全店舗数(store_profileのdistinctホール名数)。
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if 'store_profile' not in tables:
+            return 0
+        row = con.execute('SELECT COUNT(DISTINCT ホール名) FROM store_profile').fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        con.close()
+
+
+_CREATE_MACHINE_BIAS_FLAGS_SQL = '''
+    CREATE TABLE IF NOT EXISTS machine_bias_flags (
+        機種名       TEXT NOT NULL PRIMARY KEY,
+        対象店舗数   INTEGER,
+        有意店舗数   INTEGER,
+        有意店舗比率 REAL,
+        バイアス判定 INTEGER,
+        更新日時     TEXT
+    )
+'''
+
+
+def write_machine_bias_flags(db_path: str, bias_df: pd.DataFrame) -> None:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] patterns.identify_machine_biasの
+    出力を分析DBへ保存する(グローバル1本の全削除→再挿入。全店舗横断の診断情報のため
+    店舗単位のキーを持たない)。バイアス判定=Falseの機種も含め全機種を保存する
+    (「保存は緩く・使用側でゲート」の既存方針に合わせ、診断・案B較正への入力として
+    可視化できる形にする)。
+    """
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = [
+        (
+            str(r['機種名']), int(r['対象店舗数']), int(r['有意店舗数']),
+            float(r['有意店舗比率']), int(bool(r['バイアス判定'])), now,
+        )
+        for _, r in bias_df.iterrows()
+    ]
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_MACHINE_BIAS_FLAGS_SQL)
+        con.execute('DELETE FROM machine_bias_flags')
+        if rows:
+            con.executemany(
+                '''
+                INSERT INTO machine_bias_flags
+                    (機種名, 対象店舗数, 有意店舗数, 有意店舗比率, バイアス判定, 更新日時)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                rows,
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def read_machine_bias_list(db_path: str) -> list[str]:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] バイアス判定=Trueの機種名リストを
+    返す(S_機種_除外予測・おすすめ店舗スコア・カレンダー投影の除外フィルタ用)。
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if 'machine_bias_flags' not in tables:
+            return []
+        rows = con.execute(
+            'SELECT 機種名 FROM machine_bias_flags WHERE バイアス判定 = 1'
+        ).fetchall()
+        return [r[0] for r in rows]
     finally:
         con.close()
 

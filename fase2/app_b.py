@@ -544,6 +544,31 @@ def _store_relative_scores(daily: pd.Series) -> dict[str, float]:
     return out
 
 
+def _load_machine_bias_list(db_path: str) -> list[str]:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] run_store_profile.pyが書き込む
+    machine_bias_flags(バイアス判定=1)の機種名リストを返す。おすすめ店舗スコア・
+    有効性マトリクス・カレンダー投影から、バイアス機種の「恒常」条件だけを除外するために
+    使う(日付条件付きの条件は店固有性が高いため除外対象にしない)。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'machine_bias_flags' not in tables:
+                return []
+            rows = con.execute(
+                'SELECT 機種名 FROM machine_bias_flags WHERE バイアス判定 = 1'
+            ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
 def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFrame:
     """
     [今後の実装予定.md 4節「機能B理想形」項目5] 未来投影に使えるカレンダー型の有意条件を
@@ -551,6 +576,9 @@ def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFra
     (台番号末尾/機種/機種_直近、BH有意のみ)、周期パターンのうちカレンダー経路のもの(曜日等)は
     teppan_conditionsから集める。一致ルール(台番号依存で店舗単位に集約できない)・
     据え置き/遷移/導入後(未来日で該当が確定しない)は対象外(決定事項の制約)。
+
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] バイアス機種(machine_bias_flags)の
+    「恒常」行は除外する(店の癖ではなく機種側の推定バイアスのため)。
     """
     try:
         con = sqlite3.connect(db_path)
@@ -560,11 +588,20 @@ def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFra
             )['name'].tolist()
             frames: list[pd.DataFrame] = []
             if 'group_calendar_conditions' in tables:
+                bias_machines = _load_machine_bias_list(db_path)
+                exclude_clause, params = '', [hole_name]
+                if bias_machines:
+                    placeholders = ','.join('?' * len(bias_machines))
+                    exclude_clause = (
+                        f" AND NOT (日付条件 = '恒常' AND グループ IN ({placeholders}))"
+                    )
+                    params = [hole_name, *bias_machines]
                 df = pd.read_sql_query(
                     "SELECT グループ, 日付条件, 効果量 FROM group_calendar_conditions "
                     "WHERE ホール名 = ? AND BH有意 = 1 "
-                    "AND グループ種別 IN ('台番号末尾', '機種', '機種_直近')",
-                    con, params=(hole_name,),
+                    "AND グループ種別 IN ('台番号末尾', '機種', '機種_直近')"
+                    f"{exclude_clause}",
+                    con, params=params,
                 )
                 frames.append(df[df['グループ'] != '一致ルール'][['日付条件', '効果量']])
             if 'teppan_conditions' in tables:
@@ -648,7 +685,13 @@ def _load_prediction_accuracy(db_path: str, hole_name: str) -> pd.DataFrame:
 
 
 def _load_condition_significance(db_path: str, hole_name: str) -> pd.DataFrame:
-    """group_calendar_conditionsをグループ種別単位で集計(検定数・BH有意数・有意条件内の最大効果量)する。"""
+    """
+    group_calendar_conditionsをグループ種別単位で集計(検定数・BH有意数・有意条件内の最大効果量)する。
+
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] バイアス機種(machine_bias_flags)の
+    「恒常」行は集計から除外する(店の癖ではなく機種側の推定バイアスのため。
+    おすすめ店舗スコア・有効性マトリクスの両方がこの集計を再利用する)。
+    """
     try:
         con = sqlite3.connect(db_path)
         try:
@@ -657,16 +700,25 @@ def _load_condition_significance(db_path: str, hole_name: str) -> pd.DataFrame:
             )['name'].tolist()
             if 'group_calendar_conditions' not in tables:
                 return pd.DataFrame()
+            bias_machines = _load_machine_bias_list(db_path)
+            exclude_clause, params = '', [hole_name]
+            if bias_machines:
+                placeholders = ','.join('?' * len(bias_machines))
+                exclude_clause = (
+                    " AND NOT (グループ種別 IN ('機種', '機種_直近', '機種_較正') "
+                    f"AND 日付条件 = '恒常' AND グループ IN ({placeholders}))"
+                )
+                params = [hole_name, *bias_machines]
             return pd.read_sql_query(
-                '''
+                f'''
                 SELECT グループ種別, COUNT(*) AS 検定数,
                        SUM(BH有意) AS 有意数,
                        MAX(CASE WHEN BH有意 = 1 THEN 効果量 END) AS 最大効果量
                 FROM group_calendar_conditions
-                WHERE ホール名 = ?
+                WHERE ホール名 = ?{exclude_clause}
                 GROUP BY グループ種別
                 ''',
-                con, params=(hole_name,),
+                con, params=params,
             )
         finally:
             con.close()

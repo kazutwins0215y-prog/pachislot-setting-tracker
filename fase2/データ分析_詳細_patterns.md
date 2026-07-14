@@ -182,6 +182,54 @@ build_group_calendar_conditions(
 
 新台/増台/再導入/移動台の「導入後の扱い」は下記「導入後カーブ」節で実装済み。
 
+### 機種バイアス除外・案A/案B(`identify_machine_bias`/`multi_store.learn_machine_bias_delta`、2026-07-14設計・実装済み)
+
+2026-07-14の軸総点検で、機種検定(`group_constant_test`)の「恒常」判定が鉄拳6(11店中9店)・
+いざ番長(11店中8店)で有意になっており、ユーザーの実地実感がないことから、店の癖ではなく
+**機種側のhigh_prob推定バイアス**(スペック表由来の判定の甘さ等)が店舗横断で写っていると判断
+(今後の実装予定.md 1.8.5節)。S_機種のspearmanが負寄りだった有力原因でもある。ユーザー要望
+「機種が違っても同じ設定6は同じ強さとして検出してほしい」を受け、対症療法(案A)と根本対応の
+並走実験(案B)の両方を実装した。
+
+**案A(バイアス除外、合成済み)**: `identify_machine_bias(constant_conditions, total_store_count)`が
+全店舗の`group_calendar_conditions`(グループ種別='機種'、日付条件='恒常')を集計し、機種ごとに
+「BH有意だった店舗数 ÷ 全店舗数(プロファイル済み店舗数)」を計算、過半数超を「バイアス機種」と
+判定する。分母は機種の在籍有無に関わらず全店舗数を使う(「8/11店」という書き方に合わせる設計)。
+判定は恒常窓(全期間、グループ種別='機種')のみで行い、結果は機種/機種_直近の両方の恒常行に適用する
+(バイアスは機種側の推定バイアスであり時間窓に依存しないため)。日付条件付き(末尾8・毎月X日等)は
+店固有性が高いため除外対象にしない。
+
+```python
+bias_df = identify_machine_bias(constant_conditions, total_store_count)
+# columns: 機種名, 対象店舗数, 有意店舗数, 有意店舗比率, バイアス判定
+```
+
+`run_store_profile.py`の`_refresh_machine_bias_list`が店舗処理のたびにこの集計を再実行し
+`machine_bias_flags`テーブル(グローバル1本・全削除→再挿入)へ保存、バイアス機種名リストを返す
+(集計は軽量なSQL集約のみのため店舗ごとの再計算でも実害はない。複数店舗一括実行では
+ループが進むほど直近の検定結果を反映する)。`_run_machine_group_predictions`が、通常の
+S_機種/S_機種_直近に加えて、有意条件からバイアス機種の「恒常」行だけを除外した変種を
+S_機種_除外/S_機種_直近_除外として**同一期間に並走記録**する(除外前後を`prediction_accuracy`で
+対比較するため、既存のS_機種は変更せず残す)。`app_b.py`の`_load_condition_significance`/
+`_load_future_calendar_conditions`(おすすめ店舗スコア・有効性マトリクス・カレンダー投影が
+再利用)も、バイアス機種の「恒常」行を集計・投影から除外する。
+
+**案B(根本対応・δ較正、並走評価専用)**: `multi_store.learn_machine_bias_delta`が全店舗プールで
+「自機種の日次投入率 − 同店・同日の他機種平均投入率」の対応ペア差分をlogit空間で計算し、
+機種ごとに平均(raw_delta)を求めたうえで縮小推定(`delta = raw_delta × n/(n+SHRINKAGE_K)`,
+`SHRINKAGE_K=200`)する。nが少ない機種を0へ引き寄せる、他のStage5学習と同じ思想。
+`fit_hierarchical_model`実行後(bin_curves/channel_weights学習済み)に呼び、学習結果を
+`machine_bias_delta.json`へ保存する(1回学習・全店舗再利用、bin_curves/channel_weightsと同じ
+パターン)。`run_store_profile.py`の`_run_machine_bias_calibrated_predictions`がこのδで
+log_odds(`log_odds − delta`)を較正したhigh_probを使い、機種恒常検定→翌日予測を
+S_機種_較正としてprediction_logへ並走記録する(グループ種別='機種_較正'。**本流のhigh_prob・
+合成スコア・表示には一切使わない**)。δ未学習時は記録自体をスキップする。
+
+**評価**: 新規テーブル・予測種別を追加しただけで`evaluate_predictions.py`(予測種別ごとに汎用集計)・
+`write_prediction_log`の重複ガード(ホール名/予測種別/使用データ最終日キー)はコード変更不要で
+対応済み。S_機種・S_機種_除外・S_機種_較正の3系列を`prediction_accuracy`で比較し、
+0節の検証ゲートに従って除外/較正の採否を判断する(今後の実装予定.md参照)。
+
 ### 導入後カーブ: 新台/増台/減台/再導入/純移動の判別と経過日数ビン検定(`detect_introduction_events`/`introduction_curve_test`、2026-07-13設計・実装済み)
 
 新台・増台・移動台に共通して重要なのは「導入初日に入るか」ではなく**「導入後の一定期間、

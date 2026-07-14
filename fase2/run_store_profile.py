@@ -427,11 +427,32 @@ def _run_machine_group_conditions(
     return {'機種': result_full, '機種_直近': result_recent}
 
 
+def _refresh_machine_bias_list(analysis_db: str) -> list[str]:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] 全店舗横断で
+    group_calendar_conditions(グループ種別='機種', 日付条件='恒常')を集計し直し、
+    machine_bias_flagsを最新化してバイアス機種名リストを返す。
+
+    store_profile.pyの1店舗分の処理(run_for_hole)から毎回呼ぶため、複数店舗を
+    一括実行する場合はループが進むほど直近の検定結果を反映する(単一パス構成のまま、
+    最終店舗以外は前回実行分のデータが混じる最大1日分の遅延を許容する設計)。
+    集計自体は小さなSQL集約のみで軽量なため、店舗ごとに再計算しても実害はない。
+    """
+    conditions = sc.read_machine_constant_conditions(analysis_db)
+    total_stores = sc.count_profiled_stores(analysis_db)
+    bias_df = pt.identify_machine_bias(conditions, total_stores)
+    sc.write_machine_bias_flags(analysis_db, bias_df)
+    if bias_df.empty:
+        return []
+    return bias_df.loc[bias_df['バイアス判定'], '機種名'].tolist()
+
+
 def _run_machine_group_predictions(
     scored: 'pd.DataFrame',
     hole_name: str,
     group_results: dict,
     analysis_db: str,
+    bias_machines: list[str] | None = None,
 ) -> int:
     """
     [今後の実装予定.md 1.8節「機種単位の癖分析」] S_機種/S_機種_直近の翌観測日予測を
@@ -444,6 +465,11 @@ def _run_machine_group_predictions(
     evaluate_predictions.pyが実測差枚と台単位で突合するため、末尾版と同じ設計)。
 
     S_末尾と同様、長期/短期のブレンドは行わない(使用alpha=0.0固定)。
+
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] bias_machinesが渡された場合、
+    通常のS_機種/S_機種_直近に加えて「恒常」条件のうちバイアス機種の行だけを除外した
+    変種をS_機種_除外/S_機種_直近_除外として同じ期間に並走記録する(除外前後を
+    prediction_accuracyで同一期間対比較するため、既存のS_機種は変更せず残す)。
     """
     all_dates = sorted(scored['日付'].dropna().unique())
     if not all_dates:
@@ -465,25 +491,110 @@ def _run_machine_group_predictions(
         sig = group_result[group_result['BH有意']]
         if sig.empty:
             continue
-        for _, u in units.iterrows():
-            machine, unit = u['機種名'], int(u['台番号'])
-            pred = pt.predict_machine_group_next_day(machine, next_date, sig)
-            if pred is None:
+
+        variants = [(pred_type, sig)]
+        if bias_machines:
+            is_biased_constant = (sig['日付条件'] == '恒常') & (sig['グループ'].isin(bias_machines))
+            if is_biased_constant.any():
+                variants.append((f'{pred_type}_除外', sig[~is_biased_constant]))
+
+        for variant_pred_type, variant_sig in variants:
+            if variant_sig.empty:
                 continue
-            rows.append({
-                '実行日時': now,
-                '使用データ最終日': str(max_date),
-                '対象日': next_date.strftime('%Y-%m-%d'),
-                'ホール名': hole_name,
-                '機種名': machine,
-                '台番号': unit,
-                '予測種別': pred_type,
-                '長期スコア': pred['値'],
-                '短期スコア': None,
-                'ブレンド値': pred['値'],
-                '使用alpha': 0.0,
-                '詳細': {'該当条件': pred['該当条件']},
-            })
+            for _, u in units.iterrows():
+                machine, unit = u['機種名'], int(u['台番号'])
+                pred = pt.predict_machine_group_next_day(machine, next_date, variant_sig)
+                if pred is None:
+                    continue
+                rows.append({
+                    '実行日時': now,
+                    '使用データ最終日': str(max_date),
+                    '対象日': next_date.strftime('%Y-%m-%d'),
+                    'ホール名': hole_name,
+                    '機種名': machine,
+                    '台番号': unit,
+                    '予測種別': variant_pred_type,
+                    '長期スコア': pred['値'],
+                    '短期スコア': None,
+                    'ブレンド値': pred['値'],
+                    '使用alpha': 0.0,
+                    '詳細': {'該当条件': pred['該当条件']},
+                })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
+def _run_machine_bias_calibrated_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.8.5節「機種バイアス除外・案B」] multi_store.pyが全店舗横断で
+    学習した機種ベースラインδ(machine_bias_delta.json)でlog_oddsを較正した
+    high_probを使い、機種恒常検定→S_機種_較正の翌観測日予測を並走記録する
+    (合成スコア・表示には一切使わない実験軸。案Aと同一期間でprediction_accuracyの
+    spearman/リフトを比較するのが目的)。
+
+    δ未学習(ファイル未作成、または対象機種なし)の場合は較正が無意味(全機種delta=0で
+    通常のS_機種とほぼ同じ結果になる)なため記録自体をスキップする。
+    """
+    delta_map = pp.load_machine_bias_delta()
+    if not delta_map:
+        return 0
+
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return 0
+    max_date = all_dates[-1]
+
+    calibrated = scored.copy()
+    offset = calibrated['機種名'].map(delta_map).fillna(0.0).to_numpy(dtype=float)
+    calibrated_log_odds = calibrated['log_odds'].to_numpy(dtype=float) - offset
+    calibrated['high_prob'] = pp.sigmoid(calibrated_log_odds)
+
+    group_series = pt.machine_group(calibrated)
+    result = pt.build_group_calendar_conditions(
+        calibrated, hole_name, group_series, group_type='機種_較正',
+        include_match_rules=False, include_constant=True,
+    )
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result, str(max_date), group_types='機種_較正',
+    )
+    if result.empty:
+        return 0
+    sig = result[result['BH有意']]
+    if sig.empty:
+        return 0
+
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+    hole_last_day = calibrated[(calibrated['ホール名'] == hole_name) & (calibrated['日付'] == max_date)]
+    if 'is_invalid' in hole_last_day.columns:
+        hole_last_day = hole_last_day[~hole_last_day['is_invalid'].fillna(True)]
+    units = hole_last_day[['機種名', '台番号']].dropna().drop_duplicates()
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = []
+    for _, u in units.iterrows():
+        machine, unit = u['機種名'], int(u['台番号'])
+        pred = pt.predict_machine_group_next_day(machine, next_date, sig)
+        if pred is None:
+            continue
+        rows.append({
+            '実行日時': now,
+            '使用データ最終日': str(max_date),
+            '対象日': next_date.strftime('%Y-%m-%d'),
+            'ホール名': hole_name,
+            '機種名': machine,
+            '台番号': unit,
+            '予測種別': 'S_機種_較正',
+            '長期スコア': pred['値'],
+            '短期スコア': None,
+            'ブレンド値': pred['値'],
+            '使用alpha': 0.0,
+            '詳細': {'該当条件': pred['該当条件']},
+        })
 
     sc.write_prediction_log(analysis_db, rows)
     return len(rows)
@@ -729,8 +840,14 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     n_machine_calendar = sum(
         int(r['BH有意'].sum()) for r in machine_group_results.values() if not r.empty
     )
+    # [今後の実装予定.md 1.8.5節「機種バイアス除外」] 案A: 全店舗横断の恒常バイアス機種を
+    # 再集計し、除外版(S_機種_除外等)を並走記録。案B: δ較正版(S_機種_較正)を並走記録
+    bias_machines = _refresh_machine_bias_list(analysis_db)
     n_machine_pred = _run_machine_group_predictions(
-        scored, hole_name, machine_group_results, analysis_db
+        scored, hole_name, machine_group_results, analysis_db, bias_machines=bias_machines,
+    )
+    n_machine_calibrated_pred = _run_machine_bias_calibrated_predictions(
+        scored, hole_name, analysis_db
     )
 
     # [今後の実装予定.md 1.8.3節「導入後カーブ」] 機種レベルイベント(新台/増台/減台/
@@ -796,7 +913,8 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
         f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件、'
         f'末尾版有意{n_group_calendar}件・予測{n_tail_pred}台、'
-        f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台、'
+        f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台'
+        f'(バイアス機種{len(bias_machines)}件・較正予測{n_machine_calibrated_pred}台)、'
         f'導入後有意{n_introduction_sig}件・予測{n_introduction_pred}台)。'
     )
 

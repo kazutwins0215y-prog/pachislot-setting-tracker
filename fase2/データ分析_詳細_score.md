@@ -95,5 +95,19 @@ append-only記録する(今後の実装予定.md 1.8節)。`run_store_profile.ru
   `prediction_log`へ並走記録する(`_run_tail_group_predictions`。既存`write_prediction_log`の
   重複ガードをそのまま流用)
 
+### 機種バイアス判定の保存・読込(`write_machine_bias_flags`/`read_machine_bias_list`、2026-07-14「機種バイアス除外・案A」実装済み)
+
+`patterns.identify_machine_bias`の出力(機種名・対象店舗数・有意店舗数・有意店舗比率・バイアス判定)を
+`machine_bias_flags`テーブルへ保存する(詳細はpatterns.pyセクション「機種バイアス除外・案A/案B」参照)。
+
+- 他の店舗単位テーブルと異なり**グローバル1本**(店舗単位のキーを持たない、全店舗横断の診断情報のため)。
+  `run_store_profile.run_for_hole`が店舗処理のたびに全削除→再挿入で最新化する
+- バイアス判定=Falseの機種も含め全機種を保存する(「保存は緩く・使用側でゲート」の既存方針。
+  診断・案B較正への入力として可視化できる形にする)
+- `read_machine_bias_list`はバイアス判定=Trueの機種名リストを返す。`run_store_profile.py`の
+  予測生成・`app_b.py`のおすすめ店舗スコア/有効性マトリクス/カレンダー投影の除外フィルタが使う
+- `read_machine_constant_conditions`/`count_profiled_stores`は`identify_machine_bias`の入力
+  (全店舗の機種×恒常条件、プロファイル済み店舗数)をDBから読み込むヘルパー
+
 ---
 

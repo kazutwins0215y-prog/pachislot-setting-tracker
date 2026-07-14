@@ -51,6 +51,8 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - Stage 3: 統合スコア化
 - Stage 4: 信頼度しきい値・判定保留
 - Stage 5: 複数店舗データでの精緻化(`multi_store.fit_hierarchical_model`、2026-07再設計)
+- 機種バイアスδ学習・案B(`multi_store.learn_machine_bias_delta`、2026-07-14設計・実装済み): 機種ごとのlog_odds系統オフセットを全店舗横断・縮小推定で学習(並走評価専用、`machine_bias_delta.json`)
+- 高設定/低設定の分割境界(`preprocess._split_setting_keys`、2026-07-14修正): 設定4以上/3以下の固定境界に変更(旧「上位半分/下位半分」折半は欠番パターンで境界がズレていた沖ドキ系等6機種のみ影響)
 - Stage 6: 検証戦略(教師ラベルなし。`multi_store.py`で実装済み)
 
 
@@ -66,6 +68,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - 機種強さ軸・全台系/高配分の日次判定(`score_zentaikei_judgment`、2026-07-09設計合意・Phase1実装済み)
 - 末尾版: 台番号末尾グループのカレンダー構造検出(`build_group_calendar_conditions`、2026-07-10設計・実装済み)
 - 機種版: 看板機種＋機種カレンダー癖の検出(`machine_group`/`group_constant_test`、2026-07-10設計・実装済み)
+- 機種バイアス除外・案A(`identify_machine_bias`、2026-07-14設計・実装済み): 全店舗横断で「機種×恒常」がBH有意だった店舗比率を集計し過半数超を機種側の推定バイアスと判定
 - 導入後カーブ: 新台/増台/減台/再導入/純移動の判別と経過日数ビン検定(`detect_introduction_events`/`introduction_curve_test`、2026-07-13設計・実装済み)
 - パターン検出: 深さ(depth)型
 - 鉄板台の検出フロー(2経路)
@@ -92,6 +95,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - 店舗プロファイル
 - 機種×日 全台系/高配分の判定ログ(`write_machine_judgment_log`、2026-07-09設計合意・Phase1実装済み)
 - 末尾版レイヤー2検定結果の保存(`write_group_calendar_conditions`、2026-07-10「末尾版」フェーズ2実装済み)
+- 機種バイアス判定の保存・読込(`write_machine_bias_flags`/`read_machine_bias_list`、2026-07-14「機種バイアス除外・案A」実装済み)
 
 
 ## 出力3系統
@@ -120,8 +124,9 @@ analysis.db/ground_truth.dbの全テーブル定義(stage3_scores〜ground_truth
 - `machine_judgment_log` テーブル（analysis.db、`score.write_machine_judgment_log`が更新。2026-07-09設計合意「機種強さ軸・全台系/高配分の日次判定」Phase1）
 - `group_calendar_conditions` テーブル（analysis.db、`score.write_group_calendar_conditions`が更新。2026-07-10「末尾版」フェーズ2実装済み・2026-07「機種単位の癖分析」で拡張）
 - `introduction_events` テーブル（analysis.db、`score.write_introduction_events`が更新。2026-07-13「導入後カーブ」実装済み）
+- `machine_bias_flags` テーブル（analysis.db、`score.write_machine_bias_flags`が更新。2026-07-14「機種バイアス除外・案A」実装済み。グローバル1本・全削除→再挿入）
 - `ground_truth` テーブル（`ホールデータ/ground_truth.db`、正解発表の手入力データ。2026-07-12実装済み）
-- 外部ファイル
+- 外部ファイル（`machine_bias_delta.json`含む。2026-07-14「機種バイアス除外・案B」実装済み）
 
 ## 重要な設計上の注意点
 
