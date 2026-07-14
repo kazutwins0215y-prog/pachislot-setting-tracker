@@ -120,7 +120,6 @@ def get_info(session: requests.Session, url: str, hole_date: str):
                 n = j + 1
                 prepend = 1 if is_variety else 2
                 data_column_list.append(n + prepend)
-                data_row_list.append(len(datas) // n - 1)
                 break
 
         if n == 0:
@@ -141,6 +140,16 @@ def get_info(session: requests.Session, url: str, hole_date: str):
                     data_list.append(slot_name)
             data_list.append(text)
             count += 1
+
+        # 行数は実際に取り込んだ行数(平均行の手前まで)を数える。
+        # 旧実装の len(datas)//n - 1 は「表末尾に平均行がある」前提の計算で、
+        # 平均行を持たないバラエティ(1台設置)表では最終行を毎回取り捨てていた
+        # (2026-07-14発覚。全店舗×全期間でバラエティ最終行1台が欠損)
+        if count % n != 0:
+            partial = count % n
+            del data_list[-(partial + prepend):]
+            logger.warning(f'{slot_name}: 末尾の不完全な行({partial}セル)を除外しました')
+        data_row_list.append(count // n)
 
     logger.info('データ取得完了')
     return data_list, data_column_list, data_row_list, missing_machines
