@@ -69,6 +69,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - 末尾版: 台番号末尾グループのカレンダー構造検出(`build_group_calendar_conditions`、2026-07-10設計・実装済み)
 - 機種版: 看板機種＋機種カレンダー癖の検出(`machine_group`/`group_constant_test`、2026-07-10設計・実装済み)
 - 機種バイアス除外・案A(`identify_machine_bias`、2026-07-14設計・実装済み): 全店舗横断で「機種×恒常」がBH有意だった店舗比率を集計し過半数超を機種側の推定バイアスと判定
+- 店舗×曜日(店全体レベル)の癖軸(`store_day_calendar_test`、2026-07-14設計・実装済み): 店全体を1グループとして実測差枚(勝ち台率)をカレンダー49候補で検定。既存軸と異なりhigh_probではなく実測値を検定する
 - 導入後カーブ: 新台/増台/減台/再導入/純移動の判別と経過日数ビン検定(`detect_introduction_events`/`introduction_curve_test`、2026-07-13設計・実装済み)
 - パターン検出: 深さ(depth)型
 - 鉄板台の検出フロー(2経路)
@@ -104,7 +105,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 
 機能A(店内比較)・機能B(店舗特徴+おすすめ店舗)・トップページ(熱い台予測7タブ)の表示層詳細。
 
-収録トピック（全文検索用）: 機能B再設計 Phase1〜7の実装経緯(有効性マトリクス`build_habit_matrix`・検知期間履歴・カレンダーヒートマップ・おすすめ店舗ランキング`compute_store_recommend_score`案cハイブリッド・符号付きパーセンタイル`signed_percentile`) / 機能A(`app_a.py`店舗分析・台番号・機種名ビュー) / トップページ(`app_top.py`鮮度フィルタ・新台/増台タブ分離) / `ui_theme.py`(モバイルUI・ダークテーマ)
+収録トピック（全文検索用）: 機能B再設計 Phase1〜7の実装経緯(有効性マトリクス`build_habit_matrix`・検知期間履歴・カレンダーヒートマップ・おすすめ店舗ランキング`compute_store_recommend_score`案cハイブリッド・符号付きパーセンタイル`signed_percentile`) / カレンダーヒートマップのイベント日マーカー★(店舗×曜日の癖軸、`_load_store_day_conditions`/`_mark_event_days`、2026-07-14実装済み) / 機能A(`app_a.py`店舗分析・台番号・機種名ビュー) / トップページ(`app_top.py`鮮度フィルタ・新台/増台タブ分離) / `ui_theme.py`(モバイルUI・ダークテーマ)
 
 
 ## データモデル(fase2新規追加分)

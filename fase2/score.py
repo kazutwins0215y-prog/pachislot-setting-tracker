@@ -516,6 +516,7 @@ _CREATE_GROUP_CALENDAR_CONDITIONS_SQL = '''
         効果量           REAL,
         BH有意           INTEGER,
         台数中央値       REAL,
+        参考差枚差       REAL,
         使用データ最終日 TEXT NOT NULL,
         更新日時         TEXT
     )
@@ -524,14 +525,17 @@ _CREATE_GROUP_CALENDAR_CONDITIONS_SQL = '''
 
 def _ensure_group_calendar_conditions_schema(con: sqlite3.Connection) -> None:
     """
-    [2026-07 機種単位の癖分析] 台数中央値カラム(機種版のみ使用。使用側ゲート(暫定n≥3等)の
-    判断材料。末尾版の行はNULLのまま)を追加するマイグレーション。既存DBはCREATE TABLE
-    IF NOT EXISTSでは列が増えないため、teppan_conditions等と同様PRAGMA table_infoで
-    存在確認してからALTER TABLEする。
+    [2026-07 機種単位の癖分析/1.9節「店舗×曜日の癖軸」] 台数中央値カラム(機種版のみ使用。
+    使用側ゲート(暫定n≥3等)の判断材料。末尾版の行はNULLのまま)・参考差枚差カラム
+    (店舗日版のみ使用。検定対象外の記述統計、他版の行はNULLのまま)を追加するマイグレーション。
+    既存DBはCREATE TABLE IF NOT EXISTSでは列が増えないため、teppan_conditions等と同様
+    PRAGMA table_infoで存在確認してからALTER TABLEする。
     """
     cols = [row[1] for row in con.execute('PRAGMA table_info(group_calendar_conditions)').fetchall()]
     if '台数中央値' not in cols:
         con.execute('ALTER TABLE group_calendar_conditions ADD COLUMN 台数中央値 REAL')
+    if '参考差枚差' not in cols:
+        con.execute('ALTER TABLE group_calendar_conditions ADD COLUMN 参考差枚差 REAL')
 
 
 def write_group_calendar_conditions(
@@ -562,6 +566,7 @@ def write_group_calendar_conditions(
 
     now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
     has_size_col = '台数中央値' in result_df.columns
+    has_diff_col = '参考差枚差' in result_df.columns
     rows = [
         (
             hole_name, r['グループ種別'], r['グループ'], r['日付条件'],
@@ -570,6 +575,7 @@ def write_group_calendar_conditions(
             None if pd.isna(r['効果量']) else float(r['効果量']),
             int(bool(r['BH有意'])),
             None if not has_size_col or pd.isna(r['台数中央値']) else float(r['台数中央値']),
+            None if not has_diff_col or pd.isna(r['参考差枚差']) else float(r['参考差枚差']),
             last_date, now,
         )
         for _, r in result_df.iterrows()
@@ -588,8 +594,8 @@ def write_group_calendar_conditions(
             con.executemany(
                 '''
                 INSERT INTO group_calendar_conditions
-                    (ホール名, グループ種別, グループ, 日付条件, 該当日数, p値, 効果量, BH有意, 台数中央値, 使用データ最終日, 更新日時)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (ホール名, グループ種別, グループ, 日付条件, 該当日数, p値, 効果量, BH有意, 台数中央値, 参考差枚差, 使用データ最終日, 更新日時)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 rows,
             )

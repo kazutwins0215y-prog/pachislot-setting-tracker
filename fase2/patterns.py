@@ -1168,6 +1168,147 @@ def identify_machine_bias(
     return grouped.sort_values('有意店舗比率', ascending=False).reset_index(drop=True)[columns]
 
 
+# ── 店舗×曜日(店全体レベル)の癖軸(今後の実装予定.md 1.9節、2026-07-14設計確定) ──────
+
+STORE_DAY_MIN_UNITS = 5  # 店舗×日集計に使う最低有効台数(未満の日は集計から除外。欠測・臨時休業対策)
+
+
+def store_day_calendar_test(
+    df: pd.DataFrame,
+    hole_name: str,
+    min_days: int = GROUP_CALENDAR_MIN_DAYS,
+    min_units: int = STORE_DAY_MIN_UNITS,
+) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日(店全体レベル)の癖軸」] 店舗全体を1グループとして
+    扱い、日付条件ごとに「候補日 vs 対照日」のMann-Whitney U片側検定(greater)+
+    rank-biserial効果量を行う(末尾版/機種版のgroup_calendar_testと同じ枠組みだが、
+    グループが店全体1つのため複数グループ間の比較にはならない)。
+
+    既存軸(末尾版/機種版/機種強さ軸)はすべてhigh_prob(モデルの事後確率)を検定対象に
+    しているが、この軸は「特定機種に固めない・中間設定中心の広浅い還元」を検出する目的のため、
+    **実測差枚そのもの(勝ち台率=差枚>0の台の割合)を検定する**(2026-07-14ユーザー合意)。
+    high_probベースの投入率だと機種側の推定を経由するため、広浅型の還元(モデルが強い/弱いと
+    判定しない中間設定の底上げ)を原理的に検出できない。勝ち台率は店内の機種構成(ボラティリティが
+    機種ごとに大きく異なる)に左右されにくく0〜1に正規化されるため、台あたり差枚(平均)より
+    店舗横断比較に向くと判断し主指標に採用した。台あたり差枚は検定対象にはせず、
+    「参考差枚差」(候補日平均−対照日平均、単位:枚)として同じ行に記述統計のみ保存する
+    (実地照合用。プレサス土曜+240枚のような数字をそのまま確認できるようにするため)。
+
+    有効台数(is_invalid除外)がmin_units未満の日は集計から除外する(欠測・臨時休業等の
+    ノイズ日を候補日/対照日どちらの集団にも混ぜない)。
+
+    BH補正は他軸(末尾版/機種版)とは混ぜず、この関数の49候補だけで独立に行う
+    (店舗全体1グループのみのため、build_group_calendar_conditionsの一致ルール・
+    看板機種検定は該当しない=専用のエントリポイントとする)。
+
+    Returns:
+        DataFrame(グループ種別='店舗日', グループ='店全体', 日付条件, 該当日数, 対照日数,
+                  p_raw, 効果量, 参考差枚差, BH有意)
+    """
+    columns = [
+        'グループ種別', 'グループ', '日付条件', '該当日数', '対照日数',
+        'p_raw', '効果量', '参考差枚差', 'BH有意',
+    ]
+    empty = pd.DataFrame(columns=columns)
+
+    mask = df['ホール名'] == hole_name
+    if 'is_invalid' in df.columns:
+        mask &= ~df['is_invalid'].fillna(True)
+    sub = df.loc[mask].dropna(subset=['差枚', '日付']).copy()
+    if sub.empty:
+        return empty
+
+    grp = sub.groupby('日付')['差枚']
+    daily = pd.DataFrame({
+        'n': grp.size(),
+        '勝ち数': grp.apply(lambda s: int((s > 0).sum())),
+        '平均差枚': grp.mean(),
+    })
+    daily = daily[daily['n'] >= min_units]
+    if daily.empty:
+        return empty
+    daily['勝ち台率'] = daily['勝ち数'] / daily['n']
+
+    all_dates = sorted(daily.index)
+    dt_idx = pd.to_datetime(all_dates, errors='coerce')
+    conditions = calendar_candidates(dt_idx)
+    date_pos = {d: i for i, d in enumerate(all_dates)}
+
+    records = []
+    for cname, mask_arr in conditions.items():
+        cand_dates = [d for d in all_dates if mask_arr[date_pos[d]]]
+        ctrl_dates = [d for d in all_dates if not mask_arr[date_pos[d]]]
+        k_cand, k_ctrl = len(cand_dates), len(ctrl_dates)
+
+        if k_cand < min_days or k_ctrl < min_days:
+            records.append({
+                'グループ種別': '店舗日', 'グループ': '店全体', '日付条件': cname,
+                '該当日数': k_cand, '対照日数': k_ctrl,
+                'p_raw': np.nan, '効果量': np.nan, '参考差枚差': np.nan,
+            })
+            continue
+
+        x = daily.loc[cand_dates, '勝ち台率'].to_numpy(dtype=float)
+        y = daily.loc[ctrl_dates, '勝ち台率'].to_numpy(dtype=float)
+        _, p = stats.mannwhitneyu(x, y, alternative='greater')
+        u2, _ = stats.mannwhitneyu(x, y, alternative='two-sided')
+        rbc = float(2.0 * u2 / (len(x) * len(y)) - 1.0)
+        diff_ref = float(
+            daily.loc[cand_dates, '平均差枚'].mean() - daily.loc[ctrl_dates, '平均差枚'].mean()
+        )
+        records.append({
+            'グループ種別': '店舗日', 'グループ': '店全体', '日付条件': cname,
+            '該当日数': k_cand, '対照日数': k_ctrl,
+            'p_raw': float(p), '効果量': rbc, '参考差枚差': diff_ref,
+        })
+
+    result = pd.DataFrame(records)
+    testable = result['p_raw'].notna()
+    flags = benjamini_hochberg(result.loc[testable, 'p_raw'].tolist())
+    result['BH有意'] = False
+    result.loc[testable, 'BH有意'] = [
+        bool(f) and eff >= EFFECT_SIZE_THRESHOLD
+        for f, eff in zip(flags, result.loc[testable, '効果量'])
+    ]
+    return result[columns]
+
+
+def predict_store_day_next_day(
+    next_date,
+    significant_conditions: pd.DataFrame,
+) -> dict | None:
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] S_店舗日の翌観測日予測。店舗全体で
+    1つのグループしかないため、末尾版/機種版と異なりグループ照合は不要で、next_dateが
+    該当する有意カレンダー条件を集めてmax(効果量)を採る(重複統合、加算しない=二重計上回避)。
+
+    significant_conditions: store_day_calendar_testの出力のうちBH有意=Trueの行
+    (この店舗・この使用データ最終日分。呼び出し側でフィルタして渡す)。
+
+    Returns:
+        {'値': float(該当条件のmax効果量), '該当条件': [{'日付条件','効果量'}, ...]}
+        該当する有意条件が1つもない場合はNone(予測不可)。
+    """
+    if significant_conditions.empty:
+        return None
+
+    dt = pd.Timestamp(next_date)
+    candidates = calendar_candidates(pd.DatetimeIndex([dt]))
+
+    matched: list[dict] = []
+    for _, row in significant_conditions.iterrows():
+        cname = row['日付条件']
+        mask_arr = candidates.get(cname)
+        if mask_arr is not None and bool(mask_arr[0]):
+            matched.append({'日付条件': cname, '効果量': float(row['効果量'])})
+
+    if not matched:
+        return None
+    best = max(matched, key=lambda m: m['効果量'])
+    return {'値': best['効果量'], '該当条件': matched}
+
+
 # ── 導入後カーブ(今後の実装予定.md 1.8.3節「導入後カーブ」2026-07-13設計確定) ──────
 
 INTRODUCTION_BIN_ORDER = ['初日', '2〜3日', '4〜7日', '8〜14日', '15日以降']

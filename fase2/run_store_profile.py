@@ -427,6 +427,90 @@ def _run_machine_group_conditions(
     return {'機種': result_full, '機種_直近': result_recent}
 
 
+def _run_store_day_conditions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> 'pd.DataFrame':
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日(店全体レベル)の癖軸」] 店舗全体レベルの
+    カレンダー構造検定(patterns.store_day_calendar_test)をgroup_calendar_conditionsへ
+    保存する(グループ種別='店舗日')。末尾版・機種版と同じ「グループ種別単位で
+    全削除→再挿入」方式(店舗単位で全履歴を毎回再検定するため過去分の履歴を残す必要がない)。
+
+    Returns: store_day_calendar_testの生の結果DataFrame(空ならempty)。
+    _run_store_day_predictionsが同じ結果を再利用するため、保存だけでなく呼び出し元へ返す。
+    """
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return pd.DataFrame()
+    max_date = all_dates[-1]
+
+    result = pt.store_day_calendar_test(scored, hole_name)
+    sc.write_group_calendar_conditions(
+        analysis_db, hole_name, result, str(max_date), group_types='店舗日',
+    )
+    return result
+
+
+def _run_store_day_predictions(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    result: 'pd.DataFrame',
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] S_店舗日の翌観測日予測をprediction_logへ
+    追記する(並走記録のみ。合成スコア(狙い目度)へは混ぜない。S_末尾等と同じ運用)。
+
+    店全体レベルの予測のため台ごとの区別はなく、翌日が有意条件に該当する場合は
+    使用データ最終日に判定可能だった全台へ同じ値を書く(evaluate_predictions.pyが
+    実測差枚と台単位で突合するため、末尾版/機種版と同じ粒度で保存する)。
+    """
+    if result.empty:
+        return 0
+    sig = result[result['BH有意']]
+    if sig.empty:
+        return 0
+
+    all_dates = sorted(scored['日付'].dropna().unique())
+    if not all_dates:
+        return 0
+    max_date = all_dates[-1]
+    next_date = pd.to_datetime(max_date) + pd.DateOffset(days=1)
+
+    pred = pt.predict_store_day_next_day(next_date, sig)
+    if pred is None:
+        return 0
+
+    hole_last_day = scored[(scored['ホール名'] == hole_name) & (scored['日付'] == max_date)]
+    if 'is_invalid' in hole_last_day.columns:
+        hole_last_day = hole_last_day[~hole_last_day['is_invalid'].fillna(True)]
+    units = hole_last_day[['機種名', '台番号']].dropna().drop_duplicates()
+
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    rows = []
+    for _, u in units.iterrows():
+        machine, unit = u['機種名'], int(u['台番号'])
+        rows.append({
+            '実行日時': now,
+            '使用データ最終日': str(max_date),
+            '対象日': next_date.strftime('%Y-%m-%d'),
+            'ホール名': hole_name,
+            '機種名': machine,
+            '台番号': unit,
+            '予測種別': 'S_店舗日',
+            '長期スコア': pred['値'],
+            '短期スコア': None,
+            'ブレンド値': pred['値'],
+            '使用alpha': 0.0,
+            '詳細': {'該当条件': pred['該当条件']},
+        })
+
+    sc.write_prediction_log(analysis_db, rows)
+    return len(rows)
+
+
 def _refresh_machine_bias_list(analysis_db: str) -> list[str]:
     """
     [今後の実装予定.md 1.8.5節「機種バイアス除外・案A」] 全店舗横断で
@@ -834,6 +918,12 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     # [今後の実装予定.md 1.8節「末尾版」フェーズ3] S_末尾の翌観測日予測をprediction_logへ追記
     n_tail_pred = _run_tail_group_predictions(scored, hole_name, group_calendar_result, analysis_db)
 
+    # [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] 店舗全体レベルのカレンダー構造検定を保存し、
+    # S_店舗日の翌観測日予測をprediction_logへ追記(並走記録のみ。合成スコアには混ぜない)
+    store_day_result = _run_store_day_conditions(scored, hole_name, analysis_db)
+    n_store_day_sig = int(store_day_result['BH有意'].sum()) if not store_day_result.empty else 0
+    n_store_day_pred = _run_store_day_predictions(scored, hole_name, store_day_result, analysis_db)
+
     # [今後の実装予定.md 1.8節「機種単位の癖分析」] 看板機種+機種カレンダー癖を
     # 恒常窓/直近90日窓の2窓で検定・保存し、S_機種/S_機種_直近の翌観測日予測を追記
     machine_group_results = _run_machine_group_conditions(scored, hole_name, analysis_db)
@@ -913,6 +1003,7 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
         f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件、'
         f'末尾版有意{n_group_calendar}件・予測{n_tail_pred}台、'
+        f'店舗日有意{n_store_day_sig}件・予測{n_store_day_pred}台、'
         f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台'
         f'(バイアス機種{len(bias_machines)}件・較正予測{n_machine_calibrated_pred}台)、'
         f'導入後有意{n_introduction_sig}件・予測{n_introduction_pred}台)。'

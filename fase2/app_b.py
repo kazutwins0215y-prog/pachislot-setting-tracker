@@ -476,10 +476,17 @@ def _load_daily_stage3_avg(db_path: str, hole_name: str) -> pd.Series:
     return df.groupby('日付')['high_prob'].mean()
 
 
-def _month_grid(score_by_day: dict[str, float], year: int, month: int) -> tuple[np.ndarray, np.ndarray]:
+def _month_grid(
+    score_by_day: dict[str, float],
+    year: int,
+    month: int,
+    event_days: set[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     year年month月のカレンダー形式(週×曜日)グリッドを作る。
     score_by_day: 'YYYY-MM-DD' → スコアの辞書。月内でデータが無い日はNaN。
+    event_days: [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] 有意な店舗日条件に該当する
+    日付集合('YYYY-MM-DD')。該当日は日表示に★を付ける(過去・未来どちらの日付も対象)。
     Returns: (z: 週数×7 のスコア行列, text: 同形状の「日」表示用文字列行列)
     """
     import calendar
@@ -491,8 +498,9 @@ def _month_grid(score_by_day: dict[str, float], year: int, month: int) -> tuple[
         for di, day in enumerate(week):
             if day == 0:
                 continue
-            text[wi, di] = str(day)
             date_str = f'{year:04d}-{month:02d}-{day:02d}'
+            marker = '★' if event_days and date_str in event_days else ''
+            text[wi, di] = f'{day}{marker}'
             if date_str in score_by_day:
                 z[wi, di] = score_by_day[date_str]
     return z, text
@@ -599,7 +607,7 @@ def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFra
                 df = pd.read_sql_query(
                     "SELECT グループ, 日付条件, 効果量 FROM group_calendar_conditions "
                     "WHERE ホール名 = ? AND BH有意 = 1 "
-                    "AND グループ種別 IN ('台番号末尾', '機種', '機種_直近')"
+                    "AND グループ種別 IN ('台番号末尾', '機種', '機種_直近', '店舗日')"
                     f"{exclude_clause}",
                     con, params=params,
                 )
@@ -618,6 +626,57 @@ def _load_future_calendar_conditions(db_path: str, hole_name: str) -> pd.DataFra
     if not frames:
         return pd.DataFrame(columns=['日付条件', '効果量'])
     return pd.concat(frames, ignore_index=True).dropna(subset=['効果量'])
+
+
+def _load_store_day_conditions(db_path: str, hole_name: str) -> pd.DataFrame:
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] group_calendar_conditionsから
+    グループ種別='店舗日'のBH有意な行(日付条件, 効果量)を返す。カレンダーヒートマップの
+    イベント日マーカー(★)表示専用(_load_future_calendar_conditionsは色の投影に使うため
+    別途取得する)。
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'group_calendar_conditions' not in tables:
+                return pd.DataFrame(columns=['日付条件', '効果量'])
+            return pd.read_sql_query(
+                "SELECT 日付条件, 効果量 FROM group_calendar_conditions "
+                "WHERE ホール名 = ? AND グループ種別 = '店舗日' AND BH有意 = 1",
+                con, params=(hole_name,),
+            )
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame(columns=['日付条件', '効果量'])
+
+
+def _mark_event_days(conditions: pd.DataFrame, dates: list) -> set[str]:
+    """
+    [今後の実装予定.md 1.9節「店舗×曜日の癖軸」] 有意な店舗日条件(store_day_calendar_test)に
+    該当する日付の集合('YYYY-MM-DD')を返す(カレンダーヒートマップの★マーカー表示用。
+    実績日・未来日どちらの日付リストにも使える)。
+    """
+    if conditions.empty or not dates:
+        return set()
+    import patterns as pt
+
+    dt_index = pd.DatetimeIndex(dates)
+    candidates = pt.calendar_candidates(dt_index)
+    sig_names = set(conditions['日付条件'])
+
+    marked: set[str] = set()
+    for cname in sig_names:
+        mask = candidates.get(cname)
+        if mask is None:
+            continue
+        for i, dt in enumerate(dt_index):
+            if bool(mask[i]):
+                marked.add(dt.strftime('%Y-%m-%d'))
+    return marked
 
 
 def _project_future_calendar_scores(conditions: pd.DataFrame, dates: list) -> dict[str, float]:
@@ -1035,6 +1094,7 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
         '差枚・設定配分を表示します。データ取得済み日は実績、それ以降の日はカレンダー型の'
         '検出パターン(曜日・毎月X日・機種の看板パターン等)からの予測です'
         '(今後の実装予定.md 4節「機能B理想形」項目5)。'
+        '★は「店舗×曜日の癖軸」(1.9節、検証中・並走記録のみ)で有意と判定された日を示します。'
     )
 
     daily_avg = _load_daily_stage3_avg(str(ds.ANALYSIS_DB_PATH), sel_hole)     # 設定配分(実績)
@@ -1071,10 +1131,13 @@ def render_store_detail(profiles: pd.DataFrame, sel_hole: str) -> None:
 
     combined_map = {**rel_map, **projected}
 
+    store_day_conditions = _load_store_day_conditions(str(ds.ANALYSIS_DB_PATH), sel_hole)
+    event_days = _mark_event_days(store_day_conditions, month_dates)
+
     if not combined_map:
         st.info('カレンダー表示用のデータがありません。')
     else:
-        z, text = _month_grid(combined_map, year, month)
+        z, text = _month_grid(combined_map, year, month, event_days=event_days)
         # DIVERGINGは中間点が白のため、白文字(ui.TEXT)だと0付近のセルで読めなくなる。
         # 濃色文字はcard_bg〜赤/青の全域で3:1以上のコントラストを確保できるためこちらを使う。
         fig_cal = go.Figure(data=go.Heatmap(
