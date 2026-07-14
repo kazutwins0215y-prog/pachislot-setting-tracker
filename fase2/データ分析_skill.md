@@ -66,6 +66,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - 台同一性・移動/撤去/増台の判定ロジック
 - パターン検出: 幅(breadth)型
 - 機種強さ軸・全台系/高配分の日次判定(`score_zentaikei_judgment`、2026-07-09設計合意・Phase1実装済み)
+- 少台数機種向けFisher版(`score_zentaikei_judgment_fisher`、2026-07-14実装・正解発表12件との突合でrecall 0/13と判明し不採用方向・並走記録のみ継続。経緯の一次情報は`今後の実装予定.md`1.8.1節)
 - 末尾版: 台番号末尾グループのカレンダー構造検出(`build_group_calendar_conditions`、2026-07-10設計・実装済み)
 - 機種版: 看板機種＋機種カレンダー癖の検出(`machine_group`/`group_constant_test`、2026-07-10設計・実装済み)
 - 機種バイアス除外・案A(`identify_machine_bias`、2026-07-14設計・実装済み): 全店舗横断で「機種×恒常」がBH有意だった店舗比率を集計し過半数超を機種側の推定バイアスと判定
@@ -95,6 +96,7 @@ data_source.py（レプリカ/分析DBのパス・接続の共通層）
 - 稼働(混雑度)の推定(S_稼働低さ)
 - 店舗プロファイル
 - 機種×日 全台系/高配分の判定ログ(`write_machine_judgment_log`、2026-07-09設計合意・Phase1実装済み)
+- 機種×日 判定ログのFisher版(`write_machine_judgment_fisher_log`、2026-07-14実装・並走記録専用)
 - 末尾版レイヤー2検定結果の保存(`write_group_calendar_conditions`、2026-07-10「末尾版」フェーズ2実装済み)
 - 機種バイアス判定の保存・読込(`write_machine_bias_flags`/`read_machine_bias_list`、2026-07-14「機種バイアス除外・案A」実装済み)
 
@@ -123,6 +125,7 @@ analysis.db/ground_truth.dbの全テーブル定義(stage3_scores〜ground_truth
 - `prediction_accuracy` テーブル（analysis.db、`evaluate_predictions.evaluate`が更新。機能B再設計Stage7-2・2026-07追加）
 - `score_snapshot` テーブル（analysis.db、`score.write_score_snapshot`が更新。2026-07-09 タスク5「記録側先行実装」）
 - `machine_judgment_log` テーブル（analysis.db、`score.write_machine_judgment_log`が更新。2026-07-09設計合意「機種強さ軸・全台系/高配分の日次判定」Phase1）
+- `machine_judgment_fisher_log` テーブル（analysis.db、`score.write_machine_judgment_fisher_log`が更新。2026-07-14「少台数機種向けFisher版」並走記録専用・検証で不採用方向）
 - `group_calendar_conditions` テーブル（analysis.db、`score.write_group_calendar_conditions`が更新。2026-07-10「末尾版」フェーズ2実装済み・2026-07「機種単位の癖分析」で拡張）
 - `introduction_events` テーブル（analysis.db、`score.write_introduction_events`が更新。2026-07-13「導入後カーブ」実装済み）
 - `machine_bias_flags` テーブル（analysis.db、`score.write_machine_bias_flags`が更新。2026-07-14「機種バイアス除外・案A」実装済み。グローバル1本・全削除→再挿入）

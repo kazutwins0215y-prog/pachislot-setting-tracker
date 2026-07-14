@@ -80,6 +80,16 @@ append-only記録する(今後の実装予定.md 1.8節)。`run_store_profile.ru
   `INSERT OR IGNORE`で行単位に行う(初回=全履歴バックフィル、以降=新規日のみ実質追記となり、
   fase4の日次再実行でも二重記録されない。`prediction_log`のバッチ単位事前チェック方式とは異なる設計)
 
+### 機種×日 判定ログのFisher版(`write_machine_judgment_fisher_log`、2026-07-14実装・並走記録専用)
+
+`patterns.score_zentaikei_judgment_fisher`の出力を`machine_judgment_fisher_log`テーブルへ
+append-only記録する(今後の実装予定.md 1.8.1節)。設計は`write_machine_judgment_log`と同型
+(全履歴まとめ渡し+`PRIMARY KEY (ホール名, 日付, 機種名)`への`INSERT OR IGNORE`)。
+0節検証ゲートの並走記録専用で、表示・合成スコアには一切使わない。
+**東中野の正解発表12件との突合でrecall 0/13と判明し不採用方向**(経緯は
+`今後の実装予定.md`1.8.1節・patterns.pyセクション「少台数機種向けFisher版」参照)。
+記録自体は比較資料としてfase4の日次実行で継続する。
+
 ### 末尾版レイヤー2検定結果の保存(`write_group_calendar_conditions`、2026-07-10「末尾版」フェーズ2実装済み)
 
 `patterns.build_group_calendar_conditions`の出力(台番号末尾グループ×日付条件のMann-Whitney U検定+

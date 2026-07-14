@@ -29,6 +29,10 @@ Stage3スコア保存 (write_stage3_scores):
     patterns.score_zentaikei_judgmentの出力(機種×日×ホールの全台系/高配分判定)を
     append-only蓄積(全履歴バックフィル対応。今後の実装予定.md 1.8節 Phase1)
 
+機種判定ログ記録・少台数機種向けFisher版 (write_machine_judgment_fisher_log):
+    patterns.score_zentaikei_judgment_fisherの出力を並走記録専用でappend-only蓄積
+    (今後の実装予定.md 1.8.1節、2026-07-14実装)
+
 末尾版レイヤー2検定結果保存 (write_group_calendar_conditions):
     patterns.build_group_calendar_conditionsの出力(台番号末尾グループ×日付条件の
     Mann-Whitney U検定+一致ルール2本)を分析DBへ保存(teppan_conditionsと同じ
@@ -975,6 +979,68 @@ def write_machine_judgment_log(db_path: str, judgment_df: pd.DataFrame) -> int:
         con.commit()
 
         after = con.execute('SELECT COUNT(*) FROM machine_judgment_log').fetchone()[0]
+        return after - before
+    finally:
+        con.close()
+
+
+_CREATE_MACHINE_JUDGMENT_FISHER_LOG_SQL = '''
+    CREATE TABLE IF NOT EXISTS machine_judgment_fisher_log (
+        実行日時       TEXT NOT NULL,
+        ホール名       TEXT NOT NULL,
+        日付           TEXT NOT NULL,
+        機種名         TEXT NOT NULL,
+        台数           INTEGER,
+        hot台数        INTEGER,
+        p値            REAL,
+        投入率         REAL,
+        判定ラベル     TEXT,
+        PRIMARY KEY (ホール名, 日付, 機種名)
+    )
+'''
+
+
+def write_machine_judgment_fisher_log(db_path: str, judgment_df: pd.DataFrame) -> int:
+    """
+    [1.8.1節・2026-07-14実装] patterns.score_zentaikei_judgment_fisherの出力
+    (機種×日×ホール粒度、Fisher直接確率検定版の全台系/高配分判定)を
+    machine_judgment_fisher_logへappend-only記録する。0節の検証ゲートに従い並走記録専用
+    (合成スコア・トップページ表示には一切使わない。現行のmachine_judgment_logは無変更)。
+
+    write_machine_judgment_logと同じ設計(呼び出し側は収集済み全履歴分をまとめて渡す想定、
+    PRIMARY KEY (ホール名, 日付, 機種名)へのINSERT OR IGNOREで重複を行単位に吸収)。
+    """
+    if judgment_df.empty:
+        return 0
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_MACHINE_JUDGMENT_FISHER_LOG_SQL)
+        before = con.execute('SELECT COUNT(*) FROM machine_judgment_fisher_log').fetchone()[0]
+
+        now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        rows = [
+            (
+                now, r['ホール名'], str(r['日付']), r['機種名'],
+                int(r['台数']) if pd.notna(r['台数']) else None,
+                int(r['hot台数']) if pd.notna(r['hot台数']) else None,
+                None if pd.isna(r['p値']) else float(r['p値']),
+                None if pd.isna(r['投入率']) else float(r['投入率']),
+                r['判定ラベル'],
+            )
+            for _, r in judgment_df.iterrows()
+        ]
+        con.executemany(
+            '''
+            INSERT OR IGNORE INTO machine_judgment_fisher_log
+                (実行日時, ホール名, 日付, 機種名, 台数, hot台数, p値, 投入率, 判定ラベル)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
+        con.commit()
+
+        after = con.execute('SELECT COUNT(*) FROM machine_judgment_fisher_log').fetchone()[0]
         return after - before
     finally:
         con.close()

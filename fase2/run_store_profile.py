@@ -349,6 +349,22 @@ def _run_zentaikei_judgment(
     return sc.write_machine_judgment_log(analysis_db, judgment_df)
 
 
+def _run_zentaikei_judgment_fisher(
+    scored: 'pd.DataFrame',
+    hole_name: str,
+    analysis_db: str,
+) -> int:
+    """
+    [今後の実装予定.md 1.8.1節・2026-07-14実装] 機種×日の全台系/高配分判定の
+    Fisher直接確率検定版(patterns.score_zentaikei_judgment_fisher)を
+    machine_judgment_fisher_logへ並走記録する。n=2〜4の少台数機種で現行z検定より
+    検出力が高いことを実データ(東中野等4店舗)で確認済み。0節の検証ゲートに従い
+    並走記録専用(合成スコア・表示には使わない。既存のmachine_judgment_logは無変更)。
+    """
+    judgment_df = pt.score_zentaikei_judgment_fisher(scored)
+    return sc.write_machine_judgment_fisher_log(analysis_db, judgment_df)
+
+
 def _run_group_calendar_conditions(
     scored: 'pd.DataFrame',
     hole_name: str,
@@ -911,6 +927,8 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
     # [2026-07-09設計合意] 機種×日の全台系/高配分判定をmachine_judgment_logへ記録
     # (上限キャリブレーション補正後のhigh_probを使うため、write_stage3_scoresと同じ位置)
     n_judgment = _run_zentaikei_judgment(scored, hole_name, analysis_db)
+    # [1.8.1節・2026-07-14実装] 同判定のFisher直接確率検定版(少台数機種向け)を並走記録
+    n_judgment_fisher = _run_zentaikei_judgment_fisher(scored, hole_name, analysis_db)
 
     # [今後の実装予定.md 1.8節「末尾版」フェーズ2] 台番号末尾グループのカレンダー構造検定を保存
     group_calendar_result = _run_group_calendar_conditions(scored, hole_name, analysis_db)
@@ -1001,7 +1019,7 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         f'({len(synthesized):,}行、上限キャリブレーション発動'
         f'{uplimit_result["発動日数"]}/{uplimit_result["対象日数"]}日、'
         f'遷移予測{n_transition}台(前日差枚条件付き{n_transition_strat}台)、'
-        f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件、'
+        f'据え置き予測{n_sueki}台、機種判定ログ新規{n_judgment}件(Fisher版{n_judgment_fisher}件)、'
         f'末尾版有意{n_group_calendar}件・予測{n_tail_pred}台、'
         f'店舗日有意{n_store_day_sig}件・予測{n_store_day_pred}台、'
         f'機種版有意{n_machine_calendar}件・予測{n_machine_pred}台'
