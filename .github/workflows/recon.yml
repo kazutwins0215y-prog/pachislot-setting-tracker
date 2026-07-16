@@ -26,7 +26,7 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          py -3.12 fase1/recover_variety_gaps.py --recon
+          python3 fase1/recover_variety_gaps.py --recon
 
       - name: 実行完了
         run: echo "偵察完了。上のログを確認してください"
