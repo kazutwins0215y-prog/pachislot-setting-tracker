@@ -7,3 +7,4 @@ python-dotenv
 libsql
 seleniumbase
 beautifulsoup4
+truststore
