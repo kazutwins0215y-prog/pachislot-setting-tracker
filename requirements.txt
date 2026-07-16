@@ -5,3 +5,5 @@ scipy
 plotly
 python-dotenv
 libsql
+seleniumbase
+beautifulsoup4

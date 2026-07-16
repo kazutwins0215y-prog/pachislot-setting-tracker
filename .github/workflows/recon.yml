@@ -1,0 +1,32 @@
+name: バラエティ欠損偵察
+
+on:
+  workflow_dispatch:  # スマホから手動実行可能
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.12 セットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: 依存関係インストール
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: バラエティ欠損偵察実行
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          py -3.12 fase1/recover_variety_gaps.py --recon
+
+      - name: 実行完了
+        run: echo "偵察完了。上のログを確認してください"

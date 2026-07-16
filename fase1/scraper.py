@@ -1,8 +1,7 @@
 import truststore
 truststore.inject_into_ssl()  # certifiではなくWindows証明書ストアを使う(Norton等のHTTPSスキャンによる証明書差し替え対策)
 
-import requests
-import urllib3
+from seleniumbase import SB
 from bs4 import BeautifulSoup
 import time
 import re
@@ -25,27 +24,36 @@ def extract_slug(store_url: str) -> str:
     return last.removesuffix('-データ一覧')
 
 
-def create_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/125.0.0.0 Safari/537.36'
-        ),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Referer': 'https://ana-slo.com/',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'Connection': 'keep-alive',
-    })
-    return session
+class SeleniumBaseDriver:
+    """SeleniumBase context manager wrapper"""
+    def __init__(self):
+        self.driver = None
+        self.context = None
+
+    def start(self):
+        self.context = SB(
+            uc=True,  # undetected-chromedriver モード（Cloudflare回避）
+            headless=True,
+        )
+        self.driver = self.context.__enter__()
+        return self
+
+    def quit(self):
+        if self.context:
+            self.context.__exit__(None, None, None)
+
+    def get(self, url, timeout=None):
+        return self.driver.get(url)
+
+    def get_page_source(self):
+        return self.driver.get_page_source()
+
+
+def create_driver() -> SeleniumBaseDriver:
+    """SeleniumBase ドライバーラッパーを作成（自動で start() を呼ぶ）"""
+    driver = SeleniumBaseDriver()
+    driver.start()
+    return driver
 
 
 def build_url(slug: str, date: str) -> str:
@@ -53,30 +61,21 @@ def build_url(slug: str, date: str) -> str:
     return f"https://ana-slo.com/{date}-{encoded}-data/"
 
 
-def fetch_page(session: requests.Session, url: str) -> requests.Response:
+def fetch_page(driver, url: str) -> str:
+    """SeleniumBase でページを取得（HTMLテキストを返す）"""
     for attempt in range(MAX_RETRIES):
         try:
-            try:
-                response = session.get(url, timeout=30)
-            except requests.exceptions.SSLError:
-                # SSL検証失敗時のフォールバック。raise_for_statusは下の共通経路で
-                # 実行する(ここで呼ぶと403→AccessForbiddenError変換を素通りするため)
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                response = session.get(url, verify=False, timeout=30)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else 0
-            if status == 403:
+            driver.get(url, timeout=30)
+            # ステータスチェック（if possible）
+            html = driver.get_page_source()
+            if '403 Forbidden' in html or 'Error 403' in html:
+                raise AccessForbiddenError(f'アクセス拒否 (403): {url}')
+            return html
+        except Exception as e:
+            error_msg = str(e).lower()
+            if '403' in error_msg or 'forbidden' in error_msg:
                 raise AccessForbiddenError(f'アクセス拒否 (403): {url}') from e
-            if status in (429, 503, 504) and attempt < MAX_RETRIES - 1:
-                wait = RETRY_BASE_WAIT * (2 ** attempt)
-                logger.warning(f'HTTP {status}。{wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES})')
-                time.sleep(wait)
-            else:
-                raise
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt < MAX_RETRIES - 1:
+            if ('timeout' in error_msg or 'connection' in error_msg) and attempt < MAX_RETRIES - 1:
                 wait = RETRY_BASE_WAIT * (2 ** attempt)
                 logger.warning(f'接続エラー。{wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES}): {e}')
                 time.sleep(wait)
@@ -85,9 +84,8 @@ def fetch_page(session: requests.Session, url: str) -> requests.Response:
     raise RuntimeError(f'{url} のリクエストに {MAX_RETRIES} 回失敗しました')
 
 
-def get_info(session: requests.Session, url: str, hole_date: str):
-    response = fetch_page(session, url)
-    soup = BeautifulSoup(response.text, 'html.parser')
+def get_info(html: str, url: str, hole_date: str):
+    soup = BeautifulSoup(html, 'html.parser')
 
     data_list = []
     data_column_list = []

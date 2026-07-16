@@ -26,7 +26,7 @@ import logging
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from scraper import build_url, get_info, create_session, AccessForbiddenError
+from scraper import build_url, get_info, create_driver, fetch_page, AccessForbiddenError
 from db import get_connection, sync_replica, _parse_row
 from メイン import load_stores, TARGET_CYCLE, MIN_SLEEP, BATCH_SIZE, BATCH_BREAK
 
@@ -47,9 +47,10 @@ def build_rows(data_list, cols, row_counts, hole_name):
     return rows
 
 
-def fetch_rows(session, hole_name: str, day: str):
+def fetch_rows(driver, hole_name: str, day: str):
     url = build_url(hole_name, day)
-    data_list, cols, row_counts, missing = get_info(session, url, day)
+    html = fetch_page(driver, url)
+    data_list, cols, row_counts, missing = get_info(html, url, day)
     return build_rows(data_list, cols, row_counts, hole_name), missing
 
 
@@ -65,7 +66,7 @@ def db_keys(con, hole_name: str, day: str) -> set:
 def recon(con):
     """各店舗の最新収集日ページを再取得し、DBに無い行を報告する。書き込みはしない。"""
     stores = load_stores()
-    session = create_session()
+    driver = create_driver()
     report = []
     try:
         for i, hole in enumerate(stores):
@@ -77,7 +78,7 @@ def recon(con):
                 report.append((hole, None, 'DBにデータなし'))
                 continue
             try:
-                rows, missing = fetch_rows(session, hole, latest)
+                rows, missing = fetch_rows(driver, hole, latest)
             except AccessForbiddenError as e:
                 logger.error(f'403検知のため偵察を中止します: {e}')
                 break
@@ -88,7 +89,7 @@ def recon(con):
             if i < len(stores) - 1:
                 time.sleep(max(MIN_SLEEP, TARGET_CYCLE - (time.monotonic() - t_start)))
     finally:
-        session.close()
+        driver.quit()
 
     logger.info('===== 偵察結果まとめ =====')
     for hole, latest, lacking in report:
@@ -106,13 +107,13 @@ def recover(con, hole: str, start: str, end: str):
         d += timedelta(days=1)
 
     logger.info(f'{hole}: {len(days)}日分を復元します ({start}〜{end})')
-    session = create_session()
+    driver = create_driver()
     total = 0
     try:
         for i, day in enumerate(days):
             t_start = time.monotonic()
             try:
-                rows, missing = fetch_rows(session, hole, day)
+                rows, missing = fetch_rows(driver, hole, day)
                 if not rows:
                     logger.warning(f'{day}: データなし(missing={missing})')
                 else:
@@ -141,13 +142,13 @@ def recover(con, hole: str, start: str, end: str):
             if i < len(days) - 1:
                 if (i + 1) % BATCH_SIZE == 0:
                     logger.info(f'{i + 1}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
-                    session.close()
+                    driver.quit()
                     time.sleep(BATCH_BREAK)
-                    session = create_session()
+                    driver = create_driver()
                 else:
                     time.sleep(max(MIN_SLEEP, TARGET_CYCLE - (time.monotonic() - t_start)))
     finally:
-        session.close()
+        driver.quit()
     logger.info(f'復元完了: 追加合計{total}行')
 
 

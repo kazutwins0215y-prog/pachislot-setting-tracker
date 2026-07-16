@@ -7,7 +7,7 @@ import logging
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from scraper import build_url, get_info, create_session, AccessForbiddenError
+from scraper import build_url, get_info, create_driver, fetch_page, AccessForbiddenError
 from db import (
     get_connection, setup_db, get_processed_dates,
     write_db, write_missing, write_null_record, sync_replica,
@@ -77,12 +77,12 @@ def process_store(con, hole_name: str):
 
     logger.info(f'{hole_name}: {len(remaining)} 日分を取得します')
 
-    session = create_session()
+    driver = create_driver()
     try:
         for i, day in enumerate(remaining):
             t_start = time.monotonic()
             try:
-                _fetch_and_write(con, session, hole_name, day)
+                _fetch_and_write(con, driver, hole_name, day)
             except AccessForbiddenError:
                 # 403はIP単位のブロックのため、この店舗だけでなく全店舗の処理を中止する
                 # (残り店舗への無駄なリクエストで被ブロック実績を積まない)
@@ -95,7 +95,7 @@ def process_store(con, hole_name: str):
                     con.close()
                     con = get_connection()
                     try:
-                        _fetch_and_write(con, session, hole_name, day)
+                        _fetch_and_write(con, driver, hole_name, day)
                     except Exception as e2:
                         logger.error(f'{hole_name}: {day} の再試行にも失敗: {e2}')
                         try:
@@ -114,23 +114,23 @@ def process_store(con, hole_name: str):
             if i < len(remaining) - 1:
                 if (i + 1) == LONG_BREAK_AT:
                     logger.info(f'{i + 1}件完了。試験的に{LONG_BREAK_SECONDS}秒の長め休憩に入ります')
-                    session.close()
+                    driver.quit()
                     time.sleep(LONG_BREAK_SECONDS)
-                    session = create_session()
-                    logger.info('セッションを再生成しました')
+                    driver = create_driver()
+                    logger.info('ドライバーを再生成しました')
                 elif (i + 1) % BATCH_SIZE == 0:
                     logger.info(f'{i + 1}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
-                    session.close()
+                    driver.quit()
                     time.sleep(BATCH_BREAK)
-                    session = create_session()
-                    logger.info('セッションを再生成しました')
+                    driver = create_driver()
+                    logger.info('ドライバーを再生成しました')
                 else:
                     elapsed = time.monotonic() - t_start
                     sleep_time = max(MIN_SLEEP, TARGET_CYCLE - elapsed)
                     logger.debug(f'経過 {elapsed:.1f}秒 → {sleep_time:.1f}秒待機')
                     time.sleep(sleep_time)
     finally:
-        session.close()
+        driver.quit()
 
     return con
 
@@ -141,9 +141,10 @@ def _is_stream_error(e: Exception) -> bool:
     return 'stream not found' in str(e)
 
 
-def _fetch_and_write(con, session, hole_name: str, day: str):
+def _fetch_and_write(con, driver, hole_name: str, day: str):
     url = build_url(hole_name, day)
-    data_list, data_column_list, data_row_list, missing_machines = get_info(session, url, day)
+    html = fetch_page(driver, url)
+    data_list, data_column_list, data_row_list, missing_machines = get_info(html, url, day)
     if data_list:
         write_db(con, data_list, data_column_list, data_row_list, hole_name, day)
     for machine_name, reason in missing_machines:
