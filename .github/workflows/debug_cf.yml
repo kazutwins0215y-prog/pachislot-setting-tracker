@@ -34,9 +34,11 @@ jobs:
           URL = f"https://ana-slo.com/2026-07-11-{quote('yasuda7', safe='')}-data/"
 
           def report(label, html):
-              title = re.search(r'<title[^>]*>(.*?)</title>', html, re.S)
-              print(f"[{label}] len={len(html)} title={title.group(1).strip() if title else 'なし'}")
-              print(f"[{label}] sectionあり={'id=\"section' in html or \"id='section\" in html}")
+              m = re.search(r'<title[^>]*>(.*?)</title>', html, re.S)
+              title = m.group(1).strip() if m else 'なし'
+              has_section = ('id="section' in html) or ("id='section" in html)
+              print(f"[{label}] len={len(html)} title={title}")
+              print(f"[{label}] sectionあり={has_section}")
               print(f"[{label}] 先頭300字: {html[:300]!r}")
 
           # 案1: 現行実装と同じ headless + 即取得
