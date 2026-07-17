@@ -5,5 +5,13 @@ __pycache__/
 venv/
 .env
 
+# SeleniumBase (UC Mode) が実行時に作る作業ディレクトリ
+downloaded_files/
+
+# SQLite系ファイルの誤コミット防止（主要DBはホールデータ/配下だが保険として全体で除外）
+*.db
+*.db-wal
+*.db-shm
+
 # ローカルSQLite（Turso移行後は不要。移行前の生データはローカルに残す）
 ホールデータ/
