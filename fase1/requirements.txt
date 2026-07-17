@@ -1,4 +1,4 @@
-requests
+seleniumbase
 beautifulsoup4
 libsql
 python-dotenv

@@ -13,6 +13,12 @@
   復元: 指定店舗×日付範囲を再取得し、欠けている行だけINSERT OR IGNOREで追記する
     py -3.12 fase1/recover_variety_gaps.py --hole bigディッパー東中野店 --start 2025-12-22 --end 2026-05-10
 
+  復元(範囲自動): --start/--end省略時はDBのその店舗のMIN(日付)〜MAX(日付)を対象にする
+    py -3.12 fase1/recover_variety_gaps.py --hole yasuda7
+
+  GitHub Actionsから: .github/workflows/recover.yml が上記コマンドを実行する
+  （iPhoneのGitHubアプリ/ブラウザから店舗を選んで手動トリガー可能）
+
 - 冪等: 既存行はUNIQUE(日付,ホール名,機種名,台番号)で無視されるため、中断後の再実行は安全
 - 403検知時は即中止する。時間を置いて同じコマンドを再実行すれば続きから埋まる
 - アクセス間隔はメイン.pyと同じ(40秒サイクル・20件ごとに5分休憩)
@@ -97,6 +103,19 @@ def recon(con):
     logger.info('欠損があった店舗は --hole/--start/--end で復元を実行してください')
 
 
+def resolve_range(con, hole: str, start: str | None, end: str | None) -> tuple[str, str]:
+    """--start/--end省略時にDBのMIN(日付)/MAX(日付)で補完する。"""
+    if start and end:
+        return start, end
+    cur = con.cursor()
+    cur.execute('SELECT MIN(日付), MAX(日付) FROM slot_data WHERE ホール名=?', (hole,))
+    db_min, db_max = cur.fetchone()
+    if not db_min:
+        logger.error(f'{hole}: DBにデータがありません（店舗名の間違い、または未収集店舗）')
+        sys.exit(1)
+    return start or db_min, end or db_max
+
+
 def recover(con, hole: str, start: str, end: str):
     """指定範囲の全日を再取得し、DBに無い行をINSERT OR IGNOREで追記する。"""
     days = []
@@ -156,19 +175,20 @@ def main():
     parser = argparse.ArgumentParser(description='バラエティ最終行欠損の偵察・復元')
     parser.add_argument('--recon', action='store_true', help='全店舗の最新日を再取得し欠損を報告(書き込みなし)')
     parser.add_argument('--hole', help='復元対象の店舗名(stores.jsonのスラッグ)')
-    parser.add_argument('--start', help='復元開始日 YYYY-MM-DD')
-    parser.add_argument('--end', help='復元終了日 YYYY-MM-DD')
+    parser.add_argument('--start', help='復元開始日 YYYY-MM-DD (省略時はDBのMIN(日付))')
+    parser.add_argument('--end', help='復元終了日 YYYY-MM-DD (省略時はDBのMAX(日付))')
     args = parser.parse_args()
 
-    if not args.recon and not (args.hole and args.start and args.end):
-        parser.error('--recon か、--hole/--start/--end の3点セットを指定してください')
+    if not args.recon and not args.hole:
+        parser.error('--recon か --hole を指定してください(--start/--end は省略可)')
 
     con = get_connection()
     try:
         if args.recon:
             recon(con)
         else:
-            recover(con, args.hole, args.start, args.end)
+            start, end = resolve_range(con, args.hole, args.start, args.end)
+            recover(con, args.hole, start, end)
         sync_replica(con)
     finally:
         con.close()

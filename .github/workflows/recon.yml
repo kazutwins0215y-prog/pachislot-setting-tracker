@@ -3,6 +3,10 @@ name: バラエティ欠損偵察
 on:
   workflow_dispatch:  # スマホから手動実行可能
 
+# サイト負荷配慮: スクレイピング系ワークフローは同時に1つしか走らせない
+concurrency:
+  group: ana-slo-scraping
+
 jobs:
   recon:
     runs-on: ubuntu-latest

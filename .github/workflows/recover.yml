@@ -1,0 +1,70 @@
+name: バラエティ欠損復元
+
+# バラエティ最終行の取り捨てバグ(2026-07-14修正)の過去分復元をクラウドで実行する。
+# iPhoneのGitHubアプリ/ブラウザ → Actions → このワークフロー → Run workflow で
+# 店舗を選んで実行する。日付を空欄にするとDBの収集開始日〜最新日が自動で対象になる。
+# 403で中断しても冪等(INSERT OR IGNORE)なので、同じ入力で再実行すれば続きから埋まる。
+
+on:
+  workflow_dispatch:
+    inputs:
+      hole:
+        description: '復元する店舗'
+        required: true
+        type: choice
+        options:
+          - bigディッパー東中野店
+          - yasuda7
+          - エスパス日拓新宿歌舞伎町店
+          - パーラースーパーセブン新高円寺店
+          - マルハン新宿東宝ビル店
+          - グランパ中野
+          - 楽園池袋店グリーンサイド
+          - 飯田橋プレサス
+          - 新橋uno
+          - 三ノ輪uno
+          - 有楽町uno
+          - bigディッパー戸越銀座店
+      start:
+        description: '開始日 YYYY-MM-DD (空欄=DBの収集開始日)'
+        required: false
+        default: ''
+      end:
+        description: '終了日 YYYY-MM-DD (空欄=DBの最新日)'
+        required: false
+        default: ''
+
+# サイト負荷配慮: スクレイピング系ワークフローは同時に1つしか走らせない
+concurrency:
+  group: ana-slo-scraping
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 約195日分(約3時間)+余裕。超過時は再実行で続きから
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.12 セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 依存関係インストール
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 復元実行
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          ARGS=(--hole "${{ inputs.hole }}")
+          if [ -n "${{ inputs.start }}" ]; then ARGS+=(--start "${{ inputs.start }}"); fi
+          if [ -n "${{ inputs.end }}" ]; then ARGS+=(--end "${{ inputs.end }}"); fi
+          python3 fase1/recover_variety_gaps.py "${ARGS[@]}"
+
+      - name: 実行完了
+        run: echo "復元完了。上のログの『復元完了 追加合計N行』を確認してください"

@@ -39,7 +39,9 @@ metadata:
 - **手動偵察**: `py -3.12 fase1/recover_variety_gaps.py --recon`（バラエティ欠損確認、スマホから GitHub Actions トリガー可能）
 
 収集を伴わずレプリカだけ最新化したい場合は `py -3.12 fase1/sync_replica.py`。
-リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）
+リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker
+（**公開**。2026-07-17にActions無料枠を無制限にするためpublic化。公開前にコミット履歴の
+メールアドレスをnoreplyへ書き換え、トークン・DBファイル非含有を履歴含めて確認済み）
 
 ---
 
@@ -399,19 +401,36 @@ py -3.12 fase1/recover_variety_gaps.py --recon
 
 # 復元: 店舗×日付範囲を再取得し、欠けている行だけをINSERT OR IGNOREで追記
 py -3.12 fase1/recover_variety_gaps.py --hole bigディッパー東中野店 --start 2025-12-22 --end 2026-05-10
+
+# 復元(範囲自動): --start/--end省略時はDBのその店舗のMIN(日付)〜MAX(日付)が対象
+py -3.12 fase1/recover_variety_gaps.py --hole yasuda7
 ```
 
-- 冪等（既存行はUNIQUE制約で無視）。403で中断しても同じコマンドで再開できる
-- アクセス間隔はメイン.pyと同じ（40秒サイクル・20件ごと5分休憩）。約90日分で1〜2時間
+**クラウド実行（2026-07-17追加・推奨）**: GitHub Actionsの
+[`recover.yml`](../.github/workflows/recover.yml)がiPhoneのGitHubアプリ/ブラウザから
+手動トリガーできる（Actions → 「バラエティ欠損復元」→ Run workflow → 店舗を選択。
+日付欄は空欄=全期間自動）。偵察は[`recon.yml`](../.github/workflows/recon.yml)。
+SeleniumBase (UC Mode)によりActionsのIPでもCloudflareを通過できる（2026-07-16確認済み）。
+
+- 冪等（既存行はUNIQUE制約で無視）。403で中断しても同じコマンド/同じ入力の再実行で再開できる
+- アクセス間隔はメイン.pyと同じ（40秒サイクル・20件ごと5分休憩）。約90日分で1〜2時間、
+  約195日分で約3時間（`recover.yml`のtimeoutは360分）
 - 復元後は`fase2/run_store_profile.py`（全店舗）で分析成果物の再生成が必要
 
-### 復元状況（2026-07-14時点）
+### 復元状況（2026-07-17時点）
+
+2026-07-16〜17のクラウド偵察（`recon.yml`、403なし）で**東中野以外の全10店舗に現在も
+バラエティ1台の欠損があること**を確認済み（yasuda7=ゾンビランドサガ(322)、
+エスパス=頭文字D 2nd(1410)、新高円寺=ヱヴァ約束の扉(552)、マルハン=ゾンビランドサガ(698)、
+グランパ中野=スマスロサンダーV(311)、楽園池袋=いざ番長(5115)、プレサス=戦国コレクション6(367)、
+新橋uno=ヱヴァ約束の扉(582)、三ノ輪uno=ダークハイビ(620)、有楽町uno=クランキークレスト(530)）。
 
 | 対象 | 期間 | 状態 |
 |---|---|---|
-| 東中野 不二子BT(220) | 2026-05-11〜07-11 | 復元済み（62日分+他店単日4ページをセッション内スクリプトで実行） |
-| 東中野 虚構推理(219)ほか | 収集開始〜2026-05-10 | **未復元**（`--recon`→`--hole`で実行する） |
-| 他10店舗 | 全期間 | **未調査**（まず`--recon`で現在の欠損台を確認してから範囲を決める） |
+| 東中野 不二子BT(220) | 2026-05-11〜07-11 | 復元済み（2026-07-14、62日分+他店単日4ページ） |
+| 東中野 虚構推理(219)ほか | 収集開始2025-12-19〜2026-05-10 | **未復元**（`recover.yml`で`--start 2025-12-19 --end 2026-05-10`を指定） |
+| 他10店舗 | 全期間（各約192〜198日） | **未復元**（`recover.yml`で店舗を選び日付欄空欄=全期間。1店舗ずつ実行） |
+| bigディッパー戸越銀座店 | — | DBにデータなし（新規店舗・バックフィル未実施のため復元対象外） |
 
 ---
 
@@ -429,7 +448,7 @@ py -3.12 fase1/recover_variety_gaps.py --hole bigディッパー東中野店 --s
 | fase2との連携 | 店舗別SQLiteファイルをfase2が直接読む | **Turso埋め込みレプリカ**（`ホールデータ/turso_replica.db`、2026-07追加）。Turso移行後「fase1はTursoに書くがfase2はローカルの旧DBしか読まない」断絶が生じていたため、`get_connection()`をリモート直接続から埋め込みレプリカ接続に変更。fase2はこのレプリカファイルをsqlite3で読み取り専用参照する（旧店舗別DBはアーカイブ扱い） |
 
 - Turso無料枠はストレージ5GB。店舗数・蓄積データ増加により将来逼迫する可能性があるため、運用しながら使用量を監視し、必要に応じて有料プラン（Developer: $4.99〜/月、9GBストレージ）への移行を検討する
-- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み（現在は`workflow_dispatch`の手動検証用途のみで使用）。ローカルPC手動実行時はリポジトリルートの`.env`ファイル（`.gitignore`済み・`python-dotenv`で読み込み）に同じ2つの値を設定する
+- GitHubリポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （公開。2026-07-17public化）。`TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`はリポジトリのActions Secretsに登録済み（`scrape.yml`/`recon.yml`/`recover.yml`の3ワークフローが使用。3つとも`concurrency: ana-slo-scraping`で同時実行1本に制限）。ローカルPC手動実行時はリポジトリルートの`.env`ファイル（`.gitignore`済み・`python-dotenv`で読み込み）に同じ2つの値を設定する
 - ローカル実行にはPython 3.12を使用（3.14では`libsql`のビルドに失敗するため。詳細は「db.py」節参照）
 - 詳細な移行方針は[`要件定義.md`](../要件定義.md)「3. 配信・公開」参照
 
@@ -439,9 +458,9 @@ py -3.12 fase1/recover_variety_gaps.py --hole bigディッパー東中野店 --s
 
 - 要件定義 → `要件定義.md`
 - 構成図 → `fase1/データ収集_構成図.md`
-- 依存パッケージ → `fase1/requirements.txt`（requests / beautifulsoup4 / libsql / python-dotenv / truststore）
+- 依存パッケージ → `fase1/requirements.txt`（seleniumbase / beautifulsoup4 / libsql / python-dotenv / truststore。2026-07-17にrequests→seleniumbaseへ差し替え）
 - 対象店舗一覧 → `fase1/stores.json`
-- GitHub Actions定義 → `.github/workflows/scrape.yml`
+- GitHub Actions定義 → `.github/workflows/scrape.yml`（日次収集・手動のみ）/ `recon.yml`（バラエティ欠損偵察）/ `recover.yml`（バラエティ欠損復元）
 - 移行用ワンショットスクリプト → `fase1/merge_stores_for_turso.py`（既存ローカルSQLiteをTurso Upload DB用に統合。恒久パイプラインには含まれない）
 - 欠損復元スクリプト → `fase1/recover_variety_gaps.py`（バラエティ最終行バグの偵察・復元。恒久パイプラインには含まれない）
 
