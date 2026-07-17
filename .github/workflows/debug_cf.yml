@@ -21,6 +21,26 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: HTTPステータス・ヘッダー確認 (curl)
+        run: |
+          URL="https://ana-slo.com/2026-07-11-yasuda7-data/"
+          echo "=== 素のcurl ==="
+          curl -sS -o /tmp/body1.txt -D /tmp/head1.txt -w 'status=%{http_code} size=%{size_download}\n' "$URL" || true
+          cat /tmp/head1.txt
+          head -c 300 /tmp/body1.txt; echo
+          echo "=== ブラウザUA付きcurl ==="
+          curl -sS -o /tmp/body2.txt -D /tmp/head2.txt -w 'status=%{http_code} size=%{size_download}\n' \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -H 'Accept: text/html,application/xhtml+xml' -H 'Accept-Language: ja,en;q=0.9' "$URL" || true
+          cat /tmp/head2.txt
+          head -c 300 /tmp/body2.txt; echo
+          echo "=== トップページ(比較用) ==="
+          curl -sS -o /tmp/body3.txt -D /tmp/head3.txt -w 'status=%{http_code} size=%{size_download}\n' \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            "https://ana-slo.com/" || true
+          cat /tmp/head3.txt
+          head -c 300 /tmp/body3.txt; echo
+
       - name: 依存関係インストール
         run: pip install seleniumbase beautifulsoup4
 
