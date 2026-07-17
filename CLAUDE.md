@@ -12,7 +12,7 @@
 | 3. 配信・公開 | [`fase3/`](fase3/) | Stage A/B完了・デプロイ済み(2026-07-07) | 分析用Turso(`pachislot-analysis`)へ差分upsert（`upload_analysis.py`）し、Streamlit Community Cloudで公開。詳細→[`fase3/配信公開_skill.md`](fase3/配信公開_skill.md) |
 | 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み・タスクスケジューラ登録済み | `run_daily.py`が朝6:30ポーリング＋10:30追い実行で「fase1収集→評価→分析→アップロード」を直列実行。詳細→[`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md) |
 
-> ※ fase1はTurso**埋め込みレプリカ方式**（書き込みはTursoへ、fase2はローカルレプリカ`ホールデータ/turso_replica.db`を読む）。2026-07-16のSeleniumBase (UC Mode)移行でCloudflareの403を回避できるようになり、GitHub Actionsでのクラウド実行が可能（偵察`recon.yml`・復元`recover.yml`はiPhoneから手動トリガー可、日次`schedule`の再開は検討中。当面はfase4のタスクスケジューラがPC上で毎日実行）。SSL検証は`truststore`必須（NortonのHTTPSスキャン対策）。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （**公開**。2026-07-17にActions無料枠のためpublic化・コミット履歴のメールはnoreplyへ書き換え済み）。経緯・詳細→[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)
+> ※ fase1はTurso**埋め込みレプリカ方式**（書き込みはTursoへ、fase2はローカルレプリカ`ホールデータ/turso_replica.db`を読む）。GitHub Actionsでのクラウド実行はana-slo.com(Cloudflare)がActionsのデータセンターIPを空ボディ403でブロックするため不可（2026-07-16にSeleniumBase (UC Mode)で回避を試みたが2026-07-17にIP/ASレベルのブロックと確定・断念）。**fase4のタスクスケジューラがPC上（住宅IP）で毎日実行する運用**。SSL検証は`truststore`必須（NortonのHTTPSスキャン対策）。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （**公開**。2026-07-17にコミット履歴のメールをnoreplyへ書き換え・シークレット非含有を確認のうえpublic化。クラウド実行はしないが公開設定は将来のために維持）。経緯・詳細→[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)
 
 ### fase2 ファイル構成
 
