@@ -13,7 +13,12 @@ metadata:
 
 ## システム概要
 
-`ana-slo.com` からパチスロホールの台データをスクレイピングし、クラウドDB「Turso」（libSQL/SQLite互換）に保存する。ana-slo.com（Cloudflare）がGitHub Actionsのデータセンター系IPを即403ブロックするため、GitHub Actionsでの自動実行（`schedule`）は停止中。代わりに2026-07に[`fase4/`](../fase4/)（タスクスケジューラ+`run_daily.py`）を実装し、自宅PC（住宅用IP）上で`py -3.12 メイン.py`を毎日自動実行する運用に移行済み（詳細は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照）。単体での手動実行も引き続き可能。
+`ana-slo.com` からパチスロホールの台データをスクレイピングし、クラウドDB「Turso」（libSQL/SQLite互換）に保存する。2026-07-16に**SeleniumBase (UC Mode)** 導入により、Cloudflare を UC（undetected-chromedriver）モードでバイパス。これにより：
+- ✅ GitHub Actions での自動実行（`schedule`）が再開可能
+- ✅ クラウド上（Ubuntu）での実行をサポート
+- ✅ 従来の PC（`py -3.12 メイン.py`）での手動実行も継続可能
+
+運用方針は現在検討中（様子見）。詳細は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照。
 
 ```
 メイン.py（エントリーポイント）
@@ -28,7 +33,11 @@ metadata:
               fase2（分析・可視化）はTursoへ直接接続せずこのファイルを読む
 ```
 
-実行環境: ローカルPC（`py -3.12 メイン.py`。Python 3.14では`libsql`がビルド不可のため3.12必須）。GitHub Actions（`.github/workflows/scrape.yml`）は`workflow_dispatch`（手動トリガー）のみ残置。
+実行環境:
+- **ローカルPC**: `py -3.12 メイン.py`（Python 3.12必須。3.14は`libsql`ビルド不可）
+- **GitHub Actions**: `.github/workflows/scrape.yml`（`schedule`で自動実行可能、SeleniumBase + UC Mode）
+- **手動偵察**: `py -3.12 fase1/recover_variety_gaps.py --recon`（バラエティ欠損確認、スマホから GitHub Actions トリガー可能）
+
 収集を伴わずレプリカだけ最新化したい場合は `py -3.12 fase1/sync_replica.py`。
 リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （非公開）
 
@@ -42,7 +51,7 @@ metadata:
 | ② DB初期化 | テーブル作成（`IF NOT EXISTS`、Turso上に無ければ作成） | `db.setup_db` |
 | ③ 日付範囲の自動算出 | 店舗ごとに取得済み最終日を調べ、翌日〜`COLLECT_UNTIL_DAYS_AGO`(1日前=前日)を対象に。加えて直近`RETRY_LOOKBACK_DAYS`(14日)内の未処理日（取得失敗によるギャップ）も再試行対象に含める（新規店舗は`INITIAL_BACKFILL_DAYS`＝90日分バックフィル） | `メイン.py.compute_remaining_days` + `db.get_processed_dates` |
 | ④ URL構築 | `https://ana-slo.com/{日付}-{slug}-data/` | `scraper.build_url` |
-| ⑤ HTTP取得 | リトライ3回・指数バックオフ・SSL対応 | `scraper.fetch_page` |
+| ⑤ Webドライバー取得 | SeleniumBase (UC Mode) でページ取得。Cloudflare 回避・リトライ3回・指数バックオフ対応 | `scraper.fetch_page` |
 | ⑥ HTML解析 | section単位でカラム数自動検出・台データ抽出 | `scraper.get_info` |
 | ⑦ データ保存 | 正常データ → `slot_data`、欠損 → `missing_data`（Turso DBへ） | `db.write_db` / `write_missing` / `write_null_record` |
 | ⑧ レート制御 | 通常10〜40秒待機、20件ごとに5分休憩 | `メイン.py` |
@@ -62,42 +71,37 @@ metadata:
 - URLパスの末尾セグメントから `-データ一覧` を除去してスラッグを返す
 - `unquote` でパーセントエンコードを解除してから処理
 
-### `create_session()`
-- Cloudflare回避用のChrome偽装ヘッダーを設定したセッションを返す
-- `Accept-Encoding` は `gzip, deflate` **のみ**。`br`（brotli）は含めない
-  - `requests` はbrotli未対応のため、`br` を含めるとレスポンスが文字化けする
-- `create_session()` は `scraper.py` からインポートして使う。`メイン.py` 内でヘッダーを直接設定しない
+### Cloudflare 対策と SeleniumBase (UC Mode)（2026-07-16追加）
+
+2026-07-16に **requests から SeleniumBase へ移行**。理由：
+- GitHub Actions のAWS DCプール IP が Cloudflare に IP 単位でブロックされていた
+- SeleniumBase の UC (undetected-chromedriver) モードは Cloudflare の検知を回避
+- ローカル PC でも GitHub Actions でも同じコードで動作
+
+#### `create_driver()`
+- **SeleniumBaseDriver ラッパークラス**を返す（context manager ベース）
+- `uc=True` で UC モード（Cloudflare 回避）、`headless=True` でヘッドレス実行
+- `start()` / `quit()` で自動的にブラウザの起動・終了を管理
+
+#### SSL証明書検証と truststore（2026-07-14追加、2026-07-16継続）
+
+`scraper.py` 冒頭で `truststore.inject_into_ssl()` を実行。
+- Windows PC の Norton Antivirus がHTTPSスキャン用に証明書を差し替えているため、truststore で OS 証明書ストア を使用
+- GitHub Actions (Linux) でも OS のストアを参照するため、環境依存性なし
+- requirements.txt に `truststore` を追加
+
+#### `fetch_page(driver, url)`
+- SeleniumBase ドライバーでページ取得（HTML テキストを返す）
+- MAX_RETRIES=3、指数バックオフ（RETRY_BASE_WAIT=60秒）でリトライ
+- **403 は `AccessForbiddenError` を送出**（リトライしない）
 
 ### `build_url(slug, date)`
 - スラッグを `quote(safe='')` でエンコードしてURLを生成
 - `.lower()` は**使わない**（hexが小文字になり実サイトのURL形式と不一致になるため）
 
-### SSL証明書検証とtruststore（2026-07-14追加）
-
-`scraper.py`冒頭で`truststore.inject_into_ssl()`を実行し、Pythonの証明書検証を
-certifi（requests同梱の証明書リスト）ではなく**OSの証明書ストア**（Windowsなら証明書マネージャ）で行う。
-
-- **経緯**: ユーザーPCのNorton Antivirus（Web/Mail Shield）がHTTPSスキャンのため全サイトの証明書を
-  Norton発行のものに差し替えており、certifiベースの検証が常に`SSLCertVerificationError`で失敗
-  →毎リクエストが`verify=False`（検証無効）フォールバックで動いていた。NortonのルートCAは
-  Windows証明書ストアには登録済みのため、truststoreの導入で正常に検証が通るようになった
-- truststoreはPyPA公式（pipが内部使用）。Windowsストアが無い環境（GitHub Actions等のLinux）でも
-  OSのストアを参照するだけで挙動は変わらない。Python 3.10+が必要（本プロジェクトは3.12固定なので問題なし）
-
-### `fetch_page(session, url)`
-- MAX_RETRIES=3、指数バックオフ（RETRY_BASE_WAIT=60秒）でリトライ
-- 429/503/504 のみリトライ対象
-- **403 は `AccessForbiddenError` を送出**（リトライしない）
-- SSLError時は `verify=False` にフォールバック（urllib3警告を抑制）。truststore導入後は通常発動しない
-
-> **【2026-07-14修正済み】SSLフォールバック経路が403判定を素通りしていたバグ**
-> 旧実装はSSLErrorのexceptブロック内で`raise_for_status()`を呼んでいたため、そこで発生した
-> `HTTPError`は同じtryの`except HTTPError`節（403→`AccessForbiddenError`変換・429リトライ）に
-> 捕捉されず生のまま上位へ漏れていた。Norton環境では毎リクエストがこのフォールバック経路を
-> 通っていたため、**403が出ても「全店舗即中止」が働かず、有楽町unoバックフィル時に403のまま
-> 全日を空回りする事故が発生**（2026-07-14）。現在はtryを二重にし、`raise_for_status()`を
-> 通常経路・フォールバック経路共通の位置で実行する構造に修正済み。
->
+### `get_info(html, url, hole_date)`
+- 第1引数が `session`（requests） から `html` (文字列) に変更（2026-07-16）
+- BeautifulSoup で HTML 解析（変わらず）
 > ```python
 > try:
 >     try:
