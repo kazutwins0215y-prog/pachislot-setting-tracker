@@ -16,9 +16,6 @@
   復元(範囲自動): --start/--end省略時はDBのその店舗のMIN(日付)〜MAX(日付)を対象にする
     py -3.12 fase1/recover_variety_gaps.py --hole yasuda7
 
-  GitHub Actionsから: .github/workflows/recover.yml が上記コマンドを実行する
-  （iPhoneのGitHubアプリ/ブラウザから店舗を選んで手動トリガー可能）
-
 - 冪等: 既存行はUNIQUE(日付,ホール名,機種名,台番号)で無視されるため、中断後の再実行は安全
 - 403検知時は即中止する。時間を置いて同じコマンドを再実行すれば続きから埋まる
 - アクセス間隔はメイン.pyと同じ(40秒サイクル・20件ごとに5分休憩)
@@ -34,7 +31,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from scraper import build_url, get_info, create_driver, fetch_page, AccessForbiddenError
 from db import get_connection, sync_replica, _parse_row
-from メイン import load_stores, TARGET_CYCLE, MIN_SLEEP, BATCH_SIZE, BATCH_BREAK
+from メイン import load_stores, slug_for, TARGET_CYCLE, MIN_SLEEP, BATCH_SIZE, BATCH_BREAK
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -54,7 +51,7 @@ def build_rows(data_list, cols, row_counts, hole_name):
 
 
 def fetch_rows(driver, hole_name: str, day: str):
-    url = build_url(hole_name, day)
+    url = build_url(slug_for(hole_name), day)
     html = fetch_page(driver, url)
     data_list, cols, row_counts, missing = get_info(html, url, day)
     return build_rows(data_list, cols, row_counts, hole_name), missing
