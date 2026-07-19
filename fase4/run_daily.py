@@ -15,6 +15,7 @@ import argparse
 import csv
 import ctypes
 import logging
+import msvcrt
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +36,7 @@ REPLICA_DB_PATH = BASE / 'ホールデータ' / 'turso_replica.db'
 COLLECTION_LOG_CSV = BASE / 'ホールデータ' / 'collection_log.csv'
 STORES_JSON_PATH = FASE1_DIR / 'stores.json'
 LOG_DIR = Path(__file__).resolve().parent / 'logs'
+LOCK_FILE_PATH = Path(__file__).resolve().parent / 'run_daily.lock'
 
 PY_FASE1_CMD = ['py', '-3.12']  # fase1呼び出し用Pythonランチャ(libsqlのビルド制約)
 PY_FASE2_CMD = ['python']       # fase2呼び出し用(既存運用どおり通常のpython。py -3.12ではない)
@@ -67,6 +69,28 @@ def _allow_sleep(logger: logging.Logger) -> None:
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
     except (AttributeError, OSError) as e:
         logger.warning(f'スリープ防止リクエストの解除に失敗しました: {e}')
+
+
+def acquire_lock():
+    """run_daily.lockを排他ロックする。他プロセスが実行中で取得できなければNoneを返す。
+    プロセスが異常終了してもOSがロックを自動解放するため残留事故は起きない。"""
+    lock_file = open(LOCK_FILE_PATH, 'a+b')
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def release_lock(lock_file) -> None:
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    lock_file.close()
 
 
 class RunStats:
@@ -292,24 +316,33 @@ def main() -> None:
     args = parser.parse_args()
 
     logger = setup_logging()
-    stats = RunStats()
-    t_start = time.monotonic()
-    logger.info(f'===== run_daily 開始 (mode={args.mode}) =====')
 
-    _prevent_sleep(logger)
+    lock_file = acquire_lock()
+    if lock_file is None:
+        logger.info(f'別のrun_dailyが実行中のためスキップします (mode={args.mode})')
+        return
+
     try:
-        forbidden, poll_count = poll_and_collect(args.mode, logger, stats)
+        stats = RunStats()
+        t_start = time.monotonic()
+        logger.info(f'===== run_daily 開始 (mode={args.mode}) =====')
 
-        if forbidden:
-            logger.error('403ブロックのため評価・分析をスキップして終了します')
+        _prevent_sleep(logger)
+        try:
+            forbidden, poll_count = poll_and_collect(args.mode, logger, stats)
+
+            if forbidden:
+                logger.error('403ブロックのため評価・分析をスキップして終了します')
+                log_summary(args.mode, logger, poll_count, forbidden, t_start, stats)
+                sys.exit(1)
+
+            run_evaluate_and_profile(logger, stats)
             log_summary(args.mode, logger, poll_count, forbidden, t_start, stats)
-            sys.exit(1)
-
-        run_evaluate_and_profile(logger, stats)
-        log_summary(args.mode, logger, poll_count, forbidden, t_start, stats)
-        logger.info('===== run_daily 正常終了 =====')
+            logger.info('===== run_daily 正常終了 =====')
+        finally:
+            _allow_sleep(logger)
     finally:
-        _allow_sleep(logger)
+        release_lock(lock_file)
 
 
 if __name__ == '__main__':

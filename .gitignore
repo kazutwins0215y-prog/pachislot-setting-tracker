@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.log
+*.lock
 .venv/
 venv/
 .env
