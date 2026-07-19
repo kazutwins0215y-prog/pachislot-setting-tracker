@@ -40,27 +40,6 @@ def load_stores() -> list[str]:
     return config['stores']
 
 
-def load_slug_overrides() -> dict:
-    """DB上のホール名 → ana-slo日次データURL用スラッグの対応(変更があった店舗のみ)。
-
-    ana-slo.comは店舗の日次データページURLのスラッグを予告なく変えることがある
-    (例: 2026-07に有楽町unoが「有楽町uno」→「uno-yurakucho」へ変更され旧URLが404化した)。
-    DB上のホール名はそのままに、URL生成に使うスラッグだけ差し替えるためのマップ。
-    stores.jsonに`slug_overrides`が無ければ空辞書を返す。"""
-    with open(STORES_FILE, encoding='utf-8') as f:
-        config = json.load(f)
-    return config.get('slug_overrides', {})
-
-
-_SLUG_OVERRIDES = load_slug_overrides()
-
-
-def slug_for(hole_name: str) -> str:
-    """ホール名(DB保存名)を ana-slo日次データURL用のスラッグへ変換する。
-    override指定が無い店舗はホール名をそのままスラッグとして使う(従来どおり)。"""
-    return _SLUG_OVERRIDES.get(hole_name, hole_name)
-
-
 def compute_remaining_days(processed: set, today: dt) -> list[str]:
     """
     取得対象の日付リスト(YYYY-MM-DD、昇順)を返す。
@@ -163,7 +142,7 @@ def _is_stream_error(e: Exception) -> bool:
 
 
 def _fetch_and_write(con, driver, hole_name: str, day: str):
-    url = build_url(slug_for(hole_name), day)
+    url = build_url(hole_name, day)
     html = fetch_page(driver, url)
     data_list, data_column_list, data_row_list, missing_machines = get_info(html, url, day)
     if data_list:

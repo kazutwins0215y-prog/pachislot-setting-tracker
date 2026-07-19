@@ -249,17 +249,7 @@ scraper.get_info()
 
 ### 店舗ループとstores.json
 
-`input()`による対話入力は廃止。`stores.json`（`{"stores": ["スラッグ1", "スラッグ2", ...]}`）から対象ホール一覧を読み込み、1つのTurso接続(`con`)を使い回して店舗ごとに処理する。
-
-#### スラッグとDBホール名の分離（`slug_overrides`、2026-07-17追加）
-
-`stores`の各文字列は**DB上のホール名**であると同時に、既定では**日次データURLのスラッグ**も兼ねる（`build_url(hole_name, day)`）。ただし**ana-slo.comは店舗の日次URLスラッグを予告なく変えることがある**（2026-07に有楽町unoが`有楽町uno`→`uno-yurakucho`へ変更され、旧URLが404化して7/12以降が全て「ページにデータなし」になった実例）。
-
-これに対応するため`stores.json`に任意で`slug_overrides`（`{"ホール名": "新スラッグ"}`）を持てるようにした。`メイン.py.slug_for(hole_name)`が「override指定があればそのスラッグ、無ければホール名そのまま」を返し、`build_url`呼び出し（`メイン.py`・`recover_variety_gaps.py`の2箇所）はこれを経由する。
-
-- **DB上のホール名は変えない**（`write_db`/`get_processed_dates`等は従来どおりホール名を使う）ため、過去データ・fase2/fase3・分析DBは一切影響を受けず、店舗の同一性が保たれる
-- URL変更に気づく手口: ある店だけ`missing_data`に「ページにデータなし」が連続し、サイトの店舗トップ（例 `ana-slo.com/hole/uno-yurakucho/`）には最新データがあるのに日次URLが404。新スラッグは店舗トップのURL末尾が手がかり
-- 例: `"slug_overrides": {"有楽町uno": "uno-yurakucho"}`
+`input()`による対話入力は廃止。`stores.json`（`{"stores": ["スラッグ1", "スラッグ2", ...]}`）から対象ホール一覧を読み込み、1つのTurso接続(`con`)を使い回して店舗ごとに処理する。`stores`の各文字列は**DB上のホール名**であると同時に**日次データURLのスラッグ**も兼ねる（`build_url(hole_name, day)`）。
 
 ```python
 EXIT_CODE_FORBIDDEN = 43  # 403検知時の専用終了コード(fase4/run_daily.pyが判別に使う)

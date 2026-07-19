@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from scraper import build_url, get_info, create_driver, fetch_page, AccessForbiddenError
 from db import get_connection, sync_replica, _parse_row
-from メイン import load_stores, slug_for, TARGET_CYCLE, MIN_SLEEP, BATCH_SIZE, BATCH_BREAK
+from メイン import load_stores, TARGET_CYCLE, MIN_SLEEP, BATCH_SIZE, BATCH_BREAK
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ def build_rows(data_list, cols, row_counts, hole_name):
 
 
 def fetch_rows(driver, hole_name: str, day: str):
-    url = build_url(slug_for(hole_name), day)
+    url = build_url(hole_name, day)
     html = fetch_page(driver, url)
     data_list, cols, row_counts, missing = get_info(html, url, day)
     return build_rows(data_list, cols, row_counts, hole_name), missing

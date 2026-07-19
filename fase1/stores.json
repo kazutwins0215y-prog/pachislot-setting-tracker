@@ -12,8 +12,5 @@
         "三ノ輪uno",
         "有楽町uno",
         "bigディッパー戸越銀座店"
-    ],
-    "slug_overrides": {
-        "有楽町uno": "uno-yurakucho"
-    }
+    ]
 }
