@@ -1,0 +1,37 @@
+name: Tests
+
+# pytestはana-slo.comへアクセスしない純ロジックのテストなので、
+# scrape.yml(IPブロックで自動実行停止中)とは違いGitHub Actions上で問題なく回せる。
+# リポジトリは公開なので全ランナー無料。
+#
+# ランナーはwindows-latestを使用する:
+#   - fase4/run_daily.py がWindows専用モジュール msvcrt(二重実行防止ロック)を
+#     module-levelでimportしており、test_run_daily_*.py がそれをimportするため。
+#     ubuntuでは収集(collection)時にModuleNotFoundErrorで落ちる。
+#   - 開発環境(Windows/cp932)と一致し、パス・文字コード依存のバグも拾える。
+on:
+  push: {}
+  pull_request:
+    branches: [master]
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -r fase1/requirements.txt
+          pip install requests
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v
