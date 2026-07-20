@@ -14,13 +14,15 @@ fase1収集→fase2評価(evaluate_predictions.py)→fase2分析・予測(run_st
 import argparse
 import csv
 import ctypes
+import json
 import logging
 import msvcrt
+import os
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime as dt, timedelta
+from datetime import date, datetime as dt, timedelta
 from pathlib import Path
 
 POLL_START = "06:30"        # これより前に起動されたら待機
@@ -37,6 +39,9 @@ COLLECTION_LOG_CSV = BASE / 'ホールデータ' / 'collection_log.csv'
 STORES_JSON_PATH = FASE1_DIR / 'stores.json'
 LOG_DIR = Path(__file__).resolve().parent / 'logs'
 LOCK_FILE_PATH = Path(__file__).resolve().parent / 'run_daily.lock'
+
+SPECS_REFRESH_INTERVAL_DAYS = 5  # 機種スペック再取得の実行間隔(days)。5日未満なら今回はスキップ
+SPECS_REFRESH_STATE_PATH = Path(__file__).resolve().parent / 'specs_refresh_state.json'
 
 PY_FASE1_CMD = ['py', '-3.12']  # fase1呼び出し用Pythonランチャ(libsqlのビルド制約)
 PY_FASE2_CMD = ['py', '-3.12']  # fase2呼び出し用(2026-07-19にpythonから統一。タスクスケジューラ環境のPATH次第で別バージョンを掴む環境差異を排除)
@@ -265,6 +270,66 @@ def poll_and_collect(mode: str, logger: logging.Logger, stats: RunStats) -> tupl
     return forbidden, poll_count
 
 
+def should_refresh_specs(last_run: str | None, today: date, interval_days: int) -> bool:
+    """前回実行日からinterval_days以上経過していれば機種スペック再取得を実行すべきかを返す。
+    未実行(last_run=None)なら常にTrue。"""
+    if last_run is None:
+        return True
+    elapsed_days = (today - date.fromisoformat(last_run)).days
+    return elapsed_days >= interval_days
+
+
+def read_specs_refresh_state() -> str | None:
+    if not SPECS_REFRESH_STATE_PATH.exists():
+        return None
+    state = json.loads(SPECS_REFRESH_STATE_PATH.read_text(encoding='utf-8'))
+    return state.get('last_run')
+
+
+def write_specs_refresh_state(today_str: str) -> None:
+    """OneDrive同期エージェントによる一瞬のファイルロック(PermissionError)に備えてリトライする。"""
+    tmp_path = SPECS_REFRESH_STATE_PATH.with_suffix('.json.tmp')
+    tmp_path.write_text(json.dumps({'last_run': today_str}, ensure_ascii=False), encoding='utf-8')
+    last_error = None
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, SPECS_REFRESH_STATE_PATH)
+            return
+        except PermissionError as e:
+            last_error = e
+            time.sleep(0.5 * (attempt + 1))
+    raise last_error
+
+
+def maybe_refresh_machine_specs(logger: logging.Logger, stats: RunStats) -> None:
+    """
+    機種スペック(理論値)の再取得を5日おきに実行する(fase2/scrape_machine_specs.py→assign_tier.py)。
+    最終実行日はSPECS_REFRESH_STATE_PATHへ永続化してrun_daily側で間隔を判定する
+    (機種ごとの90日凍結ルール自体はscrape_machine_specs.py側が管理)。
+    失敗しても後続(evaluate/run_store_profile)を止めない(理論値未取得でもpreprocess.judge_tierの
+    実測値フォールバックで分析は継続できるため)。
+    """
+    today_str = date.today().isoformat()
+    last_run = read_specs_refresh_state()
+    if not should_refresh_specs(last_run, date.today(), SPECS_REFRESH_INTERVAL_DAYS):
+        logger.info(f'機種スペック再取得は間隔未経過のためスキップします(前回実行日={last_run})')
+        return
+
+    scrape_exit = run_subprocess(
+        PY_FASE2_CMD + ['scrape_machine_specs.py'], FASE2_DIR, logger, 'scrape_machine_specs', stats,
+    )
+    if scrape_exit != 0:
+        logger.error(f'scrape_machine_specs.pyが異常終了しました(exit={scrape_exit})。理論値未取得のまま続行します')
+
+    tier_exit = run_subprocess(
+        PY_FASE2_CMD + ['assign_tier.py'], FASE2_DIR, logger, 'assign_tier', stats,
+    )
+    if tier_exit != 0:
+        logger.error(f'assign_tier.pyが異常終了しました(exit={tier_exit})')
+
+    write_specs_refresh_state(today_str)
+
+
 def run_evaluate_and_profile(logger: logging.Logger, stats: RunStats) -> None:
     eval_exit = run_subprocess(
         PY_FASE2_CMD + ['evaluate_predictions.py'], FASE2_DIR, logger, 'evaluate_predictions', stats,
@@ -336,6 +401,7 @@ def main() -> None:
                 log_summary(args.mode, logger, poll_count, forbidden, t_start, stats)
                 sys.exit(1)
 
+            maybe_refresh_machine_specs(logger, stats)
             run_evaluate_and_profile(logger, stats)
             log_summary(args.mode, logger, poll_count, forbidden, t_start, stats)
             logger.info('===== run_daily 正常終了 =====')

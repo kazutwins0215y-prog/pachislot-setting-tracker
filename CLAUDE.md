@@ -10,7 +10,7 @@
 | 1. データ収集 | [`fase1/`](fase1/) | 実装済み | ana-slo.comから日次収集しTursoへ書き込み（`メイン.py`/`scraper.py`/`db.py`/`stores.json`）。詳細→[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md) |
 | 2. 設定推測・パターン分析 | [`fase2/`](fase2/) | 実装済み | 下表参照 |
 | 3. 配信・公開 | [`fase3/`](fase3/) | Stage A/B完了・デプロイ済み(2026-07-07) | 分析用Turso(`pachislot-analysis`)へ差分upsert（`upload_analysis.py`）し、Streamlit Community Cloudで公開。詳細→[`fase3/配信公開_skill.md`](fase3/配信公開_skill.md) |
-| 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み・タスクスケジューラ登録済み | `run_daily.py`が朝6:30ポーリング＋10:30追い実行で「fase1収集→評価→分析→アップロード」を直列実行。詳細→[`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md) |
+| 4. 日次自動実行 | [`fase4/`](fase4/) | 実装済み・タスクスケジューラ登録済み | `run_daily.py`が朝6:30ポーリング＋10:30追い実行で「fase1収集→機種スペック再取得(5日おき)→評価→分析→アップロード」を直列実行。詳細→[`fase4/日次自動実行_skill.md`](fase4/日次自動実行_skill.md) |
 
 > ※ fase1はTurso**埋め込みレプリカ方式**（書き込みはTursoへ、fase2はローカルレプリカ`ホールデータ/turso_replica.db`を読む）。GitHub Actionsでのクラウド実行はana-slo.com(Cloudflare)がActionsのデータセンターIPを空ボディ403でブロックするため不可（2026-07-16にSeleniumBase (UC Mode)で回避を試みたが2026-07-17にIP/ASレベルのブロックと確定・断念）。**fase4のタスクスケジューラがPC上（住宅IP）で毎日実行する運用**。SSL検証は`truststore`必須（NortonのHTTPSスキャン対策）。リポジトリ: https://github.com/kazutwins0215y-prog/pachislot-setting-tracker （**公開**。2026-07-17にコミット履歴のメールをnoreplyへ書き換え・シークレット非含有を確認のうえpublic化。クラウド実行はしないが公開設定は将来のために維持）。経緯・詳細→[`fase1/データ収集_skill.md`](fase1/データ収集_skill.md)
 
@@ -33,7 +33,8 @@
 | [`evaluate_predictions.py`](fase2/evaluate_predictions.py) | `prediction_log`と実測差枚を突合し`prediction_accuracy`を更新（Spearman・Precision@N・リフト=差枚差ベース） | [詳細_データモデル](fase2/データ分析_詳細_データモデル.md) |
 | [`multi_store.py`](fase2/multi_store.py) | Stage1b/5/6: bin_curves学習＋LOSO交差検証ゲート（不合格時はw3=0）・検証 | [詳細_preprocess](fase2/データ分析_詳細_preprocess.md) |
 | [`data_source.py`](fase2/data_source.py) | レプリカ(読み取り専用)・分析DBのパスと接続の共通層 | — |
-| [`scrape_machine_specs.py`](fase2/scrape_machine_specs.py) / [`assign_tier.py`](fase2/assign_tier.py) | 機種スペック表の取得→正規化・Tier判定（`machine_setting_specs.json`再構築） | — |
+| [`scrape_machine_specs.py`](fase2/scrape_machine_specs.py) / [`assign_tier.py`](fase2/assign_tier.py) | 機種スペック表の取得→正規化・Tier判定（`machine_setting_specs.json`再構築）。**2026-07-20にfase4日次実行へ自動組込**（初出90日以内のみ再取得・以後`frozen`固定） | [詳細_preprocess](fase2/データ分析_詳細_preprocess.md) |
+| [`migrate_specs_freeze.py`](fase2/migrate_specs_freeze.py) | 上記自動化の導入時に一度だけ実行する移行スクリプト（既存`raw_specs_scraped.json`へ`frozen`一括付与） | 同上 |
 | [`ground_truth_entry.py`](fase2/ground_truth_entry.py) | 正解発表のローカル専用入力フォーム（`ホールデータ/ground_truth.db`へappend-only。app.pyには統合しない） | [今後の実装予定](fase2/今後の実装予定.md)3節 |
 
 ## 開発ルール
@@ -70,7 +71,7 @@
 
 ## テスト
 
-`tests/`に単体テストを設置（自作フィクスチャ・CI無し）。`py -3.12 -m pytest tests/`で手動実行。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)まで実装済み。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
+`tests/`に単体テストを設置（自作フィクスチャ・CI無し）。`py -3.12 -m pytest tests/`で手動実行。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)に加え、2026-07-20の機種スペック自動取得(`migrate_specs_freeze.py`/`scrape_machine_specs.py`の凍結判定/`run_daily.py`の5日間隔判定)29件を追加し計66件PASS。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
 
 ## Claude Codeスキル
 

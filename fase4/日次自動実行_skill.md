@@ -1,10 +1,13 @@
 # fase4: 日次自動実行 運用skill
 
-fase1収集→fase2評価(`evaluate_predictions.py`)→fase2分析・予測(`run_store_profile.py`)→
+fase1収集→機種スペック再取得(`fase2/scrape_machine_specs.py`→`assign_tier.py`、5日おき)→
+fase2評価(`evaluate_predictions.py`)→fase2分析・予測(`run_store_profile.py`)→
 fase3分析用Tursoアップロード(`upload_analysis.py`)を毎朝無人で直列実行する
 `fase4/run_daily.py`の運用手順。設計・仕様は
 [`日次自動実行_設計.md`](日次自動実行_設計.md)参照。
 アップロードステップの詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照。
+機種スペック再取得の90日凍結ルール等の詳細は
+[`fase2/データ分析_詳細_preprocess.md`](../fase2/データ分析_詳細_preprocess.md)参照。
 
 ## 前提
 
@@ -103,6 +106,8 @@ py -3.12 run_daily.py --mode morning   # ポーリングあり。起動時刻が
 | `evaluate_predictions.py`が失敗する | ERRORログを残しつつ`run_store_profile.py`は実行される(答え合わせの失敗で予測追記を止めない設計)。翌日以降のデータが揃ってから再実行されれば解消することが多い |
 | `upload_analysis.py`が失敗する | ERRORログのみ残しrun_daily自体は正常終了する。翌日の差分実行がウォーターマーク差分で自動的に追いつくため当日中の対応は必須ではない。急ぐ場合は手動で`py -3.12 fase3/upload_analysis.py`を再実行(詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照) |
 | ログに「別のrun_dailyが実行中のためスキップします」 | 正常(2026-07-19実装の二重実行防止)。朝タスクが長引いた状態で追いタスクが起動する等、2プロセスが同時に走ろうとした際に後発が即座にスキップしてexit 0で終了する。`fase4/run_daily.lock`が排他ロックファイル(Git管理外)。手動対応は不要 |
+| ログに「機種スペック再取得は間隔未経過のためスキップします」 | 正常。前回実行から5日未満のため今回はスキップ(`fase4/specs_refresh_state.json`が最終実行日を保持。Git管理外)。手動で今すぐ再取得したい場合は`py -3.12 fase2/scrape_machine_specs.py`→`py -3.12 fase2/assign_tier.py`を直接実行すればよい(run_daily側の間隔判定とは独立) |
+| `scrape_machine_specs.py`/`assign_tier.py`が異常終了する | ERRORログのみ残しrun_daily自体は続行する(理論値未取得の機種があっても`preprocess.judge_tier`の実測値フォールバックで分析は止まらない設計)。頻発する場合はchonborista.com側のブロック(403/429)の可能性があるため`fase2/raw_specs_scraped.json`の`frozen`/`gave_up`件数を確認 |
 | `Get-ScheduledTaskInfo`の`LastTaskResult`が`3221225786`(16進`0xC000013A`=プロセス強制終了) | **原因判明・対策済み(2026-07-07)**。Windowsの電源イベントログ(`Get-WinEvent -LogName System`)を確認したところ、タスク起動と同時刻に「Austerity Battery Drain Budget Exceeded」「Standby Battery Budget Exceeded」等の理由でモダンスタンバイがより深いスリープ/休止へ強制移行しており、実行中の`run_daily.py`自体が巻き込まれて強制終了していた。**バッテリー駆動時にモダンスタンバイが積極的に電力を絞る挙動**が原因で、`WakeToRun`はPCを起こすことは保証するが起動後にOSが再スリープすることは防がない。対策として`run_daily.py`起動直後に`SetThreadExecutionState`(Win32 API)でスリープ防止をOSにリクエストし、終了時(`finally`)に解除する処理を追加した。**根本対策として朝6:30・10:30の時間帯はPCをAC電源に接続しておくことを推奨**(バッテリー駆動そのものを避けるのが最も確実) |
 
 ## 運用初期の観測タスク(1ヶ月経過後に実施)
@@ -131,3 +136,19 @@ Import-Csv "ホールデータ\collection_log.csv" |
 **フェーズ表のfase4行**:
 
 | 4. 日次自動実行 | [`fase4/`](./) | 実装済み・**タスクスケジューラ登録済み** | `run_daily.py`（朝6:30ポーリング実行＋10:30追い実行。fase1収集→`evaluate_predictions.py`→`run_store_profile.py`→`fase3/upload_analysis.py`（分析用Tursoへの差分アップロード）を直列実行し、`ホールデータ/collection_log.csv`にサイト更新検知時刻を記録）。**2026-07-07判明・対策済み**: バッテリー駆動時のモダンスタンバイ強制スリープでタスクが異常終了(0xC000013A)する事例を確認し、`SetThreadExecutionState`によるスリープ防止リクエストを実行中に有効化する対策を追加（根本対策は実行時間帯のAC電源接続。詳細は[`fase4/日次自動実行_skill.md`](日次自動実行_skill.md)参照） |
+
+## 機種スペック自動取得の組込み(2026-07-20実装)
+
+新台の初当たり確率・機械割が取得されないまま放置される問題への対応として、
+`fase2/scrape_machine_specs.py`(→`assign_tier.py`)を`run_daily.py`へ自動組込した。
+
+- `maybe_refresh_machine_specs()`が`run_evaluate_and_profile()`より前に実行される
+  (Tier判定が`run_store_profile.py`の入力になるため)
+- 実行間隔(5日おき)は`fase4/specs_refresh_state.json`(Git管理外)の`last_run`で判定
+  (`should_refresh_specs`純関数。未実行なら常に実行)
+- 失敗しても後続(evaluate/run_store_profile/upload)を止めない(他ステップと同じ分離方針)
+- 機種ごとの90日凍結ルール・サーキットブレーカー・アトミック書き込みの詳細は
+  [`fase2/データ分析_詳細_preprocess.md`](../fase2/データ分析_詳細_preprocess.md)参照
+- 導入時の移行(`fase2/migrate_specs_freeze.py`)は一度だけ実施済み(153機種→frozen 152件/
+  再取得対象1件)。テストはtests/test_migrate_specs_freeze.py・test_scrape_machine_specs.py・
+  test_run_daily_specs_refresh.py(計29件)

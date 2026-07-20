@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .env
 
+# fase4: 機種スペック再取得の最終実行日(実行のたびに変わるためGit管理外)
+fase4/specs_refresh_state.json
+
 # SeleniumBase (UC Mode) が実行時に作る作業ディレクトリ
 downloaded_files/
 
