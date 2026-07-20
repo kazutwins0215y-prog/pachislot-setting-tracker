@@ -22,7 +22,7 @@
 | ファイル | 役割 | 詳細 |
 |---|---|---|
 | [`preprocess.py`](fase2/preprocess.py) | Stage0〜4-1: 正規化→Tier判定→logLR→統合スコア(high_prob)→判定保留 | [詳細_preprocess](fase2/データ分析_詳細_preprocess.md) |
-| [`patterns.py`](fase2/patterns.py) | パターン検出層: 幅型(全台系/新台増台/移動台)・深さ型(鉄板台/ローテ/据え置き)・機種判定・末尾版・機種版・導入後カーブ・遷移モデル・αブレンド | [詳細_patterns](fase2/データ分析_詳細_patterns.md) |
+| [`patterns.py`](fase2/patterns.py) | パターン検出層の窓口(facade)。実体は`patterns_common/events/breadth/groups/depth/transition.py`の6モジュール(2026-07-19分割・`import patterns as pt`は不変): 幅型(全台系/新台増台/移動台)・深さ型(鉄板台/ローテ/据え置き)・機種判定・末尾版・機種版・導入後カーブ・遷移モデル・αブレンド | [詳細_patterns](fase2/データ分析_詳細_patterns.md) |
 | [`score.py`](fase2/score.py) | サブスコア統合Σ(wᵢ×Sᵢ)÷Σ(wᵢ)・S_稼働低さ・店舗プロファイル・各種ログ/検定結果の保存（予測ログはappend-only+重複ガード） | [詳細_score](fase2/データ分析_詳細_score.md) / [詳細_データモデル](fase2/データ分析_詳細_データモデル.md) |
 | [`app.py`](fase2/app.py) | 統合エントリポイント（`streamlit run app.py`）。ホーム⇔店舗トップをsession_stateで切替、iPhone向けカードUI | [詳細_出力3系統](fase2/データ分析_詳細_出力3系統.md) |
 | [`app_top.py`](fase2/app_top.py) | トップページ: おすすめ店舗ランキング＋熱い台予測7タブ（鮮度フィルタ・新台/増台タブ分離） | 同上 |

@@ -3,6 +3,12 @@
 > [`データ分析_skill.md`](データ分析_skill.md)(ハブ)から2026-07-14に分割した詳細ファイル。
 > 「patterns.py」節の一次情報はこのファイル。本文は分割時点の原文を無改変で移動したもの。
 
+> **コード分割(2026-07-19)**: `patterns.py`本体は6モジュール(`patterns_common/events/breadth/
+> groups/depth/transition.py`)へ分割され、`patterns.py`は全名前を再輸出するfacade窓口になった。
+> 本ファイルの記述で「patterns.pyの◯◯関数」とある箇所の実体は各モジュールにあるが、
+> 関数名・挙動・`import patterns as pt`での参照方法は不変のため本文の記述はそのまま有効。
+> どの関数がどのモジュールにあるかはfacade(`patterns.py`)の冒頭docstring参照。
+
 ## patterns.py
 
 ### 台同一性・移動/撤去/増台の判定ロジック
