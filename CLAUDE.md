@@ -71,7 +71,7 @@
 
 ## テスト
 
-`tests/`に単体テストを設置（自作フィクスチャ・CI無し）。`py -3.12 -m pytest tests/`で手動実行。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)に加え、2026-07-20の機種スペック自動取得(`migrate_specs_freeze.py`/`scrape_machine_specs.py`の凍結判定/`run_daily.py`の5日間隔判定)29件を追加し計66件PASS。同日追加でリクエスト削減(案A負キャッシュ・案B簡易版catchup_only_stores)とspecs_refresh_state書き込み失敗の再現テスト16件を追加し計82件PASS。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
+`tests/`に単体テストを設置（自作フィクスチャ）。`py -3.12 -m pytest tests/`で手動実行に加え、`.github/workflows/tests.yml`でpush/PRごとにGitHub Actions(windows-latest)が自動実行する。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)に加え、2026-07-20の機種スペック自動取得(`migrate_specs_freeze.py`/`scrape_machine_specs.py`の凍結判定/`run_daily.py`の5日間隔判定)29件、リクエスト削減(案A負キャッシュ・案B簡易版catchup_only_stores)とspecs_refresh_state書き込み失敗の再現テスト16件で計82件PASSだったところに、2026-07-21にfase2中核(`preprocess.py`のlogLR3チャンネル・Tier判定・欠損偏りガード、`patterns_common.py`ほかpatterns_*モジュールの統計ユーティリティ、`score.py`の合成スコア・稼働率・上限キャリブレーション等の純関数)の回帰テスト107件を追加し計189件PASS。CI依存に`numpy`/`pandas`/`scipy`を追加（`streamlit`/`plotly`は追加せず、`app*.py`はテストで一切importしない方針を維持）。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
 
 ## 開発ハーネス（3エージェント）
 

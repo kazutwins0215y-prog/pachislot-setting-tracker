@@ -32,6 +32,12 @@ jobs:
           pip install pytest
           pip install -r fase1/requirements.txt
           pip install requests
+          # fase2中核(preprocess.py/patterns_*.py/score.py)のテストに必要な依存。
+          # fase1/requirements.txtに既に含まれる分は重複しても害はないが、
+          # CIログで明示的に確認できるよう個別に追加する。
+          # streamlit/plotlyは追加しない: app*.py(Streamlit UI層)はテストで一切importしない方針のため
+          # (preprocess.py/patterns_*.py/score.pyはStreamlitに依存せず、conftest.pyもsys.path追加のみ)。
+          pip install numpy pandas scipy
 
       - name: Run pytest
         run: python -m pytest tests/ -v
