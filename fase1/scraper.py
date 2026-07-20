@@ -61,6 +61,30 @@ def build_url(slug: str, date: str) -> str:
     return f"https://ana-slo.com/{date}-{encoded}-data/"
 
 
+BLOCK_PAGE_BODY_TEXT_MIN_LEN = 200  # 正常ページ(データなし日含む)はナビ/フッター文言だけでも十分超える長さ
+
+
+def is_block_page(html: str) -> bool:
+    """
+    ブロック(Cloudflare等による空ページ/代替ページ)の疑いがあるHTMLかどうかを判定する純関数。
+
+    2026-07-17に発生した「空ページ403の偽成功」(fetch_pageが空ボディ403を検知できず、
+    ブロック中の応答を正常な『ページにデータなし』として誤記録し続けた)の再発防止策として
+    2026-07-20に導入。判定はA・B併用のOR条件:
+      A: サイト骨格の目印(本文に'ana-slo'文字列を含む、かつ<title>タグが存在する)の欠如
+      B: 本文テキストがほぼ空
+    正常な「データなし」日もWordPressのサイト骨格(ヘッダー/フッター等)は必ず持つため、
+    骨格が欠けている時点でブロックの疑いが強い。
+    """
+    if not html:
+        return True
+    soup = BeautifulSoup(html, 'html.parser')
+    has_skeleton = 'ana-slo' in html.lower() and soup.find('title') is not None
+    body_text = soup.get_text(strip=True)
+    body_nearly_empty = len(body_text) < BLOCK_PAGE_BODY_TEXT_MIN_LEN
+    return (not has_skeleton) or body_nearly_empty
+
+
 def fetch_page(driver, url: str) -> str:
     """SeleniumBase でページを取得（HTMLテキストを返す）"""
     for attempt in range(MAX_RETRIES):
@@ -70,7 +94,11 @@ def fetch_page(driver, url: str) -> str:
             html = driver.get_page_source()
             if '403 Forbidden' in html or 'Error 403' in html:
                 raise AccessForbiddenError(f'アクセス拒否 (403): {url}')
+            if is_block_page(html):
+                raise AccessForbiddenError(f'ブロックの疑いがあるページを検知しました(骨格欠如/本文ほぼ空): {url}')
             return html
+        except AccessForbiddenError:
+            raise
         except Exception as e:
             error_msg = str(e).lower()
             if '403' in error_msg or 'forbidden' in error_msg:

@@ -68,6 +68,10 @@
 - 正解発表DB: `ホールデータ/ground_truth.db`（店舗の設定発表を`fase2/ground_truth_entry.py`で手入力する唯一の原本。再生成不可能なためanalysis.dbとは分離。バックアップはOneDrive自動同期）
 - 対象サイト: `ana-slo.com`
 
+## テスト
+
+`tests/`に単体テストを設置（自作フィクスチャ・CI無し）。`py -3.12 -m pytest tests/`で手動実行。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)まで実装済み。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
+
 ## Claude Codeスキル
 
 - 「新店舗を追加」「新しいホールを追加」→ [`.claude/skills/add-new-store/SKILL.md`](.claude/skills/add-new-store/SKILL.md)（stores.jsonへの登録・バックフィル日数指定・fase2側の反映手順）
