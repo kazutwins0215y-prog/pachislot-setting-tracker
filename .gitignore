@@ -19,3 +19,6 @@ downloaded_files/
 
 # ローカルSQLite（Turso移行後は不要。移行前の生データはローカルに残す）
 ホールデータ/
+
+# 開発ハーネスの計画書（ローカル履歴として残すがGit管理外）
+.claude/plans/

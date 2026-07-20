@@ -73,6 +73,10 @@
 
 `tests/`に単体テストを設置（自作フィクスチャ・CI無し）。`py -3.12 -m pytest tests/`で手動実行。フェーズ1(fase1純ロジック: `compute_remaining_days`/`build_url`/`extract_slug`/`_parse_row`/`is_block_page`/サーキットブレーカー関連等・37件PASS)に加え、2026-07-20の機種スペック自動取得(`migrate_specs_freeze.py`/`scrape_machine_specs.py`の凍結判定/`run_daily.py`の5日間隔判定)29件を追加し計66件PASS。バグ修正時・新機能追加時は再現テスト・仕様テスト先行が運用ルール。
 
+## 開発ハーネス（3エージェント）
+
+中規模以上のタスク（新機能・アルゴリズム追加・リファクタ）は、[`planner`](.claude/agents/planner.md)(Opus・計画書作成)→ユーザー承認→[`generator`](.claude/agents/generator.md)(Sonnet・実装)→[`evaluator`](.claude/agents/evaluator.md)(Sonnet・厳格採点、不合格ならgeneratorへ差し戻し最大2回)の順で進める。計画書＝スプリント契約は`.claude/plans/YYYY-MM-DD_タスク名.md`（Git管理外）。1行修正・質問・小タスクはハーネスを使わず直接対応する。
+
 ## Claude Codeスキル
 
 - 「新店舗を追加」「新しいホールを追加」→ [`.claude/skills/add-new-store/SKILL.md`](.claude/skills/add-new-store/SKILL.md)（stores.jsonへの登録・バックフィル日数指定・fase2側の反映手順）
