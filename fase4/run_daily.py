@@ -10,6 +10,11 @@ fase1収集→fase2評価(evaluate_predictions.py)→fase2分析・予測(run_st
 実行方法:
     py -3.12 run_daily.py --mode morning   # 6:30起動想定。ポーリングして昨日分を待つ
     py -3.12 run_daily.py --mode catchup   # 10:30起動想定。収集1回→評価→分析
+
+注意: この--mode(morning/catchup)は、fase1/メイン.py側に新設した--mode(morning/all)とは
+別物(名前が同じで紛らわしい)。run_daily側は「ポーリングするか単発か」、メイン.py側は
+「catchup_only_stores(stores.json、夕方更新が常態の店)をスキップするか」を表す。
+run_daily→メイン.pyの呼び出しは_main_py_mode()で変換する(morning→morning, catchup→all)。
 """
 import argparse
 import csv
@@ -133,11 +138,27 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
-def load_stores() -> list[str]:
-    import json
+def load_stores_config() -> dict:
     with open(STORES_JSON_PATH, encoding='utf-8') as f:
-        config = json.load(f)
-    return config['stores']
+        return json.load(f)
+
+
+def load_stores() -> list[str]:
+    """全店舗リストを返す(監視・ログ表示用。catchup_only店も含む全店)。"""
+    return load_stores_config()['stores']
+
+
+def load_catchup_only_stores() -> list[str]:
+    """夕方更新が常態でmorningポーリングの早期終了を妨げる店舗のリストを返す。
+    収集再開後にcollection_log.csvの実測でメンバーを見直す前提(stores.jsonの1行編集で変更可)。"""
+    return load_stores_config().get('catchup_only_stores', [])
+
+
+def _main_py_mode(rd_mode: str) -> str:
+    """run_daily側のmode('morning'/'catchup')をfase1/メイン.py側の--mode値('morning'/'all')へ変換する。
+    名前が同じ'morning'でも指すもの(fase1側は店舗フィルタ、run_daily側はポーリング挙動)が
+    異なる別物である点に注意。run_daily catchupはcatchup_only店も含めて確実に拾うためallを渡す。"""
+    return 'morning' if rd_mode == 'morning' else 'all'
 
 
 def read_replica_state() -> set[tuple]:
@@ -164,9 +185,15 @@ def append_collection_log(diff: list[tuple], detected_at: str, poll_count: int, 
             writer.writerow([target_date, hole_name, detected_at, poll_count, mode])
 
 
-def all_yesterday_present(pairs: set[tuple], stores: list[str]) -> bool:
+def all_yesterday_present(
+    pairs: set[tuple], stores: list[str], catchup_only_stores: list[str] = (),
+) -> bool:
+    """通常店の昨日分がすべて揃ったかを判定する。catchup_only_stores(夕方更新が常態の店)は
+    判定対象から除外し、通常店だけが揃った時点でポーリングを早期終了できるようにする
+    (削減幅最大の箇所)。デフォルトは空タプルで従来と完全一致(非破壊)。"""
     yesterday = (dt.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    return all((store, yesterday) in pairs for store in stores)
+    target_stores = [s for s in stores if s not in catchup_only_stores]
+    return all((store, yesterday) in pairs for store in target_stores)
 
 
 def run_subprocess(cmd: list[str], cwd: Path, logger: logging.Logger, label: str, stats: RunStats) -> int:
@@ -190,7 +217,8 @@ def collect_once(
 ) -> tuple[set[tuple], bool, int]:
     """fase1/メイン.pyを1回実行し、新規に現れた(ホール名,日付)をcollection_log.csvへ記録する。"""
     exit_code = run_subprocess(
-        PY_FASE1_CMD + ['メイン.py'], FASE1_DIR, logger, f'fase1収集(第{poll_count}回)', stats,
+        PY_FASE1_CMD + ['メイン.py', '--mode', _main_py_mode(mode)],
+        FASE1_DIR, logger, f'fase1収集(第{poll_count}回)', stats,
     )
 
     forbidden = exit_code == EXIT_CODE_FORBIDDEN
@@ -225,6 +253,7 @@ def poll_and_collect(mode: str, logger: logging.Logger, stats: RunStats) -> tupl
     catchup: ポーリングせず収集1回のみ。
     """
     stores = load_stores()
+    catchup_only_stores = load_catchup_only_stores()
     pairs = read_replica_state()
     poll_count = 0
     forbidden = False
@@ -256,8 +285,8 @@ def poll_and_collect(mode: str, logger: logging.Logger, stats: RunStats) -> tupl
         pairs, forbidden, _ = collect_once(pairs, poll_count, mode, logger, stats)
         if forbidden:
             break
-        if all_yesterday_present(pairs, stores):
-            logger.info('全店舗の昨日分データが揃いました。ポーリングを終了します')
+        if all_yesterday_present(pairs, stores, catchup_only_stores):
+            logger.info('通常店の昨日分データが揃いました(catchup_only店は対象外)。ポーリングを終了します')
             break
 
         now = dt.now()
@@ -327,7 +356,10 @@ def maybe_refresh_machine_specs(logger: logging.Logger, stats: RunStats) -> None
     if tier_exit != 0:
         logger.error(f'assign_tier.pyが異常終了しました(exit={tier_exit})')
 
-    write_specs_refresh_state(today_str)
+    try:
+        write_specs_refresh_state(today_str)
+    except Exception as e:
+        logger.error(f'specs_refresh_state.jsonの更新に失敗しました(次回実行時に再試行します): {e}')
 
 
 def run_evaluate_and_profile(logger: logging.Logger, stats: RunStats) -> None:

@@ -75,3 +75,33 @@ def test_collect_until_days_ago_excludes_today():
     result = compute_remaining_days(processed, today)
 
     assert today.strftime('%Y-%m-%d') not in result
+
+
+def test_given_up_dates_are_excluded_from_result():
+    """given_upに含まれる日付は取得対象から除外される(負キャッシュ)"""
+    today = dt(2026, 7, 19)
+    gap_day = today - timedelta(days=5)
+    last_processed = today - timedelta(days=2)
+    processed = set(_date_range(today - timedelta(days=100), last_processed)) - {
+        gap_day.strftime('%Y-%m-%d')
+    }
+
+    result_without_giveup = compute_remaining_days(processed, today)
+    assert gap_day.strftime('%Y-%m-%d') in result_without_giveup  # 前提: 除外しないとgapが残る
+
+    result_with_giveup = compute_remaining_days(
+        processed, today, given_up={gap_day.strftime('%Y-%m-%d')}
+    )
+    assert gap_day.strftime('%Y-%m-%d') not in result_with_giveup
+
+
+def test_given_up_default_is_empty_and_non_breaking():
+    """given_upを省略した場合は空set扱いで従来と完全一致する(非破壊)"""
+    today = dt(2026, 7, 19)
+    last_processed = today - timedelta(days=2)
+    processed = set(_date_range(today - timedelta(days=100), last_processed))
+
+    result_default = compute_remaining_days(processed, today)
+    result_explicit_empty = compute_remaining_days(processed, today, given_up=set())
+
+    assert result_default == result_explicit_empty

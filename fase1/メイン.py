@@ -1,4 +1,5 @@
 from datetime import datetime as dt, timedelta
+import argparse
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from scraper import build_url, get_info, create_driver, fetch_page, AccessForbiddenError
 from db import (
-    get_connection, setup_db, get_processed_dates,
+    get_connection, setup_db, get_processed_dates, get_no_data_giveup_dates,
     write_db, write_missing, write_null_record, sync_replica,
 )
 
@@ -30,17 +31,45 @@ RETRY_LOOKBACK_DAYS = 14     # 取得失敗等で空いた未処理日(ギャッ
 
 MAX_REQUESTS_PER_RUN = 100     # 1回の実行(メイン.py起動)で送信する最大リクエスト数。到達すると正常終了し、残りは翌回の実行が続きから自動的に再開する(2026-07-20導入・同日100へ変更。BATCH_SIZE=20+BATCH_BREAK=5分の対策で120件まで通過を確認した実績の範囲内)
 CIRCUIT_BREAKER_THRESHOLD = 3  # 連続でこの店舗数が「全対象日ともページにデータなし」ならブロックの疑いとして即中止する(2026-07-20導入。空ページ403の見逃し対策・層2)
+NO_DATA_GIVEUP_DAYS = 3  # 「ページにデータなし」の欠損記録が何暦日以上に渡って観測されたらその対象日を打ち切る(取得しない)か(2026-07-20導入。リクエスト削減の負キャッシュ・案A)
 
 STORES_FILE = os.path.join(os.path.dirname(__file__), 'stores.json')
 
 
-def load_stores() -> list[str]:
+def load_stores_config() -> dict:
     with open(STORES_FILE, encoding='utf-8') as f:
-        config = json.load(f)
+        return json.load(f)
+
+
+def validate_catchup_only_stores(stores: list[str], catchup_only_stores: list[str]) -> None:
+    """catchup_only_storesがstoresの部分集合であることを検証する(純関数)。
+    設定ミス(存在しない店舗名の指定)を早期に検出するため、違反時はValueErrorで即停止する。"""
+    invalid = [s for s in catchup_only_stores if s not in stores]
+    if invalid:
+        raise ValueError(
+            f'catchup_only_storesにstoresへ存在しない店舗があります: {invalid}'
+        )
+
+
+def stores_for_mode(all_stores: list[str], catchup_only_stores: list[str], mode: str) -> list[str]:
+    """--modeに応じた収集対象店舗リストを返す(純関数)。
+
+    morning: catchup_only_stores(夕方更新が常態の店)を除外し、通常店だけを対象にする
+             (run_daily側のmorningポーリングを早期終了させ、リクエスト数を削減するため)。
+    all/catchup: 全店対象(従来動作。catchup_onlyで残った店も含めて拾う)。
+    """
+    if mode == 'morning':
+        return [s for s in all_stores if s not in catchup_only_stores]
+    return list(all_stores)
+
+
+def load_stores() -> list[str]:
+    config = load_stores_config()
+    validate_catchup_only_stores(config['stores'], config.get('catchup_only_stores', []))
     return config['stores']
 
 
-def compute_remaining_days(processed: set, today: dt) -> list[str]:
+def compute_remaining_days(processed: set, today: dt, given_up: set = frozenset()) -> list[str]:
     """
     取得対象の日付リスト(YYYY-MM-DD、昇順)を返す。
 
@@ -49,6 +78,9 @@ def compute_remaining_days(processed: set, today: dt) -> list[str]:
       永久にスキップされるため、直近RETRY_LOOKBACK_DAYS内は未処理日を含めて
       走査対象に含める(取得済みの日はprocessedで除外されるので再取得はしない)
     - 新規店舗: INITIAL_BACKFILL_DAYS分さかのぼる
+    - given_up: 「ページにデータなし」がNO_DATA_GIVEUP_DAYS暦日以上続いた対象日
+      (負キャッシュ)。永続的にデータが無いと判断し、以後はリクエストしない。
+      省略時は空set扱いで従来と完全一致する(非破壊)。
     """
     end_date = today - timedelta(days=COLLECT_UNTIL_DAYS_AGO)
 
@@ -64,7 +96,7 @@ def compute_remaining_days(processed: set, today: dt) -> list[str]:
     while d.date() <= end_date.date():
         day_list.append(d.strftime('%Y-%m-%d'))
         d += timedelta(days=1)
-    return [day for day in day_list if day not in processed]
+    return [day for day in day_list if day not in processed and day not in given_up]
 
 
 def classify_day_result(data_list: list, missing_machines: list) -> str:
@@ -108,7 +140,8 @@ def process_store(con, hole_name: str, requests_remaining: int):
     戻り値: (更新後のcon, この店舗の全処理日が『ページにデータなし』だったか(中立=None), 消費したリクエスト数)
     """
     processed = get_processed_dates(con, hole_name)
-    remaining = compute_remaining_days(processed, dt.now())
+    given_up = get_no_data_giveup_dates(con, hole_name, NO_DATA_GIVEUP_DAYS)
+    remaining = compute_remaining_days(processed, dt.now(), given_up)
 
     if not remaining:
         logger.info(f'{hole_name}: 対象期間のデータはすべてDB済みです')
@@ -208,12 +241,30 @@ def _log_remaining_backlog(con, stores: list[str]) -> None:
     total = 0
     for hole_name in stores:
         processed = get_processed_dates(con, hole_name)
-        total += len(compute_remaining_days(processed, dt.now()))
+        given_up = get_no_data_giveup_dates(con, hole_name, NO_DATA_GIVEUP_DAYS)
+        total += len(compute_remaining_days(processed, dt.now(), given_up))
     logger.info(f'全店舗の残り取得対象: 約{total}日分(次回実行時に自動的に続きから再開されます)')
 
 
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='fase1: ana-slo.comからのデータ収集')
+    parser.add_argument(
+        '--mode', choices=['morning', 'all'], default='all',
+        help=(
+            'morning: stores.jsonのcatchup_only_stores(夕方更新が常態の店)をスキップして収集する。'
+            'all(省略時・従来動作): 全店対象。'
+            'fase4/run_daily.pyの--mode(morning/catchup)とは別物で、catchup時はallを渡す。'
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 def main():
-    stores = load_stores()
+    args = parse_args()
+    config = load_stores_config()
+    catchup_only_stores = config.get('catchup_only_stores', [])
+    validate_catchup_only_stores(config['stores'], catchup_only_stores)
+    stores = stores_for_mode(config['stores'], catchup_only_stores, args.mode)
     con = get_connection()
     forbidden = False
     budget_exhausted = False

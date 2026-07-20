@@ -119,6 +119,31 @@ def get_processed_dates(con, hole_name: str) -> set:
     return {row[0] for row in cur.fetchall()}
 
 
+def get_no_data_giveup_dates(con, hole_name: str, giveup_days: int = 3) -> set:
+    """
+    「ページにデータなし」の欠損記録が、異なるgiveup_days暦日以上にわたって
+    観測された対象日の集合を返す(リクエスト削減の負キャッシュ用)。
+
+    同一日に複数回実行して同じ暦日に何件記録が付いても1暦日としてしか数えない
+    (date(記録日時)でDISTINCT)。これにより「1日粘れば取れるかもしれない一時的な
+    欠損」と「何日経っても永続的にデータが無い日」を区別する。
+
+    libsql固有APIに依存しない標準SQLのみで書く(テストではインメモリsqlite3接続を渡せるように)。
+    """
+    cur = con.cursor()
+    cur.execute(
+        '''
+        SELECT 日付
+        FROM missing_data
+        WHERE ホール名 = ? AND 理由 = 'ページにデータなし'
+        GROUP BY 日付
+        HAVING COUNT(DISTINCT date(記録日時)) >= ?
+        ''',
+        (hole_name, giveup_days),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
 def _parse_row(row, hole_name: str):
     data_cols = row[2:] if len(row) >= 3 else []
     num_cols  = [c for c in data_cols if not (c and '/' in str(c))]

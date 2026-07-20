@@ -12,5 +12,9 @@
         "三ノ輪uno",
         "有楽町uno",
         "bigディッパー戸越銀座店"
+    ],
+    "catchup_only_stores": [
+        "三ノ輪uno",
+        "新橋uno"
     ]
 }

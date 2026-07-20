@@ -83,6 +83,20 @@ py -3.12 run_daily.py --mode morning   # ポーリングあり。起動時刻が
 `write_prediction_log`)により、データが進んでいなければ予測は追記されず安全に何度でも
 再実行できる。
 
+### catchup_only_stores(2026-07-20追加・リクエスト削減案B簡易版)
+
+`fase1/stores.json`の`catchup_only_stores`(初期値: 三ノ輪uno・新橋uno)に登録した店舗は、
+朝タスク(`--mode morning`)のポーリング対象・`all_yesterday_present`の判定対象から除外される。
+通常店の昨日分さえ揃えばポーリングが早期終了するためリクエスト数が減るが、catchup_only店
+自体は10:30の追いタスク(`--mode catchup`≒メイン.py側`--mode all`)まで収集されず、その日の
+予測が最大約4時間遅れる。
+
+**メンバーの見直し方**: `stores.json`の`catchup_only_stores`配列を編集するだけ(コード変更不要)。
+選定は2026-07-20時点でドメイン知識に基づく暫定値のため、`collection_log.csv`が1〜2週間分
+貯まったら実際の検知時刻分布(下記「運用初期の観測タスク」参照)で見直すことを推奨。
+`stores`に存在しない店名を混入させると`validate_catchup_only_stores`が起動時に`ValueError`
+で即停止する。
+
 ## 日々の確認ポイント
 
 - **ログ**: `fase4/logs/run_daily_YYYYMMDD.log`(コンソール出力と同内容)。末尾の
@@ -107,6 +121,7 @@ py -3.12 run_daily.py --mode morning   # ポーリングあり。起動時刻が
 | `upload_analysis.py`が失敗する | ERRORログのみ残しrun_daily自体は正常終了する。翌日の差分実行がウォーターマーク差分で自動的に追いつくため当日中の対応は必須ではない。急ぐ場合は手動で`py -3.12 fase3/upload_analysis.py`を再実行(詳細は[`fase3/配信公開_skill.md`](../fase3/配信公開_skill.md)参照) |
 | ログに「別のrun_dailyが実行中のためスキップします」 | 正常(2026-07-19実装の二重実行防止)。朝タスクが長引いた状態で追いタスクが起動する等、2プロセスが同時に走ろうとした際に後発が即座にスキップしてexit 0で終了する。`fase4/run_daily.lock`が排他ロックファイル(Git管理外)。手動対応は不要 |
 | ログに「機種スペック再取得は間隔未経過のためスキップします」 | 正常。前回実行から5日未満のため今回はスキップ(`fase4/specs_refresh_state.json`が最終実行日を保持。Git管理外)。手動で今すぐ再取得したい場合は`py -3.12 fase2/scrape_machine_specs.py`→`py -3.12 fase2/assign_tier.py`を直接実行すればよい(run_daily側の間隔判定とは独立) |
+| ログに「specs_refresh_state.jsonの更新に失敗しました」 | 2026-07-20にバグ修正済み。以前はOneDrive同期の一瞬の`PermissionError`でこの書き込みが失敗すると`evaluate_predictions.py`以降が丸ごとスキップされていたが、現在はERRORログのみ残し後続(評価・分析・アップロード)は継続する。次回実行時に`last_run`未更新のままなら再度書き込みを試みるため実害はない |
 | `scrape_machine_specs.py`/`assign_tier.py`が異常終了する | ERRORログのみ残しrun_daily自体は続行する(理論値未取得の機種があっても`preprocess.judge_tier`の実測値フォールバックで分析は止まらない設計)。頻発する場合はchonborista.com側のブロック(403/429)の可能性があるため`fase2/raw_specs_scraped.json`の`frozen`/`gave_up`件数を確認 |
 | `Get-ScheduledTaskInfo`の`LastTaskResult`が`3221225786`(16進`0xC000013A`=プロセス強制終了) | **原因判明・対策済み(2026-07-07)**。Windowsの電源イベントログ(`Get-WinEvent -LogName System`)を確認したところ、タスク起動と同時刻に「Austerity Battery Drain Budget Exceeded」「Standby Battery Budget Exceeded」等の理由でモダンスタンバイがより深いスリープ/休止へ強制移行しており、実行中の`run_daily.py`自体が巻き込まれて強制終了していた。**バッテリー駆動時にモダンスタンバイが積極的に電力を絞る挙動**が原因で、`WakeToRun`はPCを起こすことは保証するが起動後にOSが再スリープすることは防がない。対策として`run_daily.py`起動直後に`SetThreadExecutionState`(Win32 API)でスリープ防止をOSにリクエストし、終了時(`finally`)に解除する処理を追加した。**根本対策として朝6:30・10:30の時間帯はPCをAC電源に接続しておくことを推奨**(バッテリー駆動そのものを避けるのが最も確実) |
 

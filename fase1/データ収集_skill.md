@@ -298,6 +298,7 @@ def main():
 
 - 2026-07(fase4導入)に403検知時の終了コードを追加。従来は403捕捉後も`sync_replica`を経て**exit 0(正常終了)**していたため呼び出し元が403を判別できなかった。`sync_replica`・`con.close()`は従来どおり実行した上で最後に`sys.exit(43)`する。通常終了・その他の例外の挙動は変えていない。呼び出し元`fase4/run_daily.py`はこのexit 43でその日の評価・分析をスキップする（詳細は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照）
 - 2026-07-20に**サーキットブレーカー(層2)**と**総リクエスト上限**を追加（詳細は各節参照）。`process_store`の戻り値が`con`単体から`(con, store_all_no_data, requests_used)`のタプルに変更（ストリーム失効時に新しい`con`が返る点は従来どおり）
+- **`catchup_only_stores`と`--mode`（2026-07-20追加・リクエスト削減案B簡易版）**: `stores.json`に`"catchup_only_stores": ["三ノ輪uno", "新橋uno"]`のように、夕方更新が常態でfase4のmorningポーリングを長引かせる店舗を登録できる（`stores`の部分集合であることを`validate_catchup_only_stores`が起動時に検証し、違反時は`ValueError`で即停止）。`メイン.py`に`--mode morning|all`引数を追加（省略時`all`＝従来どおり全店対象で手動実行に非破壊）。`--mode morning`のときだけ`stores_for_mode(all_stores, catchup_only_stores, mode)`（純関数）が`catchup_only_stores`をスキップした店舗リストを返す。呼び出し元`fase4/run_daily.py`は独自の`--mode`（morning/catchup。全く別物）からこのメイン.py側`--mode`へ`_main_py_mode()`で変換して渡す（morning→morning, catchup→all）。詳細・運用注意は[`fase4/日次自動実行_skill.md`](../fase4/日次自動実行_skill.md)参照
 
 ### 日付範囲の自動算出（無人実行対応）
 
@@ -323,6 +324,7 @@ else:
 - 実行が数日〜数週間空いても、最終取得日からのギャップを自動的に埋める（固定の「直近N日」方式だと長期間の抜けが永久に埋まらないため、この方式を採用）
 - **`RETRY_LOOKBACK_DAYS`（デフォルト14日、2026-07追加）**: 途中の日が取得失敗した場合、旧実装（最終日の翌日から）ではその日が永久にスキップされた。直近14日は未処理日を走査対象に含めることで自動再試行する。取得済みの日は`processed`で除外されるため再取得はしない。サイト側にページ自体が無い日（店休日等）も14日間は再試行されるが、1日1リクエストの追加で許容範囲。14日より古い失敗日は再試行されない（手動でDBを確認して対応）
 - 新規店舗（`stores.json`に追加した直後で取得済みデータが0件）は`INITIAL_BACKFILL_DAYS`分だけ初回バックフィルする（この場合も収集終了日は`end_date`まで）
+- **負キャッシュ（`given_up`引数、2026-07-20追加・リクエスト削減案A）**: `compute_remaining_days(processed, today, given_up=set())`の第3引数。`db.get_no_data_giveup_dates(con, hole_name, giveup_days=NO_DATA_GIVEUP_DAYS)`が`missing_data`テーブルから`理由='ページにデータなし'`の記録を`GROUP BY 日付 HAVING COUNT(DISTINCT date(記録日時)) >= NO_DATA_GIVEUP_DAYS`（デフォルト3）で集計し、異なる暦日にまたがって`NO_DATA_GIVEUP_DAYS`回以上「データなし」が観測された対象日の集合を返す。この集合は取得対象からリタイア（除外）する。**同一日に複数回実行しても同じ暦日には1カウントしかしない**（`date(記録日時)`でDISTINCT）ため、「1日粘れば取れるかもしれない一時的な欠損」を誤ってリタイアさせない。`process_store`・`_log_remaining_backlog`の両方でこの集合を`compute_remaining_days`へ渡す。デフォルト値は空setのため引数省略時は従来と完全一致する（非破壊）。
 
 ### アクセス間隔（動的sleep）
 
