@@ -25,7 +25,7 @@
 | [`patterns.py`](fase2/patterns.py) | パターン検出層の窓口(facade)。実体は`patterns_common/events/breadth/groups/depth/transition.py`の6モジュール(2026-07-19分割・`import patterns as pt`は不変): 幅型(全台系/新台増台/移動台)・深さ型(鉄板台/ローテ/据え置き)・機種判定・末尾版・機種版・導入後カーブ・遷移モデル・αブレンド | [詳細_patterns](fase2/データ分析_詳細_patterns.md) |
 | [`score.py`](fase2/score.py) | サブスコア統合Σ(wᵢ×Sᵢ)÷Σ(wᵢ)・S_稼働低さ・店舗プロファイル・各種ログ/検定結果の保存（予測ログはappend-only+重複ガード） | [詳細_score](fase2/データ分析_詳細_score.md) / [詳細_データモデル](fase2/データ分析_詳細_データモデル.md) |
 | [`app.py`](fase2/app.py) | 統合エントリポイント（`streamlit run app.py`）。ホーム⇔店舗トップをsession_stateで切替、iPhone向けカードUI | [詳細_出力3系統](fase2/データ分析_詳細_出力3系統.md) |
-| [`app_top.py`](fase2/app_top.py) | トップページ: おすすめ店舗ランキング＋熱い台予測7タブ（鮮度フィルタ・新台/増台タブ分離） | 同上 |
+| [`app_top.py`](fase2/app_top.py) | トップページ: おすすめ店舗ランキング＋熱い台予測7タブ（鮮度フィルタ・新台/増台タブ分離）＋ホーム最上部の鮮度警告バナー（収集全体停止/店舗別分析遅延を検知） | 同上 |
 | [`app_a.py`](fase2/app_a.py) | 機能A: 店内比較（店舗分析/台番号/機種名の3ビュー）。`render(hole_name)`をapp.pyから呼ぶ | 同上 |
 | [`app_b.py`](fase2/app_b.py) | 機能B: 店舗特徴（癖の有効性マトリクス・検知期間履歴・カレンダーヒートマップ）＋おすすめ店舗スコア`compute_store_recommend_score` | 同上 |
 | [`ui_theme.py`](fase2/ui_theme.py) | 表示層の共通スタイル（黒基調ダークテーマ・Plotly調整・プラス=青/マイナス=赤）。機能ロジックには関与しない | 同上 |

@@ -53,3 +53,16 @@ def list_holes(db_path: str | Path | None = None) -> list[str]:
     finally:
         con.close()
     return sorted(r[0] for r in rows if r[0])
+
+
+def latest_replica_date(db_path: str | Path | None = None) -> str | None:
+    """レプリカDB(生データ)の最新日付(YYYY-MM-DD)を返す。ファイル無し/データ無しはNone。"""
+    try:
+        con = connect_replica(db_path)
+    except FileNotFoundError:
+        return None
+    try:
+        row = con.execute('SELECT MAX(日付) FROM slot_data').fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None

@@ -3,6 +3,7 @@ app.py — ホームページ(店舗検索+ランキング)と店舗トップペ
 
 構成:
   ホームページ(主ページ・起動直後に表示):
+    0. 鮮度警告バナー(app_top.render_freshness_banner。データが古い場合のみ表示)
     1. 店舗検索: st.selectboxで店舗を選択し店舗トップページへ遷移
     2. MM/DD(曜)のおすすめ店舗(app_top.render_recommend_stores)
     3. MM/DD(曜)の熱い台予測(app_top.render_hot_predictions)
@@ -47,6 +48,9 @@ def _go_home() -> None:
 
 def _render_home(profiles) -> None:
     st.title('判別ツール')
+
+    # ── 鮮度警告バナー(データが古い場合のみ表示) ──
+    app_top.render_freshness_banner()
 
     # ── 店舗検索 ──
     with st.container(border=True):

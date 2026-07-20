@@ -10,6 +10,9 @@ app_top.py — 機能B再設計 Phase4 + 2026-07 UIリニューアル: トップ
     2. render_hot_predictions(): MM/DD(曜)の熱い台予測
        (店舗ごと/全店舗横断、個別台・機種・ローテ・新台・増台・移動台・据えの7タブ。
         各タブのスコアは符号付きパーセンタイル(2026-07-13決定事項「案b」)に統一表示)
+    3. render_freshness_banner(): 鮮度警告バナー(2026-07-19追加)
+       (fase4の実行失敗/未実行に気づけるよう、収集(レプリカ)と分析(prediction_log)の
+        最新日付を「今日」と比較し、猶予日数超で古ければ警告。平常時は非表示)
 
 的中率・信頼度が低くても候補を非表示にはしない(機能B再設計1節の決定通り。
 最終判断は人間が行う前提)。的中率はPhase3のprediction_accuracyを読むだけで、
@@ -219,6 +222,92 @@ def _date_label(date_str: str | None) -> str:
     """MM/DD(曜)形式のラベルを返す。対象日が無ければ今日の日付を使う。"""
     ts = pd.Timestamp(date_str) if date_str else pd.Timestamp.now()
     return f'{ts.strftime("%m/%d")}({_WEEKDAY_LABELS[ts.dayofweek]})'
+
+
+# ── 鮮度警告バナー ────────────────────────────────────────────────
+
+_STALE_STORE_LIST_CAP = 10  # バナーに列挙する店舗数の上限(超過分は件数のみ表示)
+
+
+def _load_stage3_latest_per_store(analysis_db: str) -> dict[str, str]:
+    """stage3_scores(is_invalid除外)から店舗ごとの最新日付を返す。テーブル無しは空dict。"""
+    try:
+        con = sqlite3.connect(analysis_db)
+        try:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", con
+            )['name'].tolist()
+            if 'stage3_scores' not in tables:
+                return {}
+            df = pd.read_sql_query(
+                '''
+                SELECT ホール名, MAX(日付) AS max_date
+                FROM stage3_scores
+                WHERE is_invalid IS NULL OR is_invalid != 1
+                GROUP BY ホール名
+                ''',
+                con,
+            )
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    return dict(zip(df['ホール名'], df['max_date']))
+
+
+def render_freshness_banner() -> None:
+    """
+    ホーム最上部の鮮度警告バナー(2026-07-19追加、同日中に店舗別チェックへ設計修正)。
+    fase4(収集→分析)が失敗/未実行のまま気づかない問題
+    (実行失敗/未実行の通知がない、2026-07-19レビューで指摘)への対策。
+
+    2軸でチェックする(2026-07-19、過去合意の案A[[project_staleness_banner_plan]]と
+    今回のレプリカ全体チェックを統合):
+    1. レプリカ全体の最新日付 — 収集(fase1)自体が全店舗で止まっているかの切り分け
+    2. stage3_scoresの店舗ごとの最新日付 — 特定店舗だけ分析(fase2)が遅れるケース
+       (2026-07-07発覚のマルハン新宿東宝ビル店1店舗だけ1か月遅延した実例が動機)。
+       店舗名を明示して一覧表示する
+    いずれも「今日」との差が_PREDICTION_STALE_GRACE_DAYS(表の鮮度フィルタと同じ猶予)を
+    超えたら警告する。データが一度も無い場合は他の箇所(店舗検索欄等)で案内済みのため、
+    ここでは何も表示しない。
+    """
+    import streamlit as st
+
+    today = pd.Timestamp.now().normalize()
+    messages = []
+
+    replica_date = ds.latest_replica_date()
+    if replica_date:
+        elapsed = (today - pd.Timestamp(replica_date)).days
+        if elapsed > _PREDICTION_STALE_GRACE_DAYS:
+            messages.append(
+                f'収集(fase1)が全店舗で止まっている可能性: 最終収集日 {replica_date}({elapsed}日前)'
+            )
+
+    if ds.ANALYSIS_DB_PATH.exists():
+        per_store = _load_stage3_latest_per_store(str(ds.ANALYSIS_DB_PATH))
+        stale_stores = []
+        for hole, date_str in per_store.items():
+            if not date_str:
+                continue
+            elapsed = (today - pd.Timestamp(date_str)).days
+            if elapsed > _PREDICTION_STALE_GRACE_DAYS:
+                stale_stores.append((hole, date_str, elapsed))
+        if stale_stores:
+            stale_stores.sort(key=lambda t: -t[2])
+            shown = stale_stores[:_STALE_STORE_LIST_CAP]
+            lines = [f'  - {h}: 最終日 {d}({e}日前)' for h, d, e in shown]
+            omitted = len(stale_stores) - len(shown)
+            if omitted > 0:
+                lines.append(f'  - 他{omitted}店舗')
+            messages.append('分析(fase2)が遅れている店舗:\n' + '\n'.join(lines))
+
+    if messages:
+        st.warning(
+            'データが更新されていない可能性があります。'
+            'fase4(タスクスケジューラ)が正常に動いているか確認してください。\n\n'
+            + '\n\n'.join(messages)
+        )
 
 
 # ── Streamlit エントリポイント ────────────────────────────────────
