@@ -39,7 +39,7 @@ LOG_DIR = Path(__file__).resolve().parent / 'logs'
 LOCK_FILE_PATH = Path(__file__).resolve().parent / 'run_daily.lock'
 
 PY_FASE1_CMD = ['py', '-3.12']  # fase1呼び出し用Pythonランチャ(libsqlのビルド制約)
-PY_FASE2_CMD = ['python']       # fase2呼び出し用(既存運用どおり通常のpython。py -3.12ではない)
+PY_FASE2_CMD = ['py', '-3.12']  # fase2呼び出し用(2026-07-19にpythonから統一。タスクスケジューラ環境のPATH次第で別バージョンを掴む環境差異を排除)
 
 COLLECTION_LOG_HEADER = ['対象日', 'ホール名', '検知日時', 'ポーリング回数', 'mode']
 
