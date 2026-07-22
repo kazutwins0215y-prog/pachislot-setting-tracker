@@ -5,6 +5,6 @@ scipy
 plotly
 python-dotenv
 libsql
-seleniumbase
+requests
 beautifulsoup4
 truststore

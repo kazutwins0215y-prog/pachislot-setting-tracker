@@ -1,7 +1,7 @@
 import truststore
 truststore.inject_into_ssl()  # certifiではなくWindows証明書ストアを使う(Norton等のHTTPSスキャンによる証明書差し替え対策)
 
-from seleniumbase import SB
+import requests
 from bs4 import BeautifulSoup
 import time
 import re
@@ -24,36 +24,38 @@ def extract_slug(store_url: str) -> str:
     return last.removesuffix('-データ一覧')
 
 
-class SeleniumBaseDriver:
-    """SeleniumBase context manager wrapper"""
-    def __init__(self):
-        self.driver = None
-        self.context = None
-
-    def start(self):
-        self.context = SB(
-            uc=True,  # undetected-chromedriver モード（Cloudflare回避）
-            headless=True,
-        )
-        self.driver = self.context.__enter__()
-        return self
-
-    def quit(self):
-        if self.context:
-            self.context.__exit__(None, None, None)
-
-    def get(self, url, timeout=None):
-        return self.driver.get(url)
-
-    def get_page_source(self):
-        return self.driver.get_page_source()
+def create_session() -> requests.Session:
+    """ana-slo.com向けのrequests.Sessionを作成する。
+    2026-07-22にブラウザ自動化方式からrequests方式へ復帰(ブロック真因は
+    IP/Nortonではなく自動化ブラウザ側の指紋だったと実測で確定したため)。
+    fase2/scrape_machine_specs.pyのcreate_sessionと同じヘッダー構成を踏襲する。"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/125.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
+        'Referer': 'https://ana-slo.com/',
+    })
+    return session
 
 
-def create_driver() -> SeleniumBaseDriver:
-    """SeleniumBase ドライバーラッパーを作成（自動で start() を呼ぶ）"""
-    driver = SeleniumBaseDriver()
-    driver.start()
-    return driver
+def _http_error_action(status: int, attempt: int) -> str:
+    """HTTPステータスコードから取るべき行動を返す('abort'|'retry'|'raise')。
+    fase2/scrape_machine_specs.pyの同名関数と同じ方針(2026-07-22にfase1へも導入)。
+    403はリトライ不要で即abort(サーキットブレーカー)。429はリトライ上限到達でも
+    ブロックの疑いが強いためabort(7/14型のレート制限を早期検知するため)。
+    503/504は一時的エラーとしてリトライ上限到達後raise。"""
+    if status == 403:
+        return 'abort'
+    if status in (429, 503, 504):
+        if attempt < MAX_RETRIES - 1:
+            return 'retry'
+        return 'abort' if status == 429 else 'raise'
+    return 'raise'
 
 
 def build_url(slug: str, date: str) -> str:
@@ -85,25 +87,31 @@ def is_block_page(html: str) -> bool:
     return (not has_skeleton) or body_nearly_empty
 
 
-def fetch_page(driver, url: str) -> str:
-    """SeleniumBase でページを取得（HTMLテキストを返す）"""
+def fetch_page(session: requests.Session, url: str) -> str:
+    """requestsでページを取得（HTMLテキストを返す）。
+    2026-07-22にブラウザ自動化方式から復帰。ブロック検知2層は維持:
+    層1=is_block_page(取得したresponse.textに対して動く。骨格欠如/本文ほぼ空を検知)。"""
     for attempt in range(MAX_RETRIES):
         try:
-            driver.get(url, timeout=30)
-            # ステータスチェック（if possible）
-            html = driver.get_page_source()
-            if '403 Forbidden' in html or 'Error 403' in html:
-                raise AccessForbiddenError(f'アクセス拒否 (403): {url}')
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            html = response.text
             if is_block_page(html):
                 raise AccessForbiddenError(f'ブロックの疑いがあるページを検知しました(骨格欠如/本文ほぼ空): {url}')
             return html
-        except AccessForbiddenError:
-            raise
-        except Exception as e:
-            error_msg = str(e).lower()
-            if '403' in error_msg or 'forbidden' in error_msg:
-                raise AccessForbiddenError(f'アクセス拒否 (403): {url}') from e
-            if ('timeout' in error_msg or 'connection' in error_msg) and attempt < MAX_RETRIES - 1:
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            action = _http_error_action(status, attempt)
+            if action == 'retry':
+                wait = RETRY_BASE_WAIT * (2 ** attempt)
+                logger.warning(f'HTTP {status}。{wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES}): {url}')
+                time.sleep(wait)
+            elif action == 'abort':
+                raise AccessForbiddenError(f'HTTP {status}によりブロックの疑いがあるため中断します: {url}') from e
+            else:
+                raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BASE_WAIT * (2 ** attempt)
                 logger.warning(f'接続エラー。{wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES}): {e}')
                 time.sleep(wait)
