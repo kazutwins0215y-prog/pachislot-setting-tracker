@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 TARGET_CYCLE  = 40   # 1リクエストあたりの目標サイクル時間（秒）
 MIN_SLEEP     = 10   # 最低待機時間（秒）
-BATCH_SIZE    = 20   # この件数ごとに長めの休憩を挟む
+BATCH_SIZE    = 20   # 累計この件数ごとにバッチ休憩を挟む
 BATCH_BREAK   = 60 * 5  # バッチ休憩時間（秒）
+LONG_BREAK_AT      = 100     # 累計この件数ごとに長め休憩を挟む(2026-07-22復活。--max-requests 0の大量収集時のみ発火し、日次は累計<20で不発。BATCH_SIZEの倍数にしておくとclassify_pacingでlongがbatchに優先される)
+LONG_BREAK_SECONDS = 60 * 20  # 長め休憩の時間（秒）
 
 INITIAL_BACKFILL_DAYS = int(os.environ.get('INITIAL_BACKFILL_DAYS', 90))  # 新規店舗追加時: 初回のみ何日分さかのぼって取得するか（環境変数で一時的に上書き可能）
 COLLECT_UNTIL_DAYS_AGO = 1   # 何日前までを収集対象にするか（サイトは前日分を23:00〜翌10:00頃にページ一括更新するため中間状態の取り込みリスクなし。未更新日はRETRY_LOOKBACK_DAYSのギャップ再試行が翌日以降拾う）
@@ -136,9 +138,47 @@ def update_circuit_breaker(
     return 0, False
 
 
-def process_store(con, hole_name: str, requests_remaining: int):
+def classify_pacing(global_count: int) -> str:
+    """完了した「実行全体の累計リクエスト数」から、この直後に挟む待機の種別を返す純関数。
+
+    - 'long' : 累計がLONG_BREAK_AT(100)の倍数 → 長め休憩(20分)。バッチより優先。
+               --max-requests 0の大量収集時のみ発火する(日次は累計<20で常にnormal)。
+    - 'batch': 累計がBATCH_SIZE(20)の倍数 → バッチ休憩(5分)。
+    - 'normal': それ以外 → 通常サイクル待機。
+
+    店舗をまたいだ累計で判定するため、process_store(店舗内ループ)とmain(店舗境界)の
+    両方から同じ基準で呼べる。各累計値はどちらか一方でちょうど1回だけ評価される。
+    """
+    if global_count > 0 and global_count % LONG_BREAK_AT == 0:
+        return 'long'
+    if global_count > 0 and global_count % BATCH_SIZE == 0:
+        return 'batch'
+    return 'normal'
+
+
+def _pace_between_stores(global_count: int) -> None:
+    """店舗の切れ目で、累計リクエスト数に応じた休憩を補う。
+
+    process_storeの店舗内ループは各店の最終日の直後には休憩を挟まない(i < len-1 のときだけ)。
+    そのため累計がちょうど店舗境界で区切りに達したケースをここで1回分だけ補完する。
+    'normal'のときは待機しない(=従来の店舗間の挙動と同じ)。呼び出し側は実際に
+    リクエストを消費した(requests_used>0)店舗の後・かつ次店舗がある場合のみ呼ぶこと。
+    """
+    action = classify_pacing(global_count)
+    if action == 'long':
+        logger.info(f'累計{global_count}件完了(店舗境界)。{LONG_BREAK_SECONDS}秒の長め休憩に入ります')
+        time.sleep(LONG_BREAK_SECONDS)
+    elif action == 'batch':
+        logger.info(f'累計{global_count}件完了(店舗境界)。{BATCH_BREAK}秒のバッチ休憩に入ります')
+        time.sleep(BATCH_BREAK)
+
+
+def process_store(con, hole_name: str, requests_remaining: int, done_before: int = 0):
     """
     戻り値: (更新後のcon, この店舗の全処理日が『ページにデータなし』だったか(中立=None), 消費したリクエスト数)
+
+    done_before: この店舗の処理を始める前までに実行全体で消費した累計リクエスト数。
+    店舗をまたいだ累計でペース配分(バッチ/長め休憩)を判定するために使う。
     """
     processed = get_processed_dates(con, hole_name)
     given_up = get_no_data_giveup_dates(con, hole_name, NO_DATA_GIVEUP_DAYS)
@@ -196,8 +236,16 @@ def process_store(con, hole_name: str, requests_remaining: int):
                     except Exception as rollback_err:
                         logger.warning(f'ロールバックに失敗しました(次の書き込みで自動回復する場合があります): {rollback_err}')
             if i < len(target_days) - 1:
-                if (i + 1) % BATCH_SIZE == 0:
-                    logger.info(f'{i + 1}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
+                global_count = done_before + i + 1  # 実行全体での累計リクエスト数
+                action = classify_pacing(global_count)
+                if action == 'long':
+                    logger.info(f'累計{global_count}件完了。{LONG_BREAK_SECONDS}秒の長め休憩に入ります')
+                    session.close()
+                    time.sleep(LONG_BREAK_SECONDS)
+                    session = create_session()
+                    logger.info('セッションを再生成しました')
+                elif action == 'batch':
+                    logger.info(f'累計{global_count}件完了。{BATCH_BREAK}秒のバッチ休憩に入ります')
                     session.close()
                     time.sleep(BATCH_BREAK)
                     session = create_session()
@@ -297,12 +345,16 @@ def main():
     consecutive_no_data = 0
     max_requests = resolve_max_requests(args.max_requests)
     requests_remaining = max_requests
+    total_done = 0  # 実行全体での累計リクエスト数(店舗をまたいだペース配分の判定に使う)
     try:
         setup_db(con)
         try:
-            for hole_name in stores:
-                con, store_all_no_data, requests_used = process_store(con, hole_name, requests_remaining)
+            for idx, hole_name in enumerate(stores):
+                con, store_all_no_data, requests_used = process_store(
+                    con, hole_name, requests_remaining, done_before=total_done
+                )
                 requests_remaining -= requests_used
+                total_done += requests_used
 
                 consecutive_no_data, tripped = update_circuit_breaker(consecutive_no_data, store_all_no_data)
                 if tripped:
@@ -314,6 +366,11 @@ def main():
                     budget_exhausted = True
                     logger.info(f'リクエスト上限({max_requests})に到達したため、今回の実行はここで終了します')
                     break
+
+                # 店舗の切れ目でのペース配分(店舗内ループが最終日に休憩を挟まない分を補う)。
+                # 実際にリクエストを消費し、かつ次の店舗が残っている場合のみ。
+                if requests_used > 0 and idx < len(stores) - 1:
+                    _pace_between_stores(total_done)
         except AccessForbiddenError as e:
             logger.error(f'アクセス拒否(403)またはブロック疑いのため全店舗の処理を中止します: {e}')
             forbidden = True
