@@ -148,7 +148,7 @@ def test_compute_all_logLR_tier_a_with_payout_override():
         'RB': [0, 0],
         '差枚': [100, -50],
     })
-    out = pp.compute_all_logLR(df, machine_tier, {}, specs, column_map=None, bin_curves={})
+    out = pp.compute_all_logLR(df, machine_tier, specs, column_map=None, bin_curves={})
 
     np.testing.assert_allclose(
         out['logLR_rng'].to_numpy(),
@@ -176,7 +176,7 @@ def test_compute_all_logLR_tier_b_uses_rank_percentile_and_column_map():
         'BB確率': [0.01, 0.05, 0.09],
         '差枚': [0, 0, 0],
     })
-    out = pp.compute_all_logLR(df, machine_tier, {}, specs={}, column_map=column_map, bin_curves={})
+    out = pp.compute_all_logLR(df, machine_tier, specs={}, column_map=column_map, bin_curves={})
 
     np.testing.assert_allclose(
         out['logLR_rng'].to_numpy(),

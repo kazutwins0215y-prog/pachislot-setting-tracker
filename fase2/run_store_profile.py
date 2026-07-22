@@ -888,9 +888,9 @@ def run_for_hole(hole_name: str, replica_db: str | None = None, analysis_db: str
         return
     df = pp.normalize(df)
 
-    machine_tier, bias_params, column_map = pp.calibrate_all(df)
+    machine_tier, column_map = pp.calibrate_all(df)
     specs = pp._load_specs()
-    scored = pp.compute_all_logLR(df, machine_tier, bias_params, specs, column_map)
+    scored = pp.compute_all_logLR(df, machine_tier, specs, column_map)
     scored = pp.compute_log_odds(scored)
     scored = pp.mark_invalid(scored, machine_tier, specs)
 

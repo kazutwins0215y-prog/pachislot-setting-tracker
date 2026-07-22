@@ -1,6 +1,6 @@
 """
 preprocess.py の Tier判定・欠損偏りガード系関数の回帰テスト。
-resolve_rate_columns / estimate_bias_params / judge_tier(未知機種) /
+resolve_rate_columns / judge_tier(未知機種) /
 mark_invalid / mark_rng_anomaly / invalid_rate / check_missing_bias。
 
 相関を使う関数は乱数を使わず、決定的な線形関数(完全相関=解析的にr=±1.0)・
@@ -77,37 +77,6 @@ def test_judge_tier_unknown_machine_uses_resolve_rate_columns():
     df = _make_rate_df('_pytest未知機種_zzz999')
     result = pp.judge_tier(df, '_pytest未知機種_zzz999')
     assert result == {'BB': 'B', 'RB': 'C', 'ART': 'C'}
-
-
-# ── estimate_bias_params ─────────────────────────────────────────
-
-def test_estimate_bias_params_below_30_samples_returns_zero():
-    df = pd.DataFrame({
-        '機種名': ['機種E'] * 10,
-        '回転数': np.full(10, 1000.0),
-        '差枚': np.full(10, 50.0),
-    })
-    result = pp.estimate_bias_params(df, '機種E')
-    assert result == {'direction': 0, 'strength': 0.0}
-
-
-def test_estimate_bias_params_positive_correlation():
-    # 差枚率=turns*0.0001(turnsと正の完全相関) → direction=+1, strength≈1.0
-    turns = 1000.0 + np.arange(40) * 10.0
-    rate = turns * 0.0001
-    df = pd.DataFrame({'機種名': ['機種E2'] * 40, '回転数': turns, '差枚': rate * turns})
-    result = pp.estimate_bias_params(df, '機種E2')
-    assert result['direction'] == 1
-    assert result['strength'] == pytest.approx(1.0, abs=1e-9)
-
-
-def test_estimate_bias_params_negative_correlation():
-    turns = 1000.0 + np.arange(40) * 10.0
-    rate = -turns * 0.0001
-    df = pd.DataFrame({'機種名': ['機種E3'] * 40, '回転数': turns, '差枚': rate * turns})
-    result = pp.estimate_bias_params(df, '機種E3')
-    assert result['direction'] == -1
-    assert result['strength'] == pytest.approx(1.0, abs=1e-9)
 
 
 # ── mark_invalid / mark_rng_anomaly ──────────────────────────────
